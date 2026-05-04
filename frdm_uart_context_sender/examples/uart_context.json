@@ -1,0 +1,11 @@
+{
+  "transcript": "我有點累了，先安靜一點。",
+  "reply": "好，我切到安靜模式，先不打擾你。",
+  "emotion": {
+    "primary": "tired",
+    "summary": "使用者想休息或降低互動強度。"
+  },
+  "context": {
+    "mode": "sleep"
+  }
+}

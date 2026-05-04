@@ -1,0 +1,9 @@
+{
+  "reply": "我會把頭轉回正面，並顯示數字 7。",
+  "commands": [
+    "Normal",
+    "MotorPitch 90",
+    "MotorYaw 90",
+    "ShowNum 7"
+  ]
+}
