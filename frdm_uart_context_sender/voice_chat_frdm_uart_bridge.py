@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -54,6 +55,68 @@ from frdm_uart_context_sender import (  # noqa: E402
 
 
 DEFAULT_UART_OUTPUT = str(THIS_DIR / "uart.json")
+DEFAULT_TTS_VOICE = "zh_CN-xiao_ya-medium"
+DEFAULT_MIC_KEYWORD = os.getenv("MIC_DEVICE_KEYWORD", "UACDemo")
+
+
+def _input_device_info(device_index: int | None) -> dict[str, Any] | None:
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise RuntimeError("Missing dependency: sounddevice. Install it in the voice venv.") from exc
+
+    try:
+        info = sd.query_devices(device_index, "input")
+    except ValueError:
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def find_input_device_by_keyword(keyword: str) -> int | None:
+    if not keyword.strip():
+        return None
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise RuntimeError("Missing dependency: sounddevice. Install it in the voice venv.") from exc
+
+    lowered = keyword.strip().lower()
+    for index, device in enumerate(sd.query_devices()):
+        if not isinstance(device, dict):
+            continue
+        name = str(device.get("name", ""))
+        if lowered in name.lower() and int(device.get("max_input_channels", 0)) > 0:
+            return index
+    return None
+
+
+def resolve_input_device(args: argparse.Namespace) -> int | None:
+    """Prefer the named USB mic so ALSA index changes do not break demos."""
+    keyword = str(getattr(args, "mic_keyword", DEFAULT_MIC_KEYWORD) or "").strip()
+    no_fallback = bool(getattr(args, "no_mic_fallback", False))
+
+    if args.device is not None:
+        info = _input_device_info(args.device)
+        if info is not None:
+            return args.device
+
+        print(f"WARNING: --device {args.device} is not a microphone input.")
+        if no_fallback:
+            return args.device
+
+    if keyword and not no_fallback:
+        found = find_input_device_by_keyword(keyword)
+        if found is not None:
+            if args.device is None:
+                print(f"Selected input device {found} by keyword {keyword!r}.")
+            else:
+                print(f"Falling back to input device {found} by keyword {keyword!r}.")
+            return found
+        if args.device is not None:
+            print(f"WARNING: no input device contains keyword {keyword!r}; keeping --device {args.device}.")
+            return args.device
+
+    return args.device
 
 
 def response_to_uart_payload(response: dict[str, Any]) -> dict[str, Any]:
@@ -185,9 +248,9 @@ def handle_chat_response(response: dict[str, Any], args: argparse.Namespace, *, 
 def print_zero_rms_hint(args: argparse.Namespace) -> None:
     print("HINT: RMS is exactly zero, so the selected microphone is probably not receiving audio.")
     if args.device is None:
-        print("      Run `python3 voice_chat_frdm_uart_bridge.py --list-mics` and retry with the USB mic, for example `--device 0`.")
+        print("      Run `python3 voice_chat_frdm_uart_bridge.py --list-mics` and use `--mic-keyword UACDemo`, or choose an input index.")
     else:
-        print(f"      Current --device is {args.device}; check mic mute/gain/cable, or try another device from `--list-mics`.")
+        print(f"      Current --device is {args.device}; check mic mute/gain/cable, or retry with `--mic-keyword UACDemo`.")
 
 
 def run_text_mode(args: argparse.Namespace) -> int:
@@ -206,12 +269,18 @@ def run_text_mode(args: argparse.Namespace) -> int:
     return 0 if handle_chat_response(response, args, verbose_debug=args.debug) else 1
 
 
+def apply_default_tts_voice(args: argparse.Namespace) -> None:
+    if not getattr(args, "tts_voice", None):
+        args.tts_voice = DEFAULT_TTS_VOICE
+
+
 def run_voice_loop(args: argparse.Namespace) -> int:
     if not voice_chat.preflight_server(args):
         return 1
     if not voice_chat.preflight_tts(args):
         return 1
 
+    args.device = resolve_input_device(args)
     try:
         input_sample_rate = voice_chat.choose_input_sample_rate(args.device, args.input_sample_rate)
     except (RuntimeError, ValueError) as exc:
@@ -219,6 +288,8 @@ def run_voice_loop(args: argparse.Namespace) -> int:
         return 1
 
     print("Fast voice chat + FRDM UART bridge ready.")
+    print("AI path: Jetson record -> Windows desktop local /voice-chat -> local ASR/Ollama.")
+    print("No Gemini/OpenAI cloud API is used by this bridge.")
     print(f"Server URL: {args.server_url}")
     print(f"FRDM UART: {args.uart_port} @ {args.uart_baudrate}, line_ending={args.uart_line_ending}")
     print(f"Input sample rate: {input_sample_rate} Hz; upload WAV sample rate: {voice_chat.SAMPLE_RATE} Hz")
@@ -298,6 +369,18 @@ def run_check_server(args: argparse.Namespace) -> int:
 
 def add_uart_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Standalone Jetson fast voice chat + FRDM MCXN947 UART bridge."
+    mic_group = parser.add_argument_group("microphone selection")
+    mic_group.add_argument(
+        "--mic-keyword",
+        default=DEFAULT_MIC_KEYWORD,
+        help="Auto-select the first input device whose name contains this keyword. Default: UACDemo.",
+    )
+    mic_group.add_argument(
+        "--no-mic-fallback",
+        action="store_true",
+        help="Do not fall back to --mic-keyword when --device is missing or invalid.",
+    )
+
     group = parser.add_argument_group("FRDM UART bridge")
     group.add_argument("--no-uart", action="store_true", help="Do not write uart.json or send UART.")
     group.add_argument("--require-uart", action="store_true", help="Exit with error if UART send fails.")
@@ -323,6 +406,7 @@ def main() -> int:
     args = build_arg_parser().parse_args()
     args.server_url = voice_chat.normalize_server_url(args.server_url)
     args.tts_url = voice_chat.normalize_tts_url(args.tts_url, blocking=args.tts_blocking)
+    apply_default_tts_voice(args)
     args.tts_interrupt = not args.tts_no_interrupt
     args.tts_stream = False if args.tts_file_playback else None
 

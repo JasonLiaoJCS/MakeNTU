@@ -21,6 +21,12 @@ def test_split_chunks_prefers_punctuation() -> None:
     assert chunks[0].endswith("。")
 
 
+def test_split_chunks_does_not_split_short_text_on_commas() -> None:
+    chunks = split_chunks("你好，我現在回來了，我會用比較自然的節奏說話。", max_chunk_chars=70)
+
+    assert chunks == ["你好，我現在回來了，我會用比較自然的節奏說話。"]
+
+
 def test_text_truncation_warning() -> None:
     result = normalize_text("a" * 20, enable_traditional_to_simplified=False, max_text_chars=10)
 

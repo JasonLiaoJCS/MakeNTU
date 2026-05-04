@@ -369,12 +369,12 @@ LOG_LEVEL=INFO
 常改項目：
 
 - `AUDIO_DEVICE=default`：使用 ALSA default。
-- `AUDIO_DEVICE=plughw:1,0`：指定 USB 喇叭或其他 ALSA device。
+- `AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0`：用 USB 喇叭的穩定 ALSA 卡名，比 `plughw:1,0` 不容易因為重新插拔而失效。
 - `DEFAULT_LENGTH_SCALE=0.85`：語速更快。
 - `DEFAULT_LENGTH_SCALE=1.0`：語速較自然。
 - `MAX_TEXT_CHARS=600`：單次最多處理 600 字。
 - `MAX_CHUNK_CHARS=70`：每個 chunk 約 70 字以內。
-- `ENABLE_STREAM_PLAYBACK=true`：不寫 WAV，直接播放。
+- `ENABLE_STREAM_PLAYBACK=true`：使用 raw streaming，回覆出來後比較快開始播放。
 - `ENABLE_INPROCESS_PIPER=true`：server 常駐載入 Piper，不每句重開 CLI。
 - `ENABLE_HF_OFFLINE=true`：使用本機 Hugging Face cache，不啟動時連線檢查 tokenizer。
 
@@ -599,7 +599,7 @@ python -m jetson_piper_tts.speak "换一个声音。" --voice zh_CN-xiao_ya-medi
 指定 ALSA device：
 
 ```bash
-python -m jetson_piper_tts.speak "测试 USB 喇叭。" --device plughw:1,0
+python -m jetson_piper_tts.speak "测试 USB 喇叭。" --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
 ```
 
 ## Python Client
@@ -687,7 +687,7 @@ amixer -c 1 sset Speaker 80% unmute
 指定裝置測：
 
 ```bash
-AUDIO_DEVICE=plughw:1,0 ./scripts/test_audio.sh
+AUDIO_DEVICE='plughw:CARD=UACDemoV10,DEV=0' ./scripts/test_audio.sh
 ```
 
 ## ALSA Device
@@ -708,21 +708,21 @@ aplay -L
 
 ```bash
 AUDIO_DEVICE=default
+AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
 AUDIO_DEVICE=plughw:0,0
-AUDIO_DEVICE=plughw:1,0
 AUDIO_DEVICE=hw:0,0
 ```
 
 如果 `default` 沒聲音，先試 USB speaker：
 
 ```bash
-python -m jetson_piper_tts.speak "测试声音。" --device plughw:1,0
+python -m jetson_piper_tts.speak "测试声音。" --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
 ```
 
 可用後寫進 `.env`：
 
 ```bash
-AUDIO_DEVICE=plughw:1,0
+AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
 ```
 
 重啟 server。
@@ -1037,10 +1037,10 @@ speaker-test -D default -t sine -f 440 -c 2
 python -m jetson_piper_tts.speak "测试声音。"
 ```
 
-如果 USB 喇叭是 card 1：
+如果 USB 喇叭是 `UACDemoV1.0`：
 
 ```bash
-python -m jetson_piper_tts.speak "测试声音。" --device plughw:1,0
+python -m jetson_piper_tts.speak "测试声音。" --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
 ```
 
 ### `aplay: device busy`

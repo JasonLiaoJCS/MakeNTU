@@ -16,15 +16,88 @@ voice_chat_frdm_uart_bridge.py
 
 它不會改 `jetson_fast_voice_chat.py`，只是重用原本錄音、送 Windows、TTS、顯示結果的函式，收到 reply/emotion 後立刻產生 `uart.json` 並送 UART。
 
+如果你要省略 Enter，讓 Jetson 一直監聽 wake word，請用這支 hands-free 版：
+
+```text
+wake_voice_chat_frdm_bridge.py
+```
+
+流程是：
+
+```text
+常駐監聽
+-> 偵測 "hey_jarvis"
+-> 開始錄音
+-> 音量低於 VOLUME_MIN 並持續 SILENCE_DURATION 秒
+-> 自動停止錄音
+-> 送 Windows /voice-chat
+-> FRDM UART + TTS
+```
+
+## 重要：這包不使用雲端 AI
+
+不要跑 `stt_node.py` 那套 Gemini Flash STT。那支會用 `GEMINI_API_KEY` 呼叫雲端 API，不適合這個 demo。
+
+這個資料夾裡的兩支 bridge 都走本地端路線：
+
+```text
+voice_chat_frdm_uart_bridge.py
+wake_voice_chat_frdm_bridge.py
+```
+
+本地端 AI 流程：
+
+```text
+Jetson 本地錄音 / wake word
+-> Windows 桌機 http://100.108.141.26:8766/voice-chat
+-> Windows 本地 ASR
+-> Windows 本地 Ollama qwen35-fast
+-> Jetson FRDM UART + Piper TTS
+```
+
+不會呼叫 Gemini、OpenAI 或其他雲端 AI API。`openwakeword` 只是在 Jetson 本機做喚醒詞偵測。
+
 ## 2. 安裝依賴
 
-如果你已經在 MakeNTU 的 Python venv 裡，可以直接裝：
+這包 bridge 實際執行時用的是語音聊天 venv：
 
 ```bash
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+```
+
+所以依賴一定要裝進這個 venv，不要裝到其他 Python：
+
+```bash
+cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 python3 -m pip install -r requirements.txt
 ```
 
 只做 `--dry-run` 不需要真的打開 UART；要送到 FRDM 才需要 `pyserial`。
+
+hands-free 版需要 `openwakeword`。如果你看到：
+
+```text
+ERROR: Missing dependency: openwakeword
+```
+
+就跑：
+
+```bash
+cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+第一次使用 wake word 時還需要 `hey_jarvis` 模型檔。新版 `wake_voice_chat_frdm_bridge.py` 會自動下載；如果你想先手動下載確認：
+
+```bash
+python3 - <<'PY'
+from openwakeword.utils import download_models
+download_models(["hey_jarvis"])
+print("hey_jarvis model ready")
+PY
+```
 
 ## 3. 插上 FRDM，找 USB UART Port
 
@@ -57,6 +130,12 @@ Terminal C: Jetson 語音聊天 + FRDM UART bridge
 在 Windows PowerShell：
 
 ```powershell
+ollama serve
+```
+
+另外開一個 Windows PowerShell：
+
+```powershell
 cd C:\Users\User\Desktop\windows_desktop_server_bundle
 .\.venv\Scripts\Activate.ps1
 python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
@@ -65,6 +144,7 @@ python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwe
 Windows 本機先測：
 
 ```powershell
+curl http://127.0.0.1:11434/api/tags
 curl http://127.0.0.1:8766/health
 ```
 
@@ -83,14 +163,16 @@ tailscale ip -4
 你這台 Jetson 目前的 USB 喇叭在 ALSA 裡是：
 
 ```text
-card 1, device 0 -> plughw:1,0
+card 0, device 0 -> plughw:0,0
+stable name -> plughw:CARD=UACDemoV10,DEV=0
 ```
 
 我已經把 TTS 設定檔改成：
 
 ```text
 /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env
-AUDIO_DEVICE=plughw:1,0
+AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+ENABLE_STREAM_PLAYBACK=true
 ```
 
 在 Jetson 開一個新 terminal：
@@ -110,7 +192,7 @@ curl http://127.0.0.1:8777/health
 `health` 裡應該看到：
 
 ```text
-audio device=plughw:1,0
+audio device=plughw:CARD=UACDemoV10,DEV=0
 ```
 
 也可以直接測喇叭：
@@ -118,10 +200,25 @@ audio device=plughw:1,0
 ```bash
 cd /home/asrlab-yian/MakeNTU/jetson_piper_tts
 source .venv/bin/activate
-python -m jetson_piper_tts.speak "USB喇叭测试。" --device plughw:1,0 --stream
+python -m jetson_piper_tts.speak "USB喇叭测试。" --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
 ```
 
 ### 換不同語音包
+
+現在 `frdm_uart_context_sender` 的 Enter 版和 hands-free 版，預設都會使用：
+
+```text
+zh_CN-xiao_ya-medium
+```
+
+也就是你不用加 `--tts-voice`，bridge 也會送小雅給 TTS server。TTS server 的 `.env` 也已經改成小雅：
+
+```text
+PIPER_MODEL=./models/zh_CN-xiao_ya-medium.onnx
+PIPER_CONFIG=./models/zh_CN-xiao_ya-medium.onnx.json
+```
+
+改完 `.env` 後要重開 TTS server，`/health` 才會顯示新的預設模型。
 
 目前這台 Jetson 已經有這幾個中文 Piper voice：
 
@@ -144,13 +241,13 @@ curl http://127.0.0.1:8777/voices | python3 -m json.tool
 cd /home/asrlab-yian/MakeNTU/jetson_piper_tts
 source .venv/bin/activate
 
-python -m jetson_piper_tts.speak "这是朝文的声音。" --voice zh_CN-chaowen-medium --device plughw:1,0 --stream
-python -m jetson_piper_tts.speak "这是花妍的声音。" --voice zh_CN-huayan-medium --device plughw:1,0 --stream
-python -m jetson_piper_tts.speak "这是小雅的声音。" --voice zh_CN-xiao_ya-medium --device plughw:1,0 --stream
-python -m jetson_piper_tts.speak "这是低延迟版本。" --voice zh_CN-huayan-x_low --device plughw:1,0 --stream
+python -m jetson_piper_tts.speak "这是朝文的声音。" --voice zh_CN-chaowen-medium --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
+python -m jetson_piper_tts.speak "这是花妍的声音。" --voice zh_CN-huayan-medium --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
+python -m jetson_piper_tts.speak "这是小雅的声音。" --voice zh_CN-xiao_ya-medium --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
+python -m jetson_piper_tts.speak "这是低延迟版本。" --voice zh_CN-huayan-x_low --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
 ```
 
-臨時讓 bridge 用某個 voice，不改設定檔：
+bridge 預設就是小雅，所以正式跑可以不用加 `--tts-voice`：
 
 ```bash
 cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
@@ -158,13 +255,23 @@ source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 
 python3 voice_chat_frdm_uart_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
-  --device 0 \
+  --mic-keyword UACDemo \
   --uart-port /dev/ttyACM0 \
-  --tts-voice zh_CN-xiao_ya-medium \
   --tts-debug
 ```
 
-如果你覺得某個 voice 最適合 demo，要永久改預設 voice，改 TTS 的 `.env`：
+如果你臨時想試別的 voice，再加 `--tts-voice`，例如：
+
+```bash
+python3 voice_chat_frdm_uart_bridge.py \
+  --server-url http://100.108.141.26:8766/voice-chat \
+  --mic-keyword UACDemo \
+  --uart-port /dev/ttyACM0 \
+  --tts-voice zh_CN-huayan-medium \
+  --tts-debug
+```
+
+如果之後要永久改成別的 voice，改 TTS 的 `.env`：
 
 ```bash
 sed -i 's#^PIPER_MODEL=.*#PIPER_MODEL=./models/zh_CN-xiao_ya-medium.onnx#' /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env
@@ -241,7 +348,7 @@ Windows 本機先測和 Tailscale IP 檢查請看上面的 Terminal A。
 ```bash
 python3 voice_chat_frdm_uart_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
-  --device 0 \
+  --mic-keyword UACDemo \
   --uart-port /dev/ttyACM0 \
   --tts-debug
 ```
@@ -251,7 +358,7 @@ python3 voice_chat_frdm_uart_bridge.py \
 ```bash
 python3 voice_chat_frdm_uart_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
-  --device 0 \
+  --mic-keyword UACDemo \
   --uart-port /dev/ttyACM0 \
   --no-tts
 ```
@@ -264,6 +371,68 @@ Voice chat will continue, but replies will not be spoken until jetson_piper_tts 
 ```
 
 這不是 FRDM 問題，意思只是 TTS server 沒開；聊天和 UART 仍然可以繼續。
+
+### 免 Enter：Wake Word 自動錄音版
+
+這支會一直監聽，不用按 Enter。先說：
+
+```text
+Hey Jarvis
+```
+
+喚醒後再講你的句子；當音量低於閾值一段時間，程式會自動停止錄音並送去 Windows AI。
+
+正式跑：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py \
+  --server-url http://100.108.141.26:8766/voice-chat \
+  --mic-keyword UACDemo \
+  --uart-port /dev/ttyACM0 \
+  --tts-debug
+```
+
+如果只測 FRDM，不要 TTS：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py \
+  --server-url http://100.108.141.26:8766/voice-chat \
+  --mic-keyword UACDemo \
+  --uart-port /dev/ttyACM0 \
+  --no-tts
+```
+
+常用調整：
+
+```bash
+# wake word 靈敏度，越低越容易被喚醒
+--wake-threshold 0.45
+
+# 語音音量門檻，越低越容易開始/持續錄音
+--volume-min 12000
+
+# 安靜多久後自動結束錄音
+--silence-duration 1.2
+
+# 喚醒後最多錄幾秒
+--max-speech-seconds 15
+
+# 印出監聽狀態和音量
+--listen-debug
+```
+
+完整調參範例：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py \
+  --server-url http://100.108.141.26:8766/voice-chat \
+  --mic-keyword UACDemo \
+  --uart-port /dev/ttyACM0 \
+  --wake-threshold 0.45 \
+  --volume-min 12000 \
+  --silence-duration 1.0 \
+  --tts-debug
+```
 
 完整流程會是：
 
@@ -516,6 +685,30 @@ tailscale ip -4
 New-NetFirewallRule -DisplayName "MakeNTU voice chat 8766" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8766
 ```
 
+### `Ollama request failed: WinError 10061`
+
+這代表 Windows 的 `desktop_fast_chat_server.py` 有啟動，但它連不到 Windows 本機 Ollama。也就是 Jetson 網路沒壞，是 Windows 上 Ollama API 沒在聽 `localhost:11434`。
+
+在 Windows PowerShell 先測：
+
+```powershell
+curl http://127.0.0.1:11434/api/tags
+```
+
+如果連不上，開一個新的 PowerShell 跑：
+
+```powershell
+ollama serve
+```
+
+然後保留這個視窗，再重開或重跑桌機 server：
+
+```powershell
+cd C:\Users\User\Desktop\windows_desktop_server_bundle
+.\.venv\Scripts\Activate.ps1
+python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+```
+
 ### `RMS=0.00000`
 
 這代表目前選到的錄音裝置沒有收到聲音，不是 Windows server，也不是 FRDM UART 問題。
@@ -526,16 +719,16 @@ New-NetFirewallRule -DisplayName "MakeNTU voice chat 8766" -Direction Inbound -A
 python3 voice_chat_frdm_uart_bridge.py --list-mics
 ```
 
-你這台 Jetson 目前有看到 USB 麥克風：
+你這台 Jetson 的 USB 麥克風名稱通常是 `UACDemoV1.0`。前面的 index 會因為 USB 重新枚舉而改變，可能是 `[0]`，也可能像現在一樣是 `[1]`：
 
 ```text
-[ 0] inputs=1 default_sr=48000.0 name=UACDemoV1.0: USB Audio (hw:0,0)
+[ 1] inputs=1 default_sr=48000.0 name=UACDemoV1.0: USB Audio (hw:1,0)
 ```
 
-所以啟動時請加：
+所以啟動時建議加：
 
 ```bash
---device 0
+--mic-keyword UACDemo
 ```
 
 完整例子：
@@ -543,10 +736,12 @@ python3 voice_chat_frdm_uart_bridge.py --list-mics
 ```bash
 python3 voice_chat_frdm_uart_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
-  --device 0 \
+  --mic-keyword UACDemo \
   --uart-port /dev/ttyACM0 \
   --no-tts
 ```
+
+如果你想手動指定 index，請用當下 `--list-mics` 顯示的數字；例如現在 USB mic 是 `[1]`，就用 `--device 1`，不是 `--device 0`。
 
 ### `TTS health check failed: Connection refused`
 
@@ -574,7 +769,7 @@ source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 
 python3 voice_chat_frdm_uart_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
-  --device 0 \
+  --mic-keyword UACDemo \
   --uart-port /dev/ttyACM0
 ```
 
@@ -591,13 +786,13 @@ aplay -l
 你這台目前看到 USB speaker：
 
 ```text
-card 1: UACDemoV1.0, device 0: USB Audio
+card 0: UACDemoV1.0, device 0: USB Audio
 ```
 
 所以 TTS 要用：
 
 ```text
-AUDIO_DEVICE=plughw:1,0
+AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
 ```
 
 確認設定：
@@ -606,10 +801,11 @@ AUDIO_DEVICE=plughw:1,0
 grep '^AUDIO_DEVICE=' /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env
 ```
 
-如果不是 `plughw:1,0`，改成：
+如果不是 `plughw:CARD=UACDemoV10,DEV=0`，改成：
 
 ```bash
-sed -i 's/^AUDIO_DEVICE=.*/AUDIO_DEVICE=plughw:1,0/' /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env
+sed -i 's#^AUDIO_DEVICE=.*#AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0#' /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env
+sed -i 's/^ENABLE_STREAM_PLAYBACK=.*/ENABLE_STREAM_PLAYBACK=true/' /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env
 ```
 
 然後重開 TTS server：
@@ -623,7 +819,7 @@ python -m jetson_piper_tts.server --host 0.0.0.0 --port 8777
 測試直接播放：
 
 ```bash
-python -m jetson_piper_tts.speak "USB喇叭测试。" --device plughw:1,0 --stream
+python -m jetson_piper_tts.speak "USB喇叭测试。" --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
 ```
 
 如果 direct speak 有聲音，但 bridge 沒聲音，bridge 加 `--tts-debug` 看 TTS 是否有 enqueue：
@@ -631,7 +827,7 @@ python -m jetson_piper_tts.speak "USB喇叭测试。" --device plughw:1,0 --stre
 ```bash
 python3 voice_chat_frdm_uart_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
-  --device 0 \
+  --mic-keyword UACDemo \
   --uart-port /dev/ttyACM0 \
   --tts-debug
 ```

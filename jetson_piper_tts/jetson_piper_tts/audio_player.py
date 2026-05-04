@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import itertools
 import os
 import shutil
 import signal
@@ -225,6 +226,27 @@ class AudioPlayer:
             command.extend(["-D", self.device])
 
         started = time.perf_counter()
+        bytes_written = 0
+        stderr = b""
+        iterator = iter(audio_chunks)
+        first_audio = b""
+        for audio in iterator:
+            if audio:
+                first_audio = audio
+                break
+
+        if not first_audio:
+            return {
+                "blocking": True,
+                "streaming": True,
+                "producer": "inprocess",
+                "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "format": sample_format,
+                "bytes_written": 0,
+            }
+
         process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -237,11 +259,9 @@ class AudioPlayer:
             self._current_processes = [process]
             self._current_file = None
 
-        bytes_written = 0
-        stderr = b""
         try:
             assert process.stdin is not None
-            for audio in audio_chunks:
+            for audio in itertools.chain((first_audio,), iterator):
                 if not audio:
                     continue
                 process.stdin.write(audio)

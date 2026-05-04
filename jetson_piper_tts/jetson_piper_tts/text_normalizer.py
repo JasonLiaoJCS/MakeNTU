@@ -10,7 +10,7 @@ _OPENCC = None
 _OPENCC_UNAVAILABLE = False
 
 _SPACE_RE = re.compile(r"\s+")
-_SENTENCE_SPLIT_RE = re.compile(r"([^。！？!?；;，,\n\r]+[。！？!?；;,，]?)")
+_SENTENCE_SPLIT_RE = re.compile(r"([^。！？!?；;\n\r]+[。！？!?；;]?)")
 _QUOTE_MAP = str.maketrans(
     {
         "“": '"',

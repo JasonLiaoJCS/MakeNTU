@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "created_at": "2026-05-04T22:32:50+08:00",
+  "created_at": "2026-05-05T00:36:03+08:00",
   "target": "FRDM-MCXN947",
   "transport": "usb-serial",
   "allowed_commands": [
@@ -10,21 +10,21 @@
     "MotorPitch",
     "MotorYaw"
   ],
-  "reply": "遵命，那我先去睡啦，晚安！",
-  "transcript": "你给我去睡觉。",
+  "reply": "抱歉讓你這麼生氣，我是不是哪裡做錯了？告訴我怎麼調整，我會努力改進。",
+  "transcript": "我操你妈的！",
   "emotion": {
-    "arousal": 0.25,
-    "intensity": 0.25,
-    "primary": "neutral",
-    "summary": "語氣接近中性，沒有明顯強烈情緒。",
+    "arousal": 0.9,
+    "intensity": 0.9,
+    "primary": "angry",
+    "summary": "使用者使用強烈髒話，情緒明顯偏憤怒或強烈挫折。",
     "support_needed": false,
-    "valence": 0.0
+    "valence": -0.85
   },
   "commands": [
     {
-      "name": "Sleep",
-      "wire": "Sleep",
-      "reason": "sleep/tired context"
+      "name": "Normal",
+      "wire": "Normal",
+      "reason": "default state"
     }
   ],
   "serial": {
@@ -32,13 +32,13 @@
     "baudrate": 115200,
     "line_ending": "crlf",
     "dry_run": false,
-    "elapsed_ms": 1196,
+    "elapsed_ms": 1194,
     "results": [
       {
-        "tx": "Sleep",
+        "tx": "Normal",
         "rx": [
-          "Sleep",
-          "switch to SLEEP"
+          "Normal",
+          "switch to NORMAL"
         ]
       }
     ]

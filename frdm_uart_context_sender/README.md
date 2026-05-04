@@ -63,6 +63,7 @@ frdm_uart_context_sender/
 ├── requirements.txt
 ├── frdm_uart_context_sender.py
 ├── voice_chat_frdm_uart_bridge.py
+├── wake_voice_chat_frdm_bridge.py
 └── examples/
     ├── uart_context.json
     └── uart_manual_commands.json
@@ -70,7 +71,31 @@ frdm_uart_context_sender/
 
 ## 完整語音聊天 + FRDM UART 橋接
 
+## 重要：不使用雲端 AI
+
+不要跑 `stt_node.py` 那套 Gemini Flash STT。那支會用 `GEMINI_API_KEY` 呼叫雲端 API。
+
+這包的 Enter 版和 hands-free 版 bridge 都走本地端 AI：
+
+```text
+Jetson 本地錄音 / wake word
+-> Windows 桌機 /voice-chat
+-> Windows 本地 ASR
+-> Windows 本地 Ollama qwen35-fast
+-> Jetson FRDM UART + Piper TTS
+```
+
+這包不會呼叫 Gemini、OpenAI 或其他雲端 AI API。`openwakeword` 只在 Jetson 本機做喚醒詞偵測。
+
 如果你要跑完整流程，不要直接跑舊的 `jetson_fast_voice_chat.py`。請跑這個新檔：
+
+這包目前預設 TTS voice 是小雅：
+
+```text
+zh_CN-xiao_ya-medium
+```
+
+Enter 版和 hands-free 版 bridge 都會在沒有指定 `--tts-voice` 時自動使用小雅。
 
 ```bash
 cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
@@ -78,8 +103,40 @@ source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 
 python3 voice_chat_frdm_uart_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
-  --device 0 \
+  --mic-keyword UACDemo \
   --uart-port /dev/ttyACM0
+```
+
+如果你要省略 Enter，改用 wake word 自動錄音，跑：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py \
+  --server-url http://100.108.141.26:8766/voice-chat \
+  --mic-keyword UACDemo \
+  --uart-port /dev/ttyACM0 \
+  --tts-debug
+```
+
+hands-free 版流程：
+
+```text
+常駐監聽
+-> 偵測 "hey_jarvis"
+-> 開始錄音
+-> 音量低於 VOLUME_MIN 並持續 SILENCE_DURATION 秒
+-> 自動停止錄音
+-> 送 Windows /voice-chat
+-> FRDM UART + TTS
+```
+
+常用調整：
+
+```bash
+--wake-threshold 0.45      # 越低越容易喚醒
+--volume-min 12000         # 越低越容易保留講話聲
+--silence-duration 1.0     # 安靜多久後停止錄音
+--max-speech-seconds 15    # 最長錄音秒數
+--listen-debug             # 印出監聽狀態
 ```
 
 流程：
@@ -121,6 +178,12 @@ curl -v --connect-timeout 5 http://100.108.141.26:8766/health
 如果 timeout，回 Windows PowerShell 啟動 server：
 
 ```powershell
+ollama serve
+```
+
+另外開一個 Windows PowerShell：
+
+```powershell
 cd C:\Users\User\Desktop\windows_desktop_server_bundle
 .\.venv\Scripts\Activate.ps1
 python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
@@ -129,6 +192,7 @@ python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwe
 Windows 本機先測：
 
 ```powershell
+curl http://127.0.0.1:11434/api/tags
 curl http://127.0.0.1:8766/health
 ```
 
@@ -145,21 +209,44 @@ tailscale ip -4
 ```bash
 python3 voice_chat_frdm_uart_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
-  --device 0 \
+  --mic-keyword UACDemo \
   --uart-port /dev/ttyACM0 \
   --no-tts
 ```
 
 ## 安裝
 
-建議直接用你現有的 Python venv，或另外開一個新的 venv。
+這包 bridge 實際執行時用的是語音聊天 venv，所以依賴要裝進：
+
+```text
+/home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv
+```
 
 ```bash
 cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 python3 -m pip install -r requirements.txt
 ```
 
 只做 `--dry-run` 不需要 `pyserial`，真的要送 UART 才需要。
+
+hands-free 版需要 `openwakeword`。如果看到：
+
+```text
+ERROR: Missing dependency: openwakeword
+```
+
+代表你沒有把依賴裝進上面這個 venv，重新跑一次 `python3 -m pip install -r requirements.txt`。
+
+第一次使用 wake word 時還需要 `hey_jarvis` 模型檔。新版 `wake_voice_chat_frdm_bridge.py` 會自動下載；如果要手動確認：
+
+```bash
+python3 - <<'PY'
+from openwakeword.utils import download_models
+download_models(["hey_jarvis"])
+print("hey_jarvis model ready")
+PY
+```
 
 ## 找 USB UART Port
 
@@ -581,6 +668,30 @@ New-NetFirewallRule -DisplayName "MakeNTU voice chat 8766" -Direction Inbound -A
 
 `--no-preflight` 只能跳過啟動時的 `/health` 檢查；如果網路本身不通，後面的 `/voice-chat` 一樣會失敗。
 
+### `Ollama request failed: WinError 10061`
+
+這代表 Jetson 已經連到 Windows 的 `desktop_fast_chat_server.py`，但是桌機 server 連不到 Windows 本機 Ollama。通常是 Ollama 沒啟動，或 `localhost:11434` 沒在服務。
+
+Windows PowerShell 先測：
+
+```powershell
+curl http://127.0.0.1:11434/api/tags
+```
+
+如果連不上，開一個新的 PowerShell 跑：
+
+```powershell
+ollama serve
+```
+
+然後保留 Ollama 視窗，再重開桌機 server：
+
+```powershell
+cd C:\Users\User\Desktop\windows_desktop_server_bundle
+.\.venv\Scripts\Activate.ps1
+python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+```
+
 ### `RMS=0.00000`
 
 這代表目前選到的 Jetson 錄音裝置沒有收到聲音。Windows server 和 FRDM UART 都還沒有問題，因為程式在 RMS 太低時會直接 skip，不會 POST audio。
@@ -591,22 +702,22 @@ New-NetFirewallRule -DisplayName "MakeNTU voice chat 8766" -Direction Inbound -A
 python3 voice_chat_frdm_uart_bridge.py --list-mics
 ```
 
-你這台 Jetson 目前看到的 USB 麥克風是：
+你這台 Jetson 的 USB 麥克風名稱通常是 `UACDemoV1.0`，但前面的 index 可能會因為重新插拔而變成 `[0]`、`[1]` 或其他數字。例如：
 
 ```text
-[ 0] inputs=1 default_sr=48000.0 name=UACDemoV1.0: USB Audio (hw:0,0)
+[ 1] inputs=1 default_sr=48000.0 name=UACDemoV1.0: USB Audio (hw:1,0)
 ```
 
-所以正式啟動時請指定 `--device 0`：
+所以正式啟動時建議用名稱自動找麥克風：
 
 ```bash
 python3 voice_chat_frdm_uart_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
-  --device 0 \
+  --mic-keyword UACDemo \
   --uart-port /dev/ttyACM0
 ```
 
-如果指定 `--device 0` 後 RMS 還是 0，檢查 USB mic 是否靜音、接觸不良、音量太低，或用下面指令看 PulseAudio 預設 source：
+如果你一定要寫死 index，請用 `--list-mics` 當下顯示的數字；例如目前顯示 `[1]` 就用 `--device 1`。如果 RMS 還是 0，檢查 USB mic 是否靜音、接觸不良、音量太低，或用下面指令看 PulseAudio 預設 source：
 
 ```bash
 pactl get-default-source
