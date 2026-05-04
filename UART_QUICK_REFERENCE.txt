@@ -1,0 +1,95 @@
+# Jetson Orin Nano UART 快速参考
+
+## 快速检查可用UART
+
+```bash
+# 检测所有可用UART设备
+python3 uart_testloopback.py --detect
+
+# 查看设备详细信息
+python3 uart_testloopback.py --info
+```
+
+## 快速 Loopback 测试
+
+```bash
+# 对 /dev/ttyTHS0 进行 loopback 测试（需要用跳线连接 TX 和 RX）
+python3 uart_testloopback.py --test
+
+# 对其他 UART 进行测试
+python3 uart_testloopback.py --test --port /dev/ttyTHS1
+python3 uart_testloopback.py --test --port /dev/ttyTHS2
+python3 uart_testloopback.py --test --port /dev/ttyTHS3
+```
+
+## 快速数据发送
+
+```bash
+# 发送单条消息
+python3 uart_testloopback.py --send --message "Hello Jetson"
+
+# 重复发送5次
+python3 uart_testloopback.py --send --message "Test" --repeat 5
+
+# 指定端口和波特率
+python3 uart_testloopback.py --send --port /dev/ttyTHS0 --baudrate 115200 --message "Data"
+```
+
+## 硬件接线
+
+### Loopback 连接（测试用）
+```
+J41 Pin 8  (UART1_TX) ──────┐
+                             ├─── 用跳线直接连接
+J41 Pin 10 (UART1_RX) ──────┘
+
+同板 loopback 不需要额外接 GND；只有接外部设备时才要接 GND
+```
+
+## UART 脚位速查表
+
+| 设备 | TX 脚 | RX 脚 | 设备文件 |
+|------|-------|-------|----------|
+| UART1 | 8 | 10 | /dev/ttyTHS0 |
+| UART2 | 5 | 7 | /dev/ttyTHS1 |
+| UART3 | 11 | 13 | /dev/ttyTHS2 |
+| UART4 | 32 | 31 | /dev/ttyTHS3 |
+
+所有UART GND脚: 6, 9, 14, 20, 25, 30, 34, 39
+
+## 权限问题
+
+```bash
+# 给予权限
+sudo chmod 666 /dev/ttyTHS0
+
+# 或永久添加用户到 dialout 组
+sudo usermod -a -G dialout $USER
+newgrp dialout
+```
+
+## 常见命令
+
+```bash
+# 用 cat 查看原始串口数据
+sudo cat /dev/ttyTHS0
+
+# 用 screen 连接串口（Ctrl+A+K 退出）
+sudo screen /dev/ttyTHS0 115200
+
+# 用 minicom 交互式连接
+sudo minicom -D /dev/ttyTHS0 -b 115200
+```
+
+## 当前配置
+
+你的项目在 `config.yaml` 中配置的是：
+- 端口: `/dev/ttyTHS1`（UART2）
+- 波特率: `115200`
+- 超时: `1.0 秒`
+
+## 完整帮助
+
+```bash
+python3 uart_testloopback.py --help
+```

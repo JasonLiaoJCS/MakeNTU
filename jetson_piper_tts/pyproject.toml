@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jetson-piper-tts"
+version = "0.1.0"
+description = "Low-latency local Piper TTS service for NVIDIA Jetson Orin Nano"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "MakeNTU" }]
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic",
+  "python-dotenv",
+  "opencc-python-reimplemented",
+  "requests",
+  "piper-tts",
+  "g2pw",
+  "unicode-rbnf",
+  "sentence-stream",
+  "httpx",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+jetson-piper-tts-server = "jetson_piper_tts.server:main"
+jetson-piper-tts-speak = "jetson_piper_tts.speak:main"
+jetson-piper-tts-prewarm = "jetson_piper_tts.prewarm:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jetson_piper_tts*"]

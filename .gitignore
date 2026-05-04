@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs and runtime debug
+*.log
+*.jsonl
+fast_chat_debug.jsonl
+
+# Generated archives and audio
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# Large local ML artifacts
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.bin
+jetson_piper_tts/models/*
+!jetson_piper_tts/models/.gitkeep
+jetson_piper_tts/cache/*
+!jetson_piper_tts/cache/.gitkeep
+jetson_piper_tts/g2pW/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ROS / build outputs
+build/
+install/
+log/

@@ -1,0 +1,60 @@
+serial:
+  # Jetson Nano 40-pin TXD/RXD direct UART.
+  # J41 pin 5 TXD / pin 7 RXD is /dev/ttyTHS1 on this setup.
+  port: /dev/ttyTHS1
+  baudrate: 115200
+  timeout_sec: 1.0
+  ack_timeout_sec: 1.0
+  retry_count: 2
+  line_ending: "\n"
+  # TXD/RXD direct mode sends raw existing FRDM monitor commands such as:
+  # Sleep
+  # Normal
+  # MotorPitch 90
+  # MotorYaw 90
+  # Keep this empty for direct raw UART.
+  command_prefix: ""
+
+ai:
+  backend: ollama
+  ollama:
+    base_url: http://100.108.141.26:11434
+    model: qwen35-fast:latest
+    stream: false
+    think: false
+    api: chat
+  openai_compatible:
+    base_url: http://127.0.0.1:1234/v1
+    api_key_env: LOCAL_API_KEY
+    model: local-model
+    temperature: 0.2
+
+motion:
+  default_speed: 25
+  default_hold_ms: 1000
+  roll_min: 55
+  roll_center: 90
+  roll_max: 125
+  pitch_min: 55
+  pitch_center: 90
+  pitch_max: 125
+
+emotion:
+  map_file: emotion_map.yaml
+  allowed_emotions:
+    - neutral
+    - happy
+    - excited
+    - sad
+    - tired
+    - angry
+    - surprised
+    - curious
+    - confused
+    - thinking
+    - concerned
+    - sleepy
+
+logging:
+  level: INFO
+  log_file: logs/controller.log

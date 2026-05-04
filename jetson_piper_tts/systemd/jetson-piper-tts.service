@@ -1,0 +1,17 @@
+[Unit]
+Description=Jetson Piper TTS HTTP server
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__PROJECT_DIR__
+EnvironmentFile=-__PROJECT_DIR__/.env
+ExecStart=__PROJECT_DIR__/.venv/bin/python -m jetson_piper_tts.server
+Restart=always
+RestartSec=3
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

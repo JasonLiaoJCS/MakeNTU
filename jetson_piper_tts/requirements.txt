@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+opencc-python-reimplemented
+requests
+piper-tts
+g2pw
+unicode-rbnf
+sentence-stream
+pytest
+httpx
