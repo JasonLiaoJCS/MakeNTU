@@ -2,3 +2,5 @@ pyserial
 numpy
 sounddevice
 openwakeword
+# Optional for wake-time camera capture if Jetson does not already provide cv2:
+# opencv-python

@@ -11,7 +11,7 @@ from PIL import Image
 from latest_frame_camera import LatestFrameCamera
 
 OLLAMA_URL = "http://100.108.141.26:11434/api/chat"
-MODEL = "qwen-fast:latest"
+MODEL = "qwen35-fast:latest"
 
 CAMERA_ID = "auto"
 CAMERA_WIDTH = 320

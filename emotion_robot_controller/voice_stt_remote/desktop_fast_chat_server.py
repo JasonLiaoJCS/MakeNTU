@@ -2,13 +2,14 @@
 Fast desktop voice chat server.
 
 Purpose:
-    Receive WAV from Jetson -> Qwen3-ASR -> one fast Ollama plain chat call + local emotion.
+    Receive WAV plus optional camera JPEG from Jetson -> Qwen3-ASR
+    -> route to text chat or vision chat based on transcript keywords.
 
 Windows PowerShell:
     cd C:\\Users\\User\\Desktop\\windows_desktop_server_bundle
     .\\.venv\\Scripts\\Activate.ps1
     ollama pull qwen35-fast:latest
-    python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+    python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --vision-model qwen35-fast:latest --no-think
 
 Jetson test:
     curl http://100.108.141.26:8766/health
@@ -17,6 +18,7 @@ Jetson test:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import tempfile
@@ -39,7 +41,10 @@ from desk_voice_controller import (
 
 
 DEFAULT_FAST_MODEL = "qwen35-fast:latest"
-DEBUG_VERSION = 6
+DEFAULT_VISION_MODEL = "qwen35-fast:latest"
+VISION_FALLBACK_MODELS: tuple[str, ...] = ()
+DEFAULT_MAX_IMAGE_BYTES = 2_000_000
+DEBUG_VERSION = 9
 
 EMOTIONS = [
     "neutral",
@@ -73,12 +78,125 @@ SYSTEM_PROMPT = """
 - 回覆控制在 1 到 3 句。
 """.strip()
 
+VISION_SYSTEM_PROMPT = """
+你是自然聊天助手，而且可以看使用者剛剛拍下的相機畫面。
+
+任務：
+- 先理解使用者原話，再根據圖片內容回答。
+- 如果使用者問「這是什麼」、「桌上有什麼」、「螢幕上是什麼」等問題，請直接描述你能看出的內容。
+- 不要編造看不到的細節；不確定時說可能是什麼。
+- 不要輸出 JSON、markdown、標題、分析欄位或條列。
+- 使用使用者同一種語言或口吻回覆。
+- 回覆控制在 1 到 3 句。
+""".strip()
+
+VISION_INTENT_KEYWORDS = (
+    "看一下",
+    "幫我看",
+    "帮我看",
+    "你看",
+    "看看",
+    "看我",
+    "看這個",
+    "看这个",
+    "看那個",
+    "看那个",
+    "這是什麼",
+    "这是什么",
+    "這個是什麼",
+    "这个是什么",
+    "那是什麼",
+    "那是什么",
+    "我手上",
+    "桌上",
+    "螢幕上",
+    "屏幕上",
+    "圖片",
+    "图片",
+    "照片",
+    "畫面",
+    "画面",
+    "影像",
+    "相機",
+    "相机",
+    "辨識",
+    "识别",
+    "分析畫面",
+    "分析画面",
+    "看得到嗎",
+    "看得到吗",
+    "你看到什麼",
+    "你看到什么",
+    "幫我判斷",
+    "帮我判断",
+    "幫我辨識",
+    "帮我识别",
+    "這題",
+    "这题",
+    "這個零件",
+    "这个零件",
+    "這個東西",
+    "这个东西",
+    "這張",
+    "这张",
+    "這是什麼顏色",
+    "这是什么颜色",
+    "什麼顏色",
+    "什么颜色",
+    "有幾個東西",
+    "有几个东西",
+    "寫什麼",
+    "写什么",
+    "顯示什麼",
+    "显示什么",
+    "拍到的",
+    "look",
+    "see",
+    "camera",
+    "image",
+    "picture",
+    "photo",
+    "what is this",
+    "what do you see",
+    "can you see",
+    "identify this",
+    "analyze this",
+    "check this",
+    "check 一下",
+    "read this",
+    "read this text",
+    "screen says",
+    "screen",
+    "object",
+)
+
+VISION_INTENT_PATTERNS = (
+    ("zh_self_expression", r"(我(現在|现在|目前)?(是|有)?(什麼|什么)?(表情|臉色|脸色)|我.*(什麼|什么).*表情)"),
+    ("zh_self_look", r"我(現在|现在|目前)?看起來.*(累|疲倦|開心|开心|生氣|生气|難過|难过|怎麼樣|怎么样)"),
+    ("zh_self_smile", r"我(現在|现在|目前)?(是不是|有沒有|有没有|是否).*(笑|微笑|皺眉|皱眉|累|駝背|驼背)"),
+    ("zh_posture", r"(我(現在|现在|目前)?的?)?(姿勢|姿势).*(怎麼樣|怎么样|正確|正确|對不對|对不对|好不好)"),
+    ("zh_holding", r"我(手上|手裡|手里).*(拿|有|握|抓|是什麼|是什么|什麼|什么)"),
+    ("zh_wearing_color", r"我.*(穿|衣服|外套|帽子).*(顏色|颜色|什麼色|什么色|什麼顏色|什么颜色)"),
+    ("zh_scene_desk", r"(桌上|桌面|桌子上).*(有什麼|有什么|是什麼|是什么|幾個|几个|亂|乱|東西|东西)"),
+    ("zh_scene_screen_text", r"(螢幕|屏幕|畫面|画面).*(上)?(寫|写|顯示|显示|是什麼|是什么|什麼|什么|文字|字)"),
+    ("zh_this_color_count", r"(這|这|那).*(是)?(什麼|什么|幾個|几个|顏色|颜色|東西|东西|零件|物品)"),
+    ("en_expression", r"\b(what\s+is\s+my\s+expression|how\s+do\s+i\s+look|do\s+i\s+look\s+\w+|am\s+i\s+(smiling|frowning)|my\s+expression)\b"),
+    ("en_holding_wearing", r"\b(what\s+am\s+i\s+holding|what\s+am\s+i\s+wearing|what\s+color\s+am\s+i\s+wearing)\b"),
+    ("en_scene", r"\b(what\s+is\s+on\s+the\s+desk|what'?s\s+on\s+the\s+desk|what\s+is\s+on\s+screen|what\s+does\s+the\s+screen\s+say)\b"),
+    ("en_posture_text", r"\b(check\s+my\s+posture|read\s+(this|the)\s+(text|screen)|identify\s+this|analy[zs]e\s+this|check\s+this)\b"),
+)
+
 
 app = Flask(__name__)
 asr_adapter: QwenASRAdapter | None = None
 chat_engine: "FastChatEmotionEngine | None" = None
 last_debug: dict[str, Any] = {}
 debug_log_path: Path | None = None
+vision_model = DEFAULT_VISION_MODEL
+vision_timeout_sec = 180.0
+vision_enabled = True
+server_force_vision = False
+max_image_bytes = DEFAULT_MAX_IMAGE_BYTES
 
 
 def set_last_debug(data: dict[str, Any]) -> None:
@@ -122,6 +240,44 @@ def norm(text: str) -> str:
 
 def has_any(text: str, words: list[str]) -> bool:
     return any(word in text for word in words)
+
+
+def normalize_vision_intent_text(text: str) -> str:
+    text = str(text or "").lower().strip()
+    return re.sub(r"[\s，。！？!?、,.：:；;「」『』\"'`]+", "", text)
+
+
+def detect_vision_intent(transcript: str) -> tuple[bool, str]:
+    if transcript is None:
+        return False, "empty_transcript"
+    raw_text = str(transcript).strip()
+    if not raw_text:
+        return False, "empty_transcript"
+
+    normalized = normalize_vision_intent_text(raw_text)
+    for keyword in VISION_INTENT_KEYWORDS:
+        normalized_keyword = normalize_vision_intent_text(keyword)
+        if normalized_keyword and normalized_keyword in normalized:
+            return True, f"keyword:{keyword}"
+
+    regex_text = raw_text.lower().strip()
+    for name, pattern in VISION_INTENT_PATTERNS:
+        if re.search(pattern, regex_text, flags=re.IGNORECASE):
+            return True, f"pattern:{name}"
+
+    return False, "no_visual_intent_match"
+
+
+def should_use_vision(transcript: str) -> bool:
+    return detect_vision_intent(transcript)[0]
+
+
+def truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "force", "forced"}
 
 
 def analyze_emotion_local(transcript: str) -> dict[str, Any]:
@@ -323,6 +479,43 @@ class FastChatEmotionEngine:
             },
         }
 
+    def vision_user_content(self, transcript: str, use_no_think: bool) -> str:
+        content = f"""使用者原話：{transcript}
+
+請根據使用者原話和這張相機畫面直接自然回覆。不要輸出 JSON。"""
+        if use_no_think:
+            content = "/no_think\n" + content
+        return content
+
+    def build_vision_payload(
+        self,
+        transcript: str,
+        image_bytes: bytes,
+        *,
+        model: str,
+        use_no_think: bool,
+    ) -> dict[str, Any]:
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        return {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": self.vision_user_content(transcript, use_no_think),
+                    "images": [image_b64],
+                },
+            ],
+            "stream": False,
+            "think": False,
+            "keep_alive": "30m",
+            "options": {
+                "temperature": 0.2,
+                "num_ctx": 4096,
+                "num_predict": 220,
+            },
+        }
+
     def warm_up(self) -> None:
         print(f"Ollama warm-up: model={self.model}, no_think={self.no_think}")
         result = self.analyze("你好，聽得到我說話嗎？")
@@ -429,6 +622,155 @@ class FastChatEmotionEngine:
             set_last_debug(debug)
             return result
 
+    def analyze_with_vision(
+        self,
+        transcript: str,
+        image_bytes: bytes,
+        *,
+        request_id: str = "",
+        model: str = DEFAULT_VISION_MODEL,
+        timeout_sec: float = 180.0,
+    ) -> dict[str, Any]:
+        reply_started = time.monotonic()
+        request_id = request_id or uuid.uuid4().hex[:8]
+        debug: dict[str, Any] = {
+            "request_id": request_id,
+            "timestamp": now_stamp(),
+            "ollama_url": self.url,
+            "ollama_model": model,
+            "text_ollama_model": self.model,
+            "vision_requested": True,
+            "used_vision": True,
+            "image_bytes": len(image_bytes),
+            "no_think": self.no_think,
+            "think": False,
+            "transcript_chars": len(transcript),
+            "transcript_preview": short_text(transcript, 120),
+            "stage": "vision_ollama_request",
+        }
+        payload = self.build_vision_payload(
+            transcript,
+            image_bytes,
+            model=model,
+            use_no_think=self.no_think,
+        )
+        try:
+            print(f"voice-chat {request_id}: calling vision model={model} image_bytes={len(image_bytes)}")
+            response = post_json_with_debug(self.url, payload, timeout_sec=timeout_sec)
+            debug["stage"] = "vision_ollama_response"
+            if "error" in response:
+                raise RuntimeError(f"Ollama vision error: {short_text(str(response.get('error', 'unknown error')))}")
+
+            debug.update(summarize_ollama_response(response))
+            content = extract_ollama_text(response)
+            if not content.strip() and self.no_think:
+                debug["retry_reason"] = "empty vision content with /no_think; retrying without /no_think"
+                retry_payload = self.build_vision_payload(
+                    transcript,
+                    image_bytes,
+                    model=model,
+                    use_no_think=False,
+                )
+                response = post_json_with_debug(self.url, retry_payload, timeout_sec=timeout_sec)
+                debug["retried_without_no_think"] = True
+                if "error" in response:
+                    raise RuntimeError(f"Ollama vision retry error: {short_text(str(response.get('error', 'unknown error')))}")
+                debug.update({f"retry_{key}": value for key, value in summarize_ollama_response(response).items()})
+                content = extract_ollama_text(response)
+
+            debug.update(
+                {
+                    "ollama_done": response.get("done"),
+                    "ollama_content_chars": len(content),
+                    "ollama_content_preview": short_text(strip_thinking_text(content), 500),
+                }
+            )
+            parsed = extract_json_object(content)
+            if parsed is not None:
+                debug["parse_status"] = "json_reply"
+                reply = str(parsed.get("reply", "")).strip()
+            else:
+                debug["parse_status"] = "plain_reply"
+                reply = strip_reply(content)
+            if not reply:
+                raise ValueError("Ollama vision returned empty content")
+
+            emotion = analyze_emotion_local(transcript)
+            result = {
+                "request_id": request_id,
+                "reply": reply,
+                "emotion": emotion,
+                "vision_requested": True,
+                "used_vision": True,
+                "vision_model": model,
+                "vision_attempted_model": model,
+                "vision_error": None,
+                "timing": {
+                    "vision_ms": elapsed_ms(reply_started),
+                    "llm_ms": elapsed_ms(reply_started),
+                },
+                "debug": debug,
+            }
+            debug.update({"ok": True, "reply_chars": len(reply), "emotion_primary": emotion.get("primary")})
+            set_last_debug(debug)
+            return result
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
+            reason = f"Vision model failed: {short_error(exc)}"
+            print(f"WARN: {reason}")
+            fallback_model = next((candidate for candidate in VISION_FALLBACK_MODELS if candidate != model), "")
+            if fallback_model:
+                print(f"WARN: retrying vision with fallback model {fallback_model}")
+                retry_result = self.analyze_with_vision(
+                    transcript,
+                    image_bytes,
+                    request_id=request_id,
+                    model=fallback_model,
+                    timeout_sec=timeout_sec,
+                )
+                if retry_result.get("used_vision"):
+                    retry_result["vision_attempted_model"] = model
+                    retry_result["vision_fallback_from"] = model
+                    retry_result["vision_fallback_reason"] = reason
+                    retry_debug = retry_result.get("debug") if isinstance(retry_result.get("debug"), dict) else {}
+                    retry_debug["vision_fallback_from"] = model
+                    retry_debug["vision_fallback_reason"] = reason
+                    retry_result["debug"] = retry_debug
+                    return retry_result
+            debug.update(
+                {
+                    "ok": False,
+                    "stage": "vision_exception",
+                    "fallback_reason": reason,
+                    "exception_type": exc.__class__.__name__,
+                    "used_vision": False,
+                }
+            )
+            text_result = self.analyze(transcript, request_id=request_id)
+            original_reply = str(text_result.get("reply", "")).strip()
+            prefix = "我剛剛沒有成功看到畫面，但我可以先根據你說的內容回答。"
+            text_result["reply"] = f"{prefix}{' ' + original_reply if original_reply else ''}"
+            text_result["vision_requested"] = True
+            text_result["used_vision"] = False
+            text_result["vision_model"] = model
+            text_result["vision_error"] = reason
+            text_result["fallback_reason"] = reason
+            timing = text_result.setdefault("timing", {})
+            if isinstance(timing, dict):
+                timing["vision_ms"] = elapsed_ms(reply_started)
+            text_debug = text_result.get("debug") if isinstance(text_result.get("debug"), dict) else {}
+            text_debug.update(
+                {
+                    "vision_requested": True,
+                    "used_vision": False,
+                    "vision_error": reason,
+                    "vision_stage": debug.get("stage"),
+                    "vision_model": model,
+                }
+            )
+            text_result["debug"] = text_debug
+            set_last_debug(text_debug)
+            return text_result
+
 
 def strip_reply(content: str) -> str:
     text = strip_thinking_text(content)
@@ -488,6 +830,39 @@ def clamp_float(value: Any, default: float, minimum: float, maximum: float) -> f
     return max(minimum, min(maximum, number))
 
 
+def parse_metadata(raw: str | None) -> dict[str, Any]:
+    if raw is None or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"_parse_error": "metadata is not valid JSON"}
+    return parsed if isinstance(parsed, dict) else {"_parse_error": "metadata JSON is not an object"}
+
+
+def read_optional_image_bytes(upload: Any | None) -> tuple[bytes | None, str | None]:
+    if upload is None:
+        return None, "no image uploaded"
+    try:
+        data = upload.read(max_image_bytes + 1)
+    except Exception as exc:
+        return None, f"image upload read failed: {short_error(exc)}"
+    if not data:
+        return None, "empty image upload"
+    if len(data) > max_image_bytes:
+        return None, f"image upload too large: {len(data)} bytes > {max_image_bytes}"
+    return data, None
+
+
+def prefix_vision_unavailable(result: dict[str, Any], reason: str) -> dict[str, Any]:
+    original_reply = str(result.get("reply", "")).strip()
+    prefix = "我剛剛沒有成功看到畫面，但我可以先根據你說的內容回答。"
+    result["reply"] = f"{prefix}{' ' + original_reply if original_reply else ''}"
+    result["vision_error"] = reason
+    result["fallback_reason"] = reason
+    return result
+
+
 @app.get("/health")
 def health() -> Any:
     return jsonify(
@@ -500,6 +875,10 @@ def health() -> Any:
             "ollama_url": chat_engine.url if chat_engine is not None else None,
             "ollama_model": chat_engine.model if chat_engine is not None else None,
             "no_think": chat_engine.no_think if chat_engine is not None else None,
+            "vision_enabled": vision_enabled,
+            "vision_model": vision_model,
+            "force_vision": server_force_vision,
+            "max_image_bytes": max_image_bytes,
             "routes": ["/health", "/debug", "/text-chat", "/voice-chat"],
             "last_debug": last_debug,
             "debug_log": str(debug_log_path) if debug_log_path is not None else None,
@@ -516,6 +895,9 @@ def debug_status() -> Any:
             "debug_version": DEBUG_VERSION,
             "asr_loaded": asr_adapter is not None and asr_adapter.model is not None,
             "chat_ready": chat_engine is not None,
+            "vision_enabled": vision_enabled,
+            "vision_model": vision_model,
+            "force_vision": server_force_vision,
             "last_debug": last_debug,
             "debug_log": str(debug_log_path) if debug_log_path is not None else None,
         }
@@ -545,17 +927,121 @@ def voice_chat() -> Any:
     upload = request.files.get("audio")
     if upload is None:
         return jsonify({"ok": False, "request_id": request_id, "error": "missing audio"}), 400
+    image_upload = request.files.get("image")
+    metadata = parse_metadata(request.form.get("metadata"))
 
     temp_path = save_upload_to_temp_wav(upload)
     try:
         asr_started = time.monotonic()
         transcript = asr_adapter.transcribe(temp_path).strip()
         asr_ms = elapsed_ms(asr_started)
-        result = chat_engine.analyze(transcript, request_id=request_id)
+
+        image_received = image_upload is not None
+        image_error: str | None = None
+        image_bytes: bytes | None = None
+        if image_received:
+            image_bytes, image_error = read_optional_image_bytes(image_upload)
+        image_size_bytes = len(image_bytes) if image_bytes else 0
+
+        intent_started = time.monotonic()
+        auto_vision_intent, auto_vision_reason = detect_vision_intent(transcript)
+        vision_intent_ms = elapsed_ms(intent_started)
+        normalized_transcript = normalize_vision_intent_text(transcript)
+
+        metadata_mode = str(metadata.get("vision_mode", "")).strip().lower()
+        client_no_vision = truthy(metadata.get("no_vision")) or metadata_mode in {"off", "disabled", "disable", "no_vision", "none"}
+        client_force_vision = truthy(metadata.get("force_vision")) or metadata_mode in {"force", "forced", "always"}
+
+        if client_no_vision:
+            vision_requested = False
+            vision_reason = "disabled_by_client_no_vision"
+        elif not vision_enabled:
+            vision_requested = False
+            vision_reason = "disabled_by_server_no_vision"
+        elif client_force_vision:
+            vision_requested = True
+            vision_reason = "forced_by_client_metadata"
+        elif server_force_vision:
+            vision_requested = True
+            vision_reason = "forced_by_server_flag"
+        else:
+            vision_requested = auto_vision_intent
+            vision_reason = auto_vision_reason
+
+        print(f"voice-chat {request_id}: transcript={transcript!r}")
+        print(f"voice-chat {request_id}: normalized_transcript={normalized_transcript!r}")
+        print(
+            f"voice-chat {request_id}: vision_intent={vision_requested} "
+            f"reason={vision_reason} auto={auto_vision_intent}:{auto_vision_reason} "
+            f"image_received={image_received} image_size_bytes={image_size_bytes}"
+        )
+
+        if vision_requested and vision_enabled:
+            if image_bytes:
+                result = chat_engine.analyze_with_vision(
+                    transcript,
+                    image_bytes,
+                    request_id=request_id,
+                    model=vision_model,
+                    timeout_sec=vision_timeout_sec,
+                )
+            else:
+                reason = image_error or "image unavailable"
+                print(f"ERROR: voice-chat {request_id}: vision_intent=True but image unavailable: {reason}")
+                result = chat_engine.analyze(transcript, request_id=request_id)
+                result = prefix_vision_unavailable(result, reason)
+                result["vision_requested"] = True
+                result["used_vision"] = False
+                result["vision_model"] = vision_model
+        else:
+            result = chat_engine.analyze(transcript, request_id=request_id)
+            result["vision_requested"] = vision_requested
+            result["used_vision"] = False
+            result["vision_model"] = vision_model
+            if auto_vision_intent and not vision_enabled:
+                result = prefix_vision_unavailable(result, "vision disabled on server")
+
         timing = result.setdefault("timing", {})
         timing["asr_ms"] = asr_ms
+        timing["vision_intent_ms"] = vision_intent_ms
         timing["total_ms"] = elapsed_ms(started)
-        return jsonify({"ok": True, "transcript": transcript, **result, "elapsed_ms": elapsed_ms(started)})
+        result["vision_intent"] = vision_requested
+        result["vision_requested"] = vision_requested
+        result["vision_reason"] = vision_reason
+        result["auto_vision_intent"] = auto_vision_intent
+        result["auto_vision_reason"] = auto_vision_reason
+        result["normalized_transcript"] = normalized_transcript
+        result["image_received"] = image_received
+        result["image_size_bytes"] = image_size_bytes
+        result["image_bytes"] = image_size_bytes
+        result.setdefault("vision_error", None)
+
+        debug_obj = result.get("debug")
+        if isinstance(debug_obj, dict):
+            debug_obj.update(
+                {
+                    "vision_intent": vision_requested,
+                    "vision_reason": vision_reason,
+                    "auto_vision_intent": auto_vision_intent,
+                    "auto_vision_reason": auto_vision_reason,
+                    "normalized_transcript": normalized_transcript,
+                    "image_received": image_received,
+                    "image_size_bytes": image_size_bytes,
+                    "client_vision_mode": metadata_mode or "auto",
+                    "client_force_vision": client_force_vision,
+                    "client_no_vision": client_no_vision,
+                    "server_force_vision": server_force_vision,
+                }
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "transcript": transcript,
+                **result,
+                "client_metadata": metadata,
+                "elapsed_ms": elapsed_ms(started),
+            }
+        )
     except Exception as exc:
         debug = {
             "request_id": request_id,
@@ -591,6 +1077,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     parser.add_argument("--ollama-model", default=DEFAULT_FAST_MODEL)
+    parser.add_argument("--vision-model", default=DEFAULT_VISION_MODEL)
+    parser.add_argument("--vision-timeout", type=float, default=180.0)
+    parser.add_argument("--max-image-bytes", type=int, default=DEFAULT_MAX_IMAGE_BYTES)
+    parser.add_argument("--disable-vision", "--no-vision", dest="disable_vision", action="store_true", help="Accept image uploads but never call the vision model.")
+    parser.add_argument("--force-vision", action="store_true", help="Use the uploaded image whenever it is present, unless vision is disabled.")
     parser.set_defaults(no_think=DEFAULT_OLLAMA_NO_THINK)
     parser.add_argument("--no-think", dest="no_think", action="store_true")
     parser.add_argument("--think", dest="no_think", action="store_false")
@@ -601,14 +1092,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    global asr_adapter, chat_engine, debug_log_path
+    global asr_adapter, chat_engine, debug_log_path, vision_model, vision_timeout_sec, vision_enabled, server_force_vision, max_image_bytes
     args = build_arg_parser().parse_args()
     debug_log_path = Path(args.debug_log) if args.debug_log.strip() else None
     if debug_log_path is not None:
         print(f"Debug log: {debug_log_path}")
 
+    vision_model = args.vision_model
+    vision_timeout_sec = args.vision_timeout
+    vision_enabled = not args.disable_vision
+    server_force_vision = bool(args.force_vision)
+    max_image_bytes = max(1, args.max_image_bytes)
+
     chat_engine = FastChatEmotionEngine(args.ollama_url, args.ollama_model, args.no_think)
     chat_engine.warm_up()
+    print(
+        f"Vision routing: enabled={vision_enabled}, force={server_force_vision}, model={vision_model}, "
+        f"max_image_bytes={max_image_bytes}"
+    )
 
     if not args.skip_asr_load:
         asr_adapter = QwenASRAdapter(args.asr_model)

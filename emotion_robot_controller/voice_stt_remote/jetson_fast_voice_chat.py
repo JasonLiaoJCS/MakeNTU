@@ -117,13 +117,19 @@ def print_server_summary(health: dict[str, Any]) -> None:
     print(f"  asr_loaded   : {health.get('asr_loaded', 'unknown')}")
     print(f"  ollama_url   : {health.get('ollama_url', 'unknown')}")
     print(f"  ollama_model : {health.get('ollama_model', 'unknown')}")
+    if "vision_enabled" in health or "vision_model" in health:
+        print(f"  vision       : enabled={health.get('vision_enabled', 'unknown')} model={health.get('vision_model', 'unknown')}")
     last = health.get("last_debug")
     if isinstance(last, dict) and last:
         print(f"  last_request : {last.get('request_id', 'unknown')} stage={last.get('stage', 'unknown')} ok={last.get('ok', 'unknown')}")
         reason = str(last.get("fallback_reason", "")).strip()
         if reason:
             print(f"  last_warning : {reason}")
-    if health.get("debug_version") != 6:
+    try:
+        debug_version = int(health.get("debug_version", 0))
+    except (TypeError, ValueError):
+        debug_version = 0
+    if debug_version < 7:
         print("  warning      : desktop server is not the latest debug build; copy the new desktop_fast_chat_server.py to Windows and restart it.")
 
 

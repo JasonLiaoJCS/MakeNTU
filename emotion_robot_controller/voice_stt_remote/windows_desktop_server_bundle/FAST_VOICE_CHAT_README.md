@@ -11,7 +11,7 @@ Windows 桌機最短啟動指令：
 ```powershell
 cd C:\Users\User\Desktop\windows_desktop_server_bundle
 .\.venv\Scripts\Activate.ps1
-python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --vision-model qwen35-fast:latest --no-think
 ```
 
 Jetson 最短啟動指令：

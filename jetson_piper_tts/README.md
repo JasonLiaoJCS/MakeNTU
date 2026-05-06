@@ -369,6 +369,7 @@ LOG_LEVEL=INFO
 常改項目：
 
 - `AUDIO_DEVICE=default`：使用 ALSA default。
+- `AUDIO_DEVICE=auto:UACDemo`：每次播放前從 `aplay -L` 重新找 UACDemo USB speaker，最適合 demo 反覆重插 USB。
 - `AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0`：用 USB 喇叭的穩定 ALSA 卡名，比 `plughw:1,0` 不容易因為重新插拔而失效。
 - `DEFAULT_LENGTH_SCALE=0.85`：語速更快。
 - `DEFAULT_LENGTH_SCALE=1.0`：語速較自然。
@@ -708,6 +709,7 @@ aplay -L
 
 ```bash
 AUDIO_DEVICE=default
+AUDIO_DEVICE=auto:UACDemo
 AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
 AUDIO_DEVICE=plughw:0,0
 AUDIO_DEVICE=hw:0,0
@@ -722,7 +724,7 @@ python -m jetson_piper_tts.speak "测试声音。" --device 'plughw:CARD=UACDemo
 可用後寫進 `.env`：
 
 ```bash
-AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+AUDIO_DEVICE=auto:UACDemo
 ```
 
 重啟 server。

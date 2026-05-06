@@ -134,6 +134,7 @@ ollama list
 
 ```powershell
 ollama pull qwen35-fast:latest
+ollama pull qwen35-fast:latest
 ```
 
 如果你手動跑：
@@ -180,7 +181,7 @@ scp asrlab-yian@192.168.1.150:/home/asrlab-yian/MakeNTU/emotion_robot_controller
 cd C:\Users\User\Desktop\windows_desktop_server_bundle
 .\.venv\Scripts\Activate.ps1
 
-python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --vision-model qwen35-fast:latest --no-think
 ```
 
 這個視窗不要關。
@@ -458,7 +459,7 @@ def analyze_emotion_local(transcript: str) -> dict[str, Any]:
 檢查桌機 server 是否開著：
 
 ```powershell
-python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --vision-model qwen35-fast:latest --no-think
 ```
 
 檢查 Windows 防火牆。
@@ -572,7 +573,7 @@ total_ms
 ```powershell
 cd C:\Users\User\Desktop\windows_desktop_server_bundle
 .\.venv\Scripts\Activate.ps1
-python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --vision-model qwen35-fast:latest --no-think
 ```
 
 ### Jetson

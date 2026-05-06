@@ -26,7 +26,7 @@ Jetson 錄音
 目前確認可用版本：
 
 ```text
-desktop_fast_chat_server.py debug_version: 6
+desktop_fast_chat_server.py debug_version: 7
 Ollama request: think=false
 Reply: Ollama 自然聊天文字
 Emotion: server 本地規則
@@ -204,6 +204,7 @@ qwen35-fast:latest
 
 ```powershell
 ollama pull qwen35-fast:latest
+ollama pull qwen35-fast:latest
 ```
 
 如果你手動跑：
@@ -250,7 +251,7 @@ scp asrlab-yian@100.110.90.72:/home/asrlab-yian/MakeNTU/emotion_robot_controller
 ```powershell
 cd C:\Users\User\Desktop\windows_desktop_server_bundle
 .\.venv\Scripts\Activate.ps1
-python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --vision-model qwen35-fast:latest --no-think
 ```
 
 PowerShell 前面應該要看到：
@@ -404,7 +405,7 @@ python jetson_fast_voice_chat.py \
 成功狀態應該包含：
 
 ```text
-debug_version: 6
+debug_version: 7
 chat_ready   : True
 asr_loaded   : True
 ollama_model : qwen35-fast:latest
@@ -431,7 +432,7 @@ curl -X POST http://127.0.0.1:8777/speak_async \
   -d '{"text":"TTS 也正常。","interrupt":true}'
 ```
 
-如果 `debug_version` 不是 `6`，代表 Windows 還在跑舊版 server。重新複製 `desktop_fast_chat_server.py` 到 Windows，然後 Ctrl-C 停掉舊 server 再重啟。
+如果 `debug_version` 小於 `7`，代表 Windows 還在跑舊版 server。重新複製 `desktop_fast_chat_server.py` 到 Windows，然後 Ctrl-C 停掉舊 server 再重啟。
 
 ## Jetson 文字測試
 
@@ -831,7 +832,7 @@ server 沒有跑最新版
 python jetson_fast_voice_chat.py --server-url http://100.108.141.26:8766/voice-chat --check-server
 ```
 
-### `debug_version` 不是 6
+### `debug_version` 小於 7
 
 原因：Windows 還在跑舊檔案。
 
@@ -994,7 +995,7 @@ AUDIO_DEVICE=plughw:1,0
 ```powershell
 cd C:\Users\User\Desktop\windows_desktop_server_bundle
 .\.venv\Scripts\Activate.ps1
-python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --vision-model qwen35-fast:latest --no-think
 ```
 
 ### Terminal 2：Jetson TTS Server

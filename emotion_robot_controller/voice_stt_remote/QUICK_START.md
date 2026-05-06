@@ -63,6 +63,7 @@ qwen35-fast:latest
 
 ```powershell
 ollama pull qwen35-fast:latest
+ollama pull qwen35-fast:latest
 ```
 
 測試模型會不會正常回字：
@@ -92,7 +93,7 @@ Only one usage of each socket address...
 ```powershell
 cd C:\Users\User\Desktop\windows_desktop_server_bundle
 .\.venv\Scripts\Activate.ps1
-python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --no-think
+python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --vision-model qwen35-fast:latest --no-think
 ```
 
 成功時會看到類似：
@@ -166,7 +167,7 @@ python jetson_fast_voice_chat.py \
 成功時應該看到 Windows server：
 
 ```text
-debug_version: 6
+debug_version: 7
 chat_ready   : True
 asr_loaded   : True
 ollama_model : qwen35-fast:latest

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import itertools
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -34,13 +35,99 @@ class AudioPlayer:
             return str(path) if path.exists() and os.access(path, os.X_OK) else None
         return shutil.which(self.aplay_bin)
 
+    def _aplay_devices(self) -> list[tuple[str, str]]:
+        aplay_path = self.aplay_path
+        if not aplay_path:
+            return []
+        try:
+            result = subprocess.run(
+                [aplay_path, "-L"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return []
+        if result.returncode != 0:
+            return []
+
+        devices: list[tuple[str, str]] = []
+        name: str | None = None
+        detail: list[str] = []
+        for line in result.stdout.splitlines():
+            if line.strip() and not line.startswith((" ", "\t")):
+                if name is not None:
+                    devices.append((name, " ".join(detail)))
+                name = line.strip()
+                detail = []
+            elif name is not None:
+                detail.append(line.strip())
+        if name is not None:
+            devices.append((name, " ".join(detail)))
+        return devices
+
+    def _device_available(self, device: str) -> bool:
+        return any(name == device for name, _detail in self._aplay_devices())
+
+    def _find_device_by_keyword(self, keyword: str) -> str | None:
+        lowered = keyword.strip().lower()
+        if not lowered:
+            return None
+        matches = [
+            name
+            for name, detail in self._aplay_devices()
+            if lowered in f"{name} {detail}".lower()
+        ]
+        if not matches:
+            return None
+        for prefix in ("plughw:", "sysdefault:", "front:"):
+            for name in matches:
+                if name.startswith(prefix):
+                    return name
+        return matches[0]
+
+    def _auto_keyword(self, device: str) -> str | None:
+        lowered = device.lower()
+        for prefix in ("auto:", "keyword:"):
+            if lowered.startswith(prefix):
+                return device.split(":", 1)[1].strip()
+        if "uacdemo" in lowered:
+            return "UACDemo"
+        match = re.search(r"CARD=([^,]+)", device)
+        if match:
+            return match.group(1).split("_", 1)[0]
+        return None
+
+    def resolve_device(self) -> str | None:
+        device = self.device
+        if not device:
+            return None
+        keyword = self._auto_keyword(device)
+        if device.lower().startswith(("auto:", "keyword:")):
+            found = self._find_device_by_keyword(keyword or "")
+            if found:
+                return found
+            logger.warning("no ALSA playback device matched %r; using default", keyword)
+            return None
+        if self._device_available(device):
+            return device
+        if keyword:
+            found = self._find_device_by_keyword(keyword)
+            if found:
+                logger.warning("ALSA playback device %r is unavailable; using %r", device, found)
+                return found
+        return device
+
     def check_ready(self) -> dict[str, Any]:
+        resolved_device = self.resolve_device()
         return {
             "backend": "aplay",
             "aplay_bin": self.aplay_bin,
             "aplay_path": self.aplay_path,
             "available": self.aplay_path is not None,
-            "device": self.device or "default",
+            "device": resolved_device or "default",
+            "configured_device": self.device or "default",
             "current_file": str(self._current_file) if self._current_file else None,
             "playing": self.is_playing(),
         }
@@ -57,8 +144,9 @@ class AudioPlayer:
             )
 
         command = [aplay_path, "-q"]
-        if self.device:
-            command.extend(["-D", self.device])
+        device = self.resolve_device()
+        if device:
+            command.extend(["-D", device])
         command.append(str(path))
 
         started = time.perf_counter()
@@ -128,8 +216,9 @@ class AudioPlayer:
             "-c",
             str(channels),
         ]
-        if self.device:
-            aplay_command.extend(["-D", self.device])
+        device = self.resolve_device()
+        if device:
+            aplay_command.extend(["-D", device])
 
         started = time.perf_counter()
         aplay_process = subprocess.Popen(
@@ -222,8 +311,9 @@ class AudioPlayer:
             "-c",
             str(channels),
         ]
-        if self.device:
-            command.extend(["-D", self.device])
+        device = self.resolve_device()
+        if device:
+            command.extend(["-D", device])
 
         started = time.perf_counter()
         bytes_written = 0
