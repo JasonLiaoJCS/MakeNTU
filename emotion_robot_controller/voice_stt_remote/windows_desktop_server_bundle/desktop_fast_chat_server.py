@@ -29,7 +29,39 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, request
+try:
+    from flask import Flask, jsonify, request
+    FLASK_IMPORT_ERROR: Exception | None = None
+except ImportError as exc:
+    FLASK_IMPORT_ERROR = exc
+
+    class Flask:  # type: ignore[no-redef]
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def route(self, *_args: Any, **_kwargs: Any) -> Any:
+            def decorator(func: Any) -> Any:
+                return func
+
+            return decorator
+
+        get = route
+        post = route
+
+        def run(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("Flask is required to run the desktop server")
+
+    def jsonify(*args: Any, **kwargs: Any) -> Any:  # type: ignore[no-redef]
+        return args[0] if args else kwargs
+
+    class _MissingRequest:
+        files: dict[str, Any] = {}
+        form: dict[str, Any] = {}
+
+        def get_json(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {}
+
+    request = _MissingRequest()
 
 from desk_voice_controller import (
     DEFAULT_ASR_MODEL,
@@ -44,50 +76,119 @@ DEFAULT_FAST_MODEL = "qwen35-fast:latest"
 DEFAULT_VISION_MODEL = "qwen35-fast:latest"
 VISION_FALLBACK_MODELS: tuple[str, ...] = ()
 DEFAULT_MAX_IMAGE_BYTES = 2_000_000
-DEBUG_VERSION = 9
+DEBUG_VERSION = 10
 
-EMOTIONS = [
-    "neutral",
-    "happy",
-    "excited",
-    "sad",
-    "tired",
-    "angry",
-    "surprised",
-    "curious",
-    "confused",
-    "thinking",
-    "concerned",
-    "anxious",
-    "stressed",
-    "frustrated",
-    "lonely",
-    "calm",
-]
+CONTROL_PERSISTENT_STATES = {"normal", "sleep", "unchanged"}
+CONTROL_EMOTIONS = {"neutral", "happy", "curious", "excited", "confused", "concerned", "sleepy"}
+CONTROL_HEAD_MOTIONS = {"none", "nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop"}
+
+EMOTIONS = sorted(CONTROL_EMOTIONS)
+
+EMOTION_TO_HEAD_MOTION = {
+    "neutral": "none",
+    "happy": "nod",
+    "curious": "look_around",
+    "excited": "double_nod",
+    "confused": "shake",
+    "concerned": "gentle_nod",
+    "sleepy": "sleepy_drop",
+}
+
+SLEEP_INTENT_KEYWORDS = (
+    "去睡覺",
+    "去睡觉",
+    "睡覺吧",
+    "睡觉吧",
+    "休息一下",
+    "晚安",
+    "進入睡眠模式",
+    "进入睡眠模式",
+    "安靜一下",
+    "安静一下",
+    "不要吵我",
+    "sleep",
+    "go to sleep",
+    "standby",
+)
+
+WAKE_INTENT_KEYWORDS = (
+    "起床",
+    "醒來",
+    "醒来",
+    "回來",
+    "回来",
+    "回到正常",
+    "不要睡了",
+    "回來陪我",
+    "回来陪我",
+    "wake up",
+    "come back",
+    "normal",
+    "don't sleep",
+    "do not sleep",
+)
 
 SYSTEM_PROMPT = """
-你是自然聊天助手。輸入是語音轉文字，可能有錯字、口頭禪或重複詞。
+你是桌上寵物機器人的自然聊天大腦。輸入是語音轉文字，可能有錯字、口頭禪或重複詞。
 
-任務：
-- 只回覆使用者當下這句話，像平常對話一樣。
-- 不要輸出 JSON、markdown、標題、分析欄位或條列。
-- 不要說「我先針對這句回」、「你可以再補一句」、「請提供更多資訊」。
-- 如果使用者問問題，直接回答；如果資訊不足，可以自然地猜測或給最可能的方向。
-- 如果使用者在抱怨你，就正常承認並調整，不要防衛。
-- 使用使用者同一種語言或口吻回覆。
-- 回覆控制在 1 到 3 句。
+你必須只輸出一個 JSON object，不要 markdown，不要 code fence，不要額外文字。
+
+JSON schema:
+{
+  "reply": "自然語言回覆，給 TTS 播放。不可提到 JSON、UART、command、emotion、head_motion、persistent_state、MotorPitch、MotorYaw、內部理由。",
+  "control": {
+    "persistent_state": "normal | sleep | unchanged",
+    "emotion": "neutral | happy | curious | excited | confused | concerned | sleepy",
+    "head_motion": "none | nod | double_nod | look_around | shake | gentle_nod | sleepy_drop",
+    "reason": "簡短內部理由，不給使用者播放"
+  }
+}
+
+reply 規則：
+- reply 必須像正常聊天一樣自然、親切、可愛、流暢。
+- reply 使用使用者同一種語言或口吻。
+- reply 控制在 1 到 3 句。
+- reply 不可以包含 JSON、欄位名稱、UART 指令或內部控制說明。
+
+control 規則：
+- 一般聊天 persistent_state="unchanged"。
+- 使用者叫你睡覺、休息、晚安、安靜、standby 時：persistent_state="sleep", emotion="sleepy", head_motion="sleepy_drop"。
+- 使用者叫你起床、醒來、回來、normal、come back 時：persistent_state="normal", emotion 可用 "happy" 或 "neutral", head_motion 可用 "nod" 或 "none"。
+- 問問題或要求辨識/分析時 emotion 通常是 "curious"。
+- 稱讚、完成任務、愉快對話用 "happy"。
+- 高能量好消息或興奮情境用 "excited"。
+- 不確定、資訊模糊、看不清楚用 "confused"。
+- 使用者疲憊、沮喪、焦慮、需要關心時用 "concerned"。
 """.strip()
 
 VISION_SYSTEM_PROMPT = """
-你是自然聊天助手，而且可以看使用者剛剛拍下的相機畫面。
+你是桌上寵物機器人的自然聊天大腦，而且可以看使用者剛剛拍下的相機畫面。
 
-任務：
-- 先理解使用者原話，再根據圖片內容回答。
-- 如果使用者問「這是什麼」、「桌上有什麼」、「螢幕上是什麼」等問題，請直接描述你能看出的內容。
-- 不要編造看不到的細節；不確定時說可能是什麼。
-- 不要輸出 JSON、markdown、標題、分析欄位或條列。
-- 使用使用者同一種語言或口吻回覆。
-- 回覆控制在 1 到 3 句。
+你必須只輸出一個 JSON object，不要 markdown，不要 code fence，不要額外文字。
+
+JSON schema:
+{
+  "reply": "自然語言回覆，給 TTS 播放。不可提到 JSON、UART、command、emotion、head_motion、persistent_state、MotorPitch、MotorYaw、內部理由。",
+  "control": {
+    "persistent_state": "normal | sleep | unchanged",
+    "emotion": "neutral | happy | curious | excited | confused | concerned | sleepy",
+    "head_motion": "none | nod | double_nod | look_around | shake | gentle_nod | sleepy_drop",
+    "reason": "簡短內部理由，不給使用者播放"
+  }
+}
+
+reply 規則：
+- 先理解使用者原話，再根據圖片內容自然回答。
+- 如果使用者問表情、手上拿什麼、桌上有什麼、螢幕上寫什麼，直接描述你能看出的內容。
+- 不要編造看不到的細節；不確定時自然說可能是什麼。
+- reply 使用使用者同一種語言或口吻，控制在 1 到 3 句。
+- reply 不可以包含 JSON、欄位名稱、UART 指令或內部控制說明。
+
+control 規則：
+- 視覺辨識、看物品、看桌面、看螢幕通常 emotion="curious", head_motion="look_around"。
+- 使用者問自己是否疲憊、表情是否不好、狀態是否低落時，若畫面合理可用 emotion="concerned", head_motion="gentle_nod"。
+- 看不清楚、無法判斷時 emotion="confused", head_motion="shake"。
+- 睡覺/起床意圖仍依照 persistent_state 規則處理。
 """.strip()
 
 VISION_INTENT_KEYWORDS = (
@@ -217,15 +318,17 @@ def write_debug_log(data: dict[str, Any]) -> None:
 
 def fallback_result(transcript: str, reason: str) -> dict[str, Any]:
     text = transcript.strip()
-    emotion = analyze_emotion_local(transcript)
     if any(key in text for key in ["聽得到", "听得到", "聽得懂", "听得懂"]):
         reply = "我聽到了，而且有成功把你的聲音轉成文字。你可以直接問我問題，或跟我說你現在的狀態。"
     elif text:
         reply = local_reply(transcript)
     else:
         reply = "我沒有聽到清楚的內容，可以再說一次。"
+    control = local_control(transcript, reason=reason)
+    emotion = emotion_from_control(control, transcript)
     return {
         "reply": reply,
+        "control": control,
         "fallback_reason": reason,
         "emotion": {
             **emotion,
@@ -280,6 +383,162 @@ def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "force", "forced"}
 
 
+def normalized_contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    compact = normalize_vision_intent_text(text)
+    lowered = str(text or "").lower()
+    for keyword in keywords:
+        if normalize_vision_intent_text(keyword) in compact or keyword.lower() in lowered:
+            return True
+    return False
+
+
+def detect_persistent_state_intent(transcript: str) -> str | None:
+    text = str(transcript or "").strip()
+    if not text:
+        return None
+    if normalized_contains_any(text, WAKE_INTENT_KEYWORDS):
+        return "normal"
+    if normalized_contains_any(text, SLEEP_INTENT_KEYWORDS):
+        return "sleep"
+    return None
+
+
+def local_control(transcript: str, *, used_vision: bool = False, reason: str = "local fallback") -> dict[str, str]:
+    state_intent = detect_persistent_state_intent(transcript)
+    if state_intent == "sleep":
+        return {
+            "persistent_state": "sleep",
+            "emotion": "sleepy",
+            "head_motion": "sleepy_drop",
+            "reason": "sleep intent",
+        }
+    if state_intent == "normal":
+        return {
+            "persistent_state": "normal",
+            "emotion": "happy",
+            "head_motion": "nod",
+            "reason": "wake/normal intent",
+        }
+
+    emotion = analyze_emotion_local(transcript).get("primary", "neutral")
+    if emotion not in CONTROL_EMOTIONS:
+        emotion = "neutral"
+    if used_vision and emotion == "neutral":
+        emotion = "curious"
+    return {
+        "persistent_state": "unchanged",
+        "emotion": emotion,
+        "head_motion": EMOTION_TO_HEAD_MOTION.get(emotion, "none"),
+        "reason": reason,
+    }
+
+
+def normalize_control(raw: Any, transcript: str, *, used_vision: bool = False) -> dict[str, str]:
+    fallback = local_control(transcript, used_vision=used_vision)
+    source = raw if isinstance(raw, dict) else {}
+
+    persistent_state = str(source.get("persistent_state", fallback["persistent_state"])).strip().lower()
+    if persistent_state not in CONTROL_PERSISTENT_STATES:
+        persistent_state = fallback["persistent_state"]
+
+    emotion = str(source.get("emotion", fallback["emotion"])).strip().lower()
+    if emotion not in CONTROL_EMOTIONS:
+        emotion = fallback["emotion"]
+
+    head_motion = str(source.get("head_motion", "")).strip().lower()
+    if head_motion not in CONTROL_HEAD_MOTIONS:
+        head_motion = EMOTION_TO_HEAD_MOTION.get(emotion, fallback["head_motion"])
+
+    reason = str(source.get("reason", fallback["reason"])).strip() or fallback["reason"]
+
+    state_intent = detect_persistent_state_intent(transcript)
+    if state_intent == "sleep":
+        persistent_state = "sleep"
+        emotion = "sleepy"
+        head_motion = "sleepy_drop"
+        reason = "sleep intent"
+    elif state_intent == "normal":
+        persistent_state = "normal"
+        if emotion in {"sleepy", "concerned", "confused"}:
+            emotion = "happy"
+        if head_motion in {"sleepy_drop", "shake"}:
+            head_motion = "nod"
+        reason = "wake/normal intent"
+
+    return {
+        "persistent_state": persistent_state,
+        "emotion": emotion,
+        "head_motion": head_motion,
+        "reason": reason,
+    }
+
+
+def emotion_from_control(control: dict[str, str], transcript: str) -> dict[str, Any]:
+    base = analyze_emotion_local(transcript)
+    primary = control.get("emotion", "neutral")
+    if primary not in CONTROL_EMOTIONS:
+        primary = "neutral"
+
+    presets = {
+        "neutral": (0.25, 0.0, 0.25, False, "自然中性互動。"),
+        "happy": (0.65, 0.65, 0.55, False, "使用者情境偏正向或回覆語氣愉快。"),
+        "curious": (0.45, 0.10, 0.45, False, "正在回答問題或分析畫面，帶有好奇。"),
+        "excited": (0.8, 0.75, 0.8, False, "情境能量較高，偏興奮。"),
+        "confused": (0.55, -0.15, 0.45, False, "資訊不清楚或判斷不確定。"),
+        "concerned": (0.65, -0.35, 0.35, True, "使用者可能需要關心或溫和支持。"),
+        "sleepy": (0.5, -0.05, 0.15, False, "使用者要求休息或睡眠模式。"),
+    }
+    intensity, valence, arousal, support_needed, summary = presets.get(primary, presets["neutral"])
+    return {
+        **base,
+        "primary": primary,
+        "intensity": intensity,
+        "valence": valence,
+        "arousal": arousal,
+        "support_needed": support_needed,
+        "summary": summary,
+    }
+
+
+def content_looks_internal(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            '"reply"',
+            '"control"',
+            "persistent_state",
+            "head_motion",
+            "motorpitch",
+            "motoryaw",
+            "uart",
+            "```json",
+        )
+    )
+
+
+def parse_ai_content(content: str, transcript: str, *, used_vision: bool = False) -> tuple[str, dict[str, str], str, str]:
+    parsed = extract_json_object(content)
+    if parsed is not None:
+        reply = str(parsed.get("reply", "")).strip()
+        raw_control = parsed.get("control")
+        if not isinstance(raw_control, dict):
+            raw_control = parsed.get("uart")
+        control = normalize_control(raw_control, transcript, used_vision=used_vision)
+        if not reply or content_looks_internal(reply):
+            reply = local_reply(transcript)
+            return reply, control, "json_reply_fallback_reply", "JSON reply missing/internal; using local reply"
+        return reply, control, "json_reply", ""
+
+    reply = strip_reply(content)
+    control = normalize_control(None, transcript, used_vision=used_vision)
+    if not reply:
+        return local_reply(transcript), control, "empty_or_unparsable", "Ollama returned empty content"
+    if content_looks_internal(reply):
+        return local_reply(transcript), control, "json_parse_fallback", "Ollama returned unparsable internal JSON; using local reply"
+    return reply, control, "plain_reply_fallback_control", "Ollama returned non-JSON content; using local control"
+
+
 def analyze_emotion_local(transcript: str) -> dict[str, Any]:
     text = norm(transcript)
     primary = "neutral"
@@ -290,32 +549,32 @@ def analyze_emotion_local(transcript: str) -> dict[str, Any]:
     summary = "語氣接近中性，沒有明顯強烈情緒。"
 
     if has_any(text, ["操你媽", "操你妈", "幹你娘", "干你娘", "媽的", "妈的", "靠北", "靠邀", "fuck", "shit"]):
-        primary = "angry"
+        primary = "concerned"
         intensity = 0.9
         valence = -0.85
         arousal = 0.9
         summary = "使用者使用強烈髒話，情緒明顯偏憤怒或強烈挫折。"
     elif has_any(text, ["生氣", "生气", "很氣", "很气", "氣死", "气死", "火大", "憤怒", "愤怒"]):
-        primary = "angry"
+        primary = "concerned"
         intensity = 0.82
         valence = -0.75
         arousal = 0.82
         summary = "使用者明確表達生氣或火大，情緒偏高強度負向。"
     elif has_any(text, ["太慢", "很慢", "慢", "爛", "烂", "鳥", "鸟", "蠢", "笨", "智障", "不聰明", "不聪明", "聰明一點", "聪明一点", "不爽", "煩", "烦", "敷衍", "罐頭", "罐头", "迂迴", "迂回", "不夠親近", "不够亲近", "不像人", "像客服", "太官方"]):
-        primary = "frustrated"
+        primary = "concerned"
         intensity = 0.75
         valence = -0.55
         arousal = 0.7
         summary = "使用者明顯對速度或品質不滿，帶有挫折和急迫感。"
     elif has_any(text, ["累", "撐不下", "撑不下", "疲", "睏", "困"]):
-        primary = "tired"
+        primary = "concerned"
         intensity = 0.68
         valence = -0.45
         arousal = 0.25
         support_needed = True
         summary = "使用者可能疲憊或低能量，需要溫和支持。"
     elif has_any(text, ["擔心", "担心", "焦慮", "焦虑", "怕", "緊張", "紧张"]):
-        primary = "anxious"
+        primary = "concerned"
         intensity = 0.68
         valence = -0.45
         arousal = 0.7
@@ -345,8 +604,13 @@ def analyze_emotion_local(transcript: str) -> dict[str, Any]:
 
 
 def local_reply(transcript: str) -> str:
+    state_intent = detect_persistent_state_intent(transcript)
+    if state_intent == "sleep":
+        return "好，我先安靜陪你休息。需要我的時候再叫我。"
+    if state_intent == "normal":
+        return "我回來了，繼續待命！"
     if transcript.strip():
-        return "Ollama 這次沒有產生文字回覆，我先不硬編。下面的 Warning 會顯示原因。"
+        return "我剛剛有聽到你說的話，但這次思考有點卡住了，我先保持待命。"
     return "我沒有聽到清楚的內容，你可以再說一次。"
 
 
@@ -441,7 +705,7 @@ class FastChatEmotionEngine:
     def user_content(self, transcript: str, use_no_think: bool) -> str:
         content = f"""使用者原話：{transcript}
 
-請直接自然回覆上面的原話。不要輸出 JSON。"""
+請依照 system schema，只輸出 JSON object。reply 欄位必須是自然語言，不可混入控制資訊。"""
         if use_no_think:
             content = "/no_think\n" + content
         return content
@@ -482,7 +746,7 @@ class FastChatEmotionEngine:
     def vision_user_content(self, transcript: str, use_no_think: bool) -> str:
         content = f"""使用者原話：{transcript}
 
-請根據使用者原話和這張相機畫面直接自然回覆。不要輸出 JSON。"""
+請根據使用者原話和這張相機畫面，依照 system schema 只輸出 JSON object。reply 欄位必須是自然語言，不可混入控制資訊。"""
         if use_no_think:
             content = "/no_think\n" + content
         return content
@@ -581,27 +845,14 @@ class FastChatEmotionEngine:
                     "ollama_content_preview": short_text(strip_thinking_text(content), 500),
                 }
             )
-            parsed = extract_json_object(content)
-            fallback_reason = ""
-            if parsed is not None:
-                debug["parse_status"] = "json_reply"
-                reply = str(parsed.get("reply", "")).strip()
-                if not reply:
-                    reply = local_reply(transcript)
-                    fallback_reason = "Ollama JSON missing reply; using local reply"
-                emotion = analyze_emotion_local(transcript)
-            else:
-                reply = strip_reply(content)
-                if not reply:
-                    reply = local_reply(transcript)
-                    fallback_reason = "Ollama returned empty or unparsable content; using local reply/emotion"
-                    debug["parse_status"] = "empty_or_unparsable"
-                else:
-                    debug["parse_status"] = "plain_reply"
-                emotion = analyze_emotion_local(transcript)
+            reply, control, parse_status, fallback_reason = parse_ai_content(content, transcript, used_vision=False)
+            debug["parse_status"] = parse_status
+            debug["control"] = control
+            emotion = emotion_from_control(control, transcript)
             result = {
                 "request_id": request_id,
                 "reply": reply,
+                "control": control,
                 "emotion": emotion,
                 "timing": {"llm_ms": elapsed_ms(reply_started)},
                 "debug": debug,
@@ -609,7 +860,15 @@ class FastChatEmotionEngine:
             if fallback_reason:
                 result["fallback_reason"] = fallback_reason
                 debug["fallback_reason"] = fallback_reason
-            debug.update({"ok": True, "reply_chars": len(reply), "emotion_primary": emotion.get("primary")})
+            debug.update(
+                {
+                    "ok": True,
+                    "reply_chars": len(reply),
+                    "emotion_primary": emotion.get("primary"),
+                    "persistent_state": control.get("persistent_state"),
+                    "head_motion": control.get("head_motion"),
+                }
+            )
             set_last_debug(debug)
             return result
         except (urllib.error.URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
@@ -685,20 +944,19 @@ class FastChatEmotionEngine:
                     "ollama_content_preview": short_text(strip_thinking_text(content), 500),
                 }
             )
-            parsed = extract_json_object(content)
-            if parsed is not None:
-                debug["parse_status"] = "json_reply"
-                reply = str(parsed.get("reply", "")).strip()
-            else:
-                debug["parse_status"] = "plain_reply"
-                reply = strip_reply(content)
+            reply, control, parse_status, fallback_reason = parse_ai_content(content, transcript, used_vision=True)
+            debug["parse_status"] = parse_status
+            debug["control"] = control
+            if fallback_reason:
+                debug["fallback_reason"] = fallback_reason
             if not reply:
                 raise ValueError("Ollama vision returned empty content")
 
-            emotion = analyze_emotion_local(transcript)
+            emotion = emotion_from_control(control, transcript)
             result = {
                 "request_id": request_id,
                 "reply": reply,
+                "control": control,
                 "emotion": emotion,
                 "vision_requested": True,
                 "used_vision": True,
@@ -711,7 +969,17 @@ class FastChatEmotionEngine:
                 },
                 "debug": debug,
             }
-            debug.update({"ok": True, "reply_chars": len(reply), "emotion_primary": emotion.get("primary")})
+            if fallback_reason:
+                result["fallback_reason"] = fallback_reason
+            debug.update(
+                {
+                    "ok": True,
+                    "reply_chars": len(reply),
+                    "emotion_primary": emotion.get("primary"),
+                    "persistent_state": control.get("persistent_state"),
+                    "head_motion": control.get("head_motion"),
+                }
+            )
             set_last_debug(debug)
             return result
         except (urllib.error.URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
@@ -746,14 +1014,10 @@ class FastChatEmotionEngine:
                 }
             )
             text_result = self.analyze(transcript, request_id=request_id)
-            original_reply = str(text_result.get("reply", "")).strip()
-            prefix = "我剛剛沒有成功看到畫面，但我可以先根據你說的內容回答。"
-            text_result["reply"] = f"{prefix}{' ' + original_reply if original_reply else ''}"
+            text_result = prefix_vision_unavailable(text_result, reason, transcript)
             text_result["vision_requested"] = True
             text_result["used_vision"] = False
             text_result["vision_model"] = model
-            text_result["vision_error"] = reason
-            text_result["fallback_reason"] = reason
             timing = text_result.setdefault("timing", {})
             if isinstance(timing, dict):
                 timing["vision_ms"] = elapsed_ms(reply_started)
@@ -854,13 +1118,103 @@ def read_optional_image_bytes(upload: Any | None) -> tuple[bytes | None, str | N
     return data, None
 
 
-def prefix_vision_unavailable(result: dict[str, Any], reason: str) -> dict[str, Any]:
+def prefix_vision_unavailable(result: dict[str, Any], reason: str, transcript: str = "") -> dict[str, Any]:
     original_reply = str(result.get("reply", "")).strip()
     prefix = "我剛剛沒有成功看到畫面，但我可以先根據你說的內容回答。"
     result["reply"] = f"{prefix}{' ' + original_reply if original_reply else ''}"
     result["vision_error"] = reason
     result["fallback_reason"] = reason
+    raw_control = result.get("control") if isinstance(result.get("control"), dict) else {}
+    control = normalize_control(raw_control, transcript, used_vision=False)
+    if control["persistent_state"] == "unchanged":
+        control["emotion"] = "confused"
+        control["head_motion"] = "shake"
+        control["reason"] = "vision unavailable"
+    result["control"] = control
+    result["emotion"] = emotion_from_control(control, transcript)
     return result
+
+
+def run_self_test() -> int:
+    true_cases = [
+        "我現在是什麼表情",
+        "我看起來累嗎",
+        "我手上拿什麼",
+        "桌上有什麼",
+        "螢幕上寫什麼",
+        "這是什麼顏色",
+        "what is my expression",
+        "what am I holding",
+        "check my posture",
+        "read this text",
+    ]
+    false_cases = [
+        "幫我開電風扇",
+        "切換安靜模式",
+        "今天幾號",
+        "講個笑話",
+        "解釋 PID 控制",
+        "馬達往前走",
+    ]
+
+    for text in true_cases:
+        ok, reason = detect_vision_intent(text)
+        if not ok:
+            raise AssertionError(f"vision intent should be true for {text!r}; reason={reason}")
+    for text in false_cases:
+        ok, reason = detect_vision_intent(text)
+        if ok:
+            raise AssertionError(f"vision intent should be false for {text!r}; reason={reason}")
+
+    parser_cases = [
+        (
+            '{"reply":"好，我先安靜陪你休息。","control":{"persistent_state":"normal","emotion":"happy","head_motion":"nod","reason":"model"}}',
+            "去睡覺吧",
+            False,
+            "sleep",
+            "sleepy",
+        ),
+        (
+            '前面雜訊 {"reply":"我回來了，繼續待命！","control":{"persistent_state":"sleep","emotion":"sleepy","head_motion":"sleepy_drop","reason":"model"}} 後面雜訊',
+            "起床，回來",
+            False,
+            "normal",
+            "happy",
+        ),
+        (
+            "這不是 JSON，但我自然回答。",
+            "講個笑話",
+            False,
+            "unchanged",
+            "neutral",
+        ),
+        (
+            '{"reply":"我看到桌上有一些物品。","control":{"persistent_state":"unchanged","emotion":"curious","head_motion":"look_around","reason":"vision"}}',
+            "桌上有什麼",
+            True,
+            "unchanged",
+            "curious",
+        ),
+    ]
+
+    for content, transcript, used_vision, state, emotion in parser_cases:
+        reply, control, status, _reason = parse_ai_content(content, transcript, used_vision=used_vision)
+        if not reply or content_looks_internal(reply):
+            raise AssertionError(f"reply leaked internal content for {transcript!r}: {reply!r} status={status}")
+        if control["persistent_state"] != state or control["emotion"] != emotion:
+            raise AssertionError(f"bad control for {transcript!r}: {control}")
+
+    unavailable = prefix_vision_unavailable(
+        {"reply": "我先照你說的回答。", "control": {"persistent_state": "unchanged", "emotion": "curious"}},
+        "test vision failure",
+        "我現在是什麼表情",
+    )
+    if unavailable["control"]["emotion"] != "confused" or unavailable["control"]["head_motion"] != "shake":
+        raise AssertionError(f"vision unavailable control should be confused/shake: {unavailable['control']}")
+
+    print("desktop_fast_chat_server self-test OK")
+    print(f"debug_version={DEBUG_VERSION}, model={DEFAULT_FAST_MODEL}, vision_model={DEFAULT_VISION_MODEL}")
+    return 0
 
 
 @app.get("/health")
@@ -930,8 +1284,9 @@ def voice_chat() -> Any:
     image_upload = request.files.get("image")
     metadata = parse_metadata(request.form.get("metadata"))
 
-    temp_path = save_upload_to_temp_wav(upload)
+    temp_path: Path | None = None
     try:
+        temp_path = save_upload_to_temp_wav(upload)
         asr_started = time.monotonic()
         transcript = asr_adapter.transcribe(temp_path).strip()
         asr_ms = elapsed_ms(asr_started)
@@ -989,7 +1344,7 @@ def voice_chat() -> Any:
                 reason = image_error or "image unavailable"
                 print(f"ERROR: voice-chat {request_id}: vision_intent=True but image unavailable: {reason}")
                 result = chat_engine.analyze(transcript, request_id=request_id)
-                result = prefix_vision_unavailable(result, reason)
+                result = prefix_vision_unavailable(result, reason, transcript)
                 result["vision_requested"] = True
                 result["used_vision"] = False
                 result["vision_model"] = vision_model
@@ -999,7 +1354,7 @@ def voice_chat() -> Any:
             result["used_vision"] = False
             result["vision_model"] = vision_model
             if auto_vision_intent and not vision_enabled:
-                result = prefix_vision_unavailable(result, "vision disabled on server")
+                result = prefix_vision_unavailable(result, "vision disabled on server", transcript)
 
         timing = result.setdefault("timing", {})
         timing["asr_ms"] = asr_ms
@@ -1053,10 +1408,11 @@ def voice_chat() -> Any:
         set_last_debug(debug)
         return jsonify({"ok": False, "request_id": request_id, "error": str(exc), "debug": debug, "elapsed_ms": elapsed_ms(started)}), 500
     finally:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def elapsed_ms(started: float) -> int:
@@ -1088,12 +1444,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL)
     parser.add_argument("--skip-asr-load", action="store_true")
     parser.add_argument("--debug-log", default="fast_chat_debug.jsonl", help="JSONL file for request debug records. Use empty string to disable.")
+    parser.add_argument("--self-test", action="store_true", help="Run parser/vision-routing self-tests and exit without loading ASR/Ollama.")
     return parser
 
 
 def main() -> int:
     global asr_adapter, chat_engine, debug_log_path, vision_model, vision_timeout_sec, vision_enabled, server_force_vision, max_image_bytes
     args = build_arg_parser().parse_args()
+    if args.self_test:
+        return run_self_test()
+    if FLASK_IMPORT_ERROR is not None:
+        raise SystemExit(
+            "ERROR: Flask is required to run desktop_fast_chat_server.py. "
+            "Install the Windows server requirements in the server venv first."
+        ) from FLASK_IMPORT_ERROR
+
     debug_log_path = Path(args.debug_log) if args.debug_log.strip() else None
     if debug_log_path is not None:
         print(f"Debug log: {debug_log_path}")

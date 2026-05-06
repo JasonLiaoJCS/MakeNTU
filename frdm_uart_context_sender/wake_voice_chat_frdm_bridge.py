@@ -20,12 +20,15 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import uuid
 from typing import Any
 
@@ -50,6 +53,116 @@ import jetson_fast_voice_chat as voice_chat  # noqa: E402
 
 CLIENT_VERSION = "wake_voice_chat_frdm_bridge_vision_v2"
 DEFAULT_INSTANCE_LOCK = "/tmp/wake_voice_chat_frdm_bridge.lock"
+
+CORE_SCREEN_COMMANDS = {"Sleep", "Normal", "Thinking", "Speaking"}
+MOTOR_COMMANDS = {"MotorPitch", "MotorYaw"}
+UTILITY_COMMANDS = {"ShowNum"}
+FUTURE_EMOTION_SCREEN_COMMANDS = {"Neutral", "Happy", "Curious", "Excited", "Confused", "Concerned", "Sleepy"}
+ALLOWED_UART_COMMANDS = CORE_SCREEN_COMMANDS | MOTOR_COMMANDS | UTILITY_COMMANDS | FUTURE_EMOTION_SCREEN_COMMANDS
+
+VALID_PERSISTENT_STATES = {"normal", "sleep", "unchanged"}
+VALID_EMOTIONS = {"neutral", "happy", "curious", "excited", "confused", "concerned", "sleepy"}
+VALID_HEAD_MOTIONS = {"none", "nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop"}
+
+EMOTION_TO_SCREEN_COMMAND = {
+    "neutral": "Neutral",
+    "happy": "Happy",
+    "curious": "Curious",
+    "excited": "Excited",
+    "confused": "Confused",
+    "concerned": "Concerned",
+    "sleepy": "Sleepy",
+}
+
+EMOTION_TO_HEAD_MOTION = {
+    "neutral": "none",
+    "happy": "nod",
+    "curious": "look_around",
+    "excited": "double_nod",
+    "confused": "shake",
+    "concerned": "gentle_nod",
+    "sleepy": "sleepy_drop",
+}
+
+MOTOR_MIN = -15
+MOTOR_MAX = 15
+MOTOR_STEP_DELAY_SEC = 0.08
+
+HEAD_MOTION_SEQUENCES = {
+    "none": [
+        ("MotorPitch", 0, 0),
+        ("MotorYaw", 0, 0),
+    ],
+    "nod": [
+        ("MotorPitch", 8, 0),
+        ("MotorPitch", -5, 0),
+        ("MotorPitch", 0, 0),
+    ],
+    "double_nod": [
+        ("MotorPitch", 10, 0),
+        ("MotorPitch", -6, 0),
+        ("MotorPitch", 9, 0),
+        ("MotorPitch", -5, 0),
+        ("MotorPitch", 0, 0),
+    ],
+    "look_around": [
+        ("MotorYaw", -10, 0),
+        ("MotorYaw", 10, 0),
+        ("MotorYaw", 0, 0),
+        ("MotorPitch", -5, 0),
+        ("MotorPitch", 0, 0),
+    ],
+    "shake": [
+        ("MotorYaw", -8, 0),
+        ("MotorYaw", 8, 0),
+        ("MotorYaw", -6, 0),
+        ("MotorYaw", 0, 0),
+    ],
+    "gentle_nod": [
+        ("MotorPitch", -5, 0),
+        ("MotorPitch", 3, 0),
+        ("MotorPitch", 0, 0),
+    ],
+    "sleepy_drop": [
+        ("MotorPitch", -10, 0),
+        ("MotorPitch", -14, 0),
+        ("MotorPitch", 0, 0),
+    ],
+}
+
+SLEEP_INTENT_KEYWORDS = (
+    "去睡覺",
+    "去睡觉",
+    "睡覺吧",
+    "睡觉吧",
+    "休息一下",
+    "晚安",
+    "進入睡眠模式",
+    "进入睡眠模式",
+    "安靜一下",
+    "安静一下",
+    "不要吵我",
+    "sleep",
+    "go to sleep",
+    "standby",
+)
+
+WAKE_INTENT_KEYWORDS = (
+    "起床",
+    "醒來",
+    "醒来",
+    "回來",
+    "回来",
+    "回到正常",
+    "不要睡了",
+    "回來陪我",
+    "回来陪我",
+    "wake up",
+    "come back",
+    "normal",
+    "don't sleep",
+    "do not sleep",
+)
 CAMERA_CAPTURE_HELPER = r"""
 import glob
 import os
@@ -316,6 +429,363 @@ class InstanceLock:
             handle.close()
         except OSError:
             pass
+
+
+def clamp_int(value: Any, low: int, high: int, default: int = 0) -> int:
+    try:
+        number = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        number = default
+    return max(low, min(high, number))
+
+
+def normalize_intent_text(text: str) -> str:
+    return re.sub(r"[\s，。！？!?、,.：:；;「」『』\"'`]+", "", str(text or "").lower())
+
+
+def contains_intent(text: str, keywords: tuple[str, ...]) -> bool:
+    compact = normalize_intent_text(text)
+    lowered = str(text or "").lower()
+    return any(normalize_intent_text(keyword) in compact or keyword.lower() in lowered for keyword in keywords)
+
+
+def detect_persistent_state_intent(transcript: str) -> str | None:
+    if contains_intent(transcript, WAKE_INTENT_KEYWORDS):
+        return "normal"
+    if contains_intent(transcript, SLEEP_INTENT_KEYWORDS):
+        return "sleep"
+    return None
+
+
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(cleaned):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(cleaned[index:])
+        except json.JSONDecodeError:
+            continue
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def local_control_from_transcript(transcript: str, response: dict[str, Any] | None = None) -> dict[str, str]:
+    state_intent = detect_persistent_state_intent(transcript)
+    if state_intent == "sleep":
+        return {
+            "persistent_state": "sleep",
+            "emotion": "sleepy",
+            "head_motion": "sleepy_drop",
+            "reason": "sleep intent",
+        }
+    if state_intent == "normal":
+        return {
+            "persistent_state": "normal",
+            "emotion": "happy",
+            "head_motion": "nod",
+            "reason": "wake/normal intent",
+        }
+
+    emotion = "neutral"
+    if response is not None:
+        raw_emotion = response.get("emotion")
+        if isinstance(raw_emotion, dict):
+            emotion = str(raw_emotion.get("primary", emotion)).strip().lower()
+        elif isinstance(raw_emotion, str):
+            emotion = raw_emotion.strip().lower()
+    if emotion not in VALID_EMOTIONS:
+        emotion = "neutral"
+    return {
+        "persistent_state": "unchanged",
+        "emotion": emotion,
+        "head_motion": EMOTION_TO_HEAD_MOTION.get(emotion, "none"),
+        "reason": "local fallback",
+    }
+
+
+def normalize_control(response: dict[str, Any]) -> dict[str, str]:
+    transcript = str(response.get("transcript", "")).strip()
+    fallback = local_control_from_transcript(transcript, response)
+
+    raw_control = response.get("control")
+    if not isinstance(raw_control, dict):
+        raw_uart = response.get("uart")
+        raw_control = raw_uart if isinstance(raw_uart, dict) else None
+
+    # Backstop for server/debug paths that accidentally return the structured
+    # object in reply. This keeps TTS from reading JSON aloud.
+    reply_text = str(response.get("reply", "")).strip()
+    if raw_control is None and reply_text:
+        parsed = extract_json_object(reply_text)
+        if parsed is not None:
+            raw_control = parsed.get("control") if isinstance(parsed.get("control"), dict) else parsed.get("uart")
+            parsed_reply = str(parsed.get("reply", "")).strip()
+            if parsed_reply:
+                response["reply"] = parsed_reply
+                print("JSON parse fallback: extracted reply/control from response reply field.")
+
+    source = raw_control if isinstance(raw_control, dict) else {}
+    persistent_state = str(source.get("persistent_state", fallback["persistent_state"])).strip().lower()
+    if persistent_state not in VALID_PERSISTENT_STATES:
+        persistent_state = fallback["persistent_state"]
+
+    emotion = str(source.get("emotion", fallback["emotion"])).strip().lower()
+    if emotion not in VALID_EMOTIONS:
+        emotion = fallback["emotion"]
+
+    head_motion = str(source.get("head_motion", "")).strip().lower()
+    if head_motion not in VALID_HEAD_MOTIONS:
+        head_motion = EMOTION_TO_HEAD_MOTION.get(emotion, fallback["head_motion"])
+
+    reason = str(source.get("reason", fallback["reason"])).strip() or fallback["reason"]
+
+    state_intent = detect_persistent_state_intent(transcript)
+    if state_intent == "sleep":
+        persistent_state = "sleep"
+        emotion = "sleepy"
+        head_motion = "sleepy_drop"
+        reason = "sleep intent"
+    elif state_intent == "normal":
+        persistent_state = "normal"
+        if emotion in {"sleepy", "concerned", "confused"}:
+            emotion = "happy"
+        if head_motion in {"sleepy_drop", "shake"}:
+            head_motion = "nod"
+        reason = "wake/normal intent"
+
+    return {
+        "persistent_state": persistent_state,
+        "emotion": emotion,
+        "head_motion": head_motion,
+        "reason": reason,
+    }
+
+
+def sanitize_reply(response: dict[str, Any]) -> str:
+    reply = str(response.get("reply", "")).strip()
+    parsed = extract_json_object(reply)
+    if parsed is not None:
+        if "control" not in response and isinstance(parsed.get("control"), dict):
+            response["control"] = parsed["control"]
+        elif "control" not in response and isinstance(parsed.get("uart"), dict):
+            response["control"] = parsed["uart"]
+        parsed_reply = str(parsed.get("reply", "")).strip()
+        if parsed_reply:
+            print("JSON parse fallback: reply contained JSON; using parsed reply only.")
+            response["reply"] = parsed_reply
+            return parsed_reply
+        print("JSON parse fallback: reply looked internal; using safe fallback reply.")
+        reply = ""
+
+    lowered = reply.lower()
+    internal_markers = (
+        "persistent_state",
+        "head_motion",
+        "motorpitch",
+        "motoryaw",
+        '"control"',
+        '"reply"',
+        "uart",
+        "json",
+        "內部理由",
+        "内部理由",
+        "控制欄位",
+        "控制字段",
+        "emotion 是",
+        "emotion is",
+        "head motion",
+        "persistent state",
+    )
+    if any(marker in lowered for marker in internal_markers):
+        print("JSON parse fallback: stripped internal control text from reply.")
+        reply = ""
+
+    if not reply:
+        reply = "我剛剛有收到，但這次回覆有點不穩，我先保持待命。"
+        response["reply"] = reply
+    return reply
+
+
+class RobotUartController:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.persistent_state = "normal"
+        self._lock = threading.RLock()
+
+    def _validate_command(self, command: str, v1: int = 0, v2: int = 0) -> tuple[str, int, int] | None:
+        name = str(command or "").strip()
+        aliases = {
+            "sleep": "Sleep",
+            "normal": "Normal",
+            "thinking": "Thinking",
+            "speaking": "Speaking",
+            "shownum": "ShowNum",
+            "show_num": "ShowNum",
+            "motorpitch": "MotorPitch",
+            "pitch": "MotorPitch",
+            "motoryaw": "MotorYaw",
+            "yaw": "MotorYaw",
+            "neutral": "Neutral",
+            "happy": "Happy",
+            "curious": "Curious",
+            "excited": "Excited",
+            "confused": "Confused",
+            "concerned": "Concerned",
+            "sleepy": "Sleepy",
+        }
+        compact = re.sub(r"[\s_-]+", "", name).lower()
+        name = aliases.get(compact, name)
+        if name not in ALLOWED_UART_COMMANDS:
+            print(f"WARNING: refusing unknown UART command {command!r}.")
+            return None
+
+        if name in MOTOR_COMMANDS:
+            v1 = clamp_int(v1, MOTOR_MIN, MOTOR_MAX)
+            v2 = clamp_int(v2, MOTOR_MIN, MOTOR_MAX)
+        elif name == "ShowNum":
+            v1 = clamp_int(v1, 0, 999999)
+            v2 = clamp_int(v2, 0, 999999)
+        else:
+            v1 = clamp_int(v1, -999999, 999999)
+            v2 = clamp_int(v2, -999999, 999999)
+        return name, v1, v2
+
+    def _line_ending(self) -> bytes:
+        return bridge.line_ending_bytes(getattr(self.args, "uart_line_ending", "crlf"))
+
+    def send_uart_sequence(
+        self,
+        steps: list[tuple[str, int, int]],
+        *,
+        reason: str = "",
+        delay_sec: float = 0.0,
+        read_ms: int | None = None,
+    ) -> bool:
+        valid_steps: list[tuple[str, int, int, str]] = []
+        invalid_count = 0
+        for command, v1, v2 in steps:
+            validated = self._validate_command(command, v1, v2)
+            if validated is None:
+                invalid_count += 1
+                continue
+            name, safe_v1, safe_v2 = validated
+            valid_steps.append((name, safe_v1, safe_v2, f"{name} {safe_v1} {safe_v2}"))
+
+        if not valid_steps:
+            return invalid_count == 0
+        if getattr(self.args, "no_uart", False):
+            for _name, _v1, _v2, wire in valid_steps:
+                print(f"FRDM UART skipped (--no-uart): {wire}")
+            return True
+
+        read_ms = min(int(read_ms if read_ms is not None else getattr(self.args, "uart_read_ms", 30)), 120)
+        read_window_sec = max(0.0, read_ms / 1000.0)
+        configured_timeout = float(getattr(self.args, "uart_timeout", 0.2) or 0.2)
+        per_read_timeout = max(0.005, min(configured_timeout, read_window_sec if read_window_sec > 0 else 0.005))
+        try:
+            with self._lock:
+                if getattr(self.args, "uart_dry_run", False):
+                    for _name, _v1, _v2, wire in valid_steps:
+                        print(f"FRDM UART dry-run TX: {wire}" + (f" ({reason})" if reason else ""))
+                        if delay_sec > 0:
+                            time.sleep(delay_sec)
+                    return True
+
+                try:
+                    import serial
+                except ImportError as exc:
+                    raise RuntimeError("Missing dependency: pyserial. Install with: python -m pip install pyserial") from exc
+
+                port = bridge.resolve_uart_port(getattr(self.args, "uart_port", "auto"))
+                with serial.Serial(
+                    port=port,
+                    baudrate=getattr(self.args, "uart_baudrate", 115200),
+                    timeout=per_read_timeout,
+                    write_timeout=min(configured_timeout, 0.2),
+                ) as ser:
+                    time.sleep(0.04)
+                    try:
+                        ser.reset_input_buffer()
+                    except Exception:
+                        pass
+                    for _name, _v1, _v2, wire in valid_steps:
+                        ser.write(wire.encode("utf-8") + self._line_ending())
+                        ser.flush()
+                        print(f"FRDM UART TX: {wire}" + (f" ({reason})" if reason else ""))
+                        rx_lines: list[str] = []
+                        deadline = time.monotonic() + read_window_sec
+                        while read_window_sec > 0 and time.monotonic() < deadline:
+                            remaining = deadline - time.monotonic()
+                            ser.timeout = max(0.001, min(per_read_timeout, remaining))
+                            line = ser.readline()
+                            if line:
+                                rx_lines.append(line.decode("utf-8", errors="replace").rstrip())
+                        if getattr(self.args, "uart_debug", False):
+                            for line in rx_lines:
+                                print(f"FRDM UART RX: {line}")
+                        if delay_sec > 0:
+                            time.sleep(delay_sec)
+            return True
+        except Exception as exc:
+            print(f"WARNING: UART error while sending {reason or valid_steps[-1][3]}: {exc}")
+            return not getattr(self.args, "require_uart", False)
+
+    def send_uart_command(self, command: str, v1: int = 0, v2: int = 0, *, reason: str = "", read_ms: int | None = None) -> bool:
+        return self.send_uart_sequence([(command, v1, v2)], reason=reason, read_ms=read_ms)
+
+    def set_screen_state(self, state: str) -> bool:
+        return self.send_uart_command(state, 0, 0, reason=f"screen state {state}", read_ms=80)
+
+    def set_persistent_state(self, state: str) -> None:
+        if state in {"normal", "sleep"}:
+            if state != self.persistent_state:
+                print(f"persistent_state: {self.persistent_state} -> {state}")
+            self.persistent_state = state
+
+    def restore_persistent_screen_state(self) -> bool:
+        command = "Sleep" if self.persistent_state == "sleep" else "Normal"
+        ok = self.send_uart_command(command, 0, 0, reason=f"restore persistent state {self.persistent_state}", read_ms=100)
+        print(f"UART {command} sent (restore persistent_state={self.persistent_state}).")
+        return ok
+
+    def send_emotion_screen(self, emotion: str) -> str:
+        normalized = emotion if emotion in VALID_EMOTIONS else "neutral"
+        command = EMOTION_TO_SCREEN_COMMAND.get(normalized, "Neutral")
+        self.send_uart_command(command, 0, 0, reason=f"emotion {normalized}", read_ms=60)
+        print(f"emotion screen command sent: {command} 0 0")
+        return command
+
+    def run_head_motion(self, head_motion: str) -> None:
+        motion = head_motion if head_motion in HEAD_MOTION_SEQUENCES else "none"
+        sequence = list(HEAD_MOTION_SEQUENCES.get(motion, HEAD_MOTION_SEQUENCES["none"]))
+        try:
+            print(f"head motion started: {motion}")
+            self.send_uart_sequence(sequence, reason=f"head_motion {motion}", delay_sec=MOTOR_STEP_DELAY_SEC, read_ms=20)
+        except Exception as exc:
+            print(f"WARNING: head motion failed: {exc}")
+        finally:
+            self.send_uart_sequence(
+                [("MotorPitch", 0, 0), ("MotorYaw", 0, 0)],
+                reason="head_motion reset",
+                delay_sec=MOTOR_STEP_DELAY_SEC,
+                read_ms=20,
+            )
+            print(f"head motion ended: {motion}")
+
+    def start_head_motion(self, head_motion: str) -> threading.Thread:
+        thread = threading.Thread(target=self.run_head_motion, args=(head_motion,), name=f"head_motion_{head_motion}", daemon=True)
+        thread.start()
+        return thread
 
 
 def parse_camera_id(raw: str) -> str | int:
@@ -644,6 +1114,7 @@ class WakeVolumeRecorder:
         wake_score_at_start = 0.0
         wake_context: dict[str, Any] = {}
         last_ignored_wake_at = 0.0
+        last_waiting_speech_log_at = 0.0
 
         with sd.InputStream(
             samplerate=self.sample_rate,
@@ -683,6 +1154,7 @@ class WakeVolumeRecorder:
                         record_chunks = []
                         speech_started_at = None
                         silence_started_at = None
+                        last_waiting_speech_log_at = 0.0
                         self.reset_wake()
                         print()
                         print(f"Wake detected: {self.args.wake_word} score={score:.2f}")
@@ -718,8 +1190,18 @@ class WakeVolumeRecorder:
                         silence_started_at = now
                     elif now - silence_started_at >= self.args.silence_duration:
                         break
+                elif wake_detected_at is not None and now - last_waiting_speech_log_at >= 1.0:
+                    remaining = max(0.0, self.args.wake_listen_timeout - (now - wake_detected_at))
+                    print(
+                        f"Waiting for speech... volume={volume} < volume_min={self.args.volume_min}; "
+                        f"timeout in {remaining:.1f}s"
+                    )
+                    last_waiting_speech_log_at = now
                 elif wake_detected_at is not None and now - wake_detected_at >= self.args.wake_listen_timeout:
-                    print("No speech after wake word; returning to standby.")
+                    print(
+                        "No speech after wake word; returning to standby. "
+                        f"If you were speaking, lower --volume-min from {self.args.volume_min}."
+                    )
                     return None, {
                         "wake_score": wake_score_at_start,
                         "reason": "no_speech_after_wake",
@@ -762,6 +1244,10 @@ class WakeVolumeRecorder:
 def select_input_device(args: argparse.Namespace) -> int | None:
     keyword = str(getattr(args, "mic_keyword", "") or "").strip()
     manual_device = bool(getattr(args, "_manual_input_device", args.device is not None))
+    recovery_hint = (
+        "If USB devices disappeared from lsusb, run:\n"
+        "  cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender && ./recover_demo_usb.sh"
+    )
 
     # In demo mode the USB microphone's PortAudio index can change after
     # unplug/replug. If the user selected by keyword, always rescan by name
@@ -782,7 +1268,8 @@ def select_input_device(args: argparse.Namespace) -> int | None:
             raise RuntimeError(
                 f"No microphone matching --mic-keyword {keyword!r} was found. "
                 "Replug the UACDemo USB audio device, run `python3 wake_voice_chat_frdm_bridge.py --list-mics`, "
-                "or pass --allow-default-mic for a temporary fallback."
+                "or pass --allow-default-mic for a temporary fallback.\n"
+                f"{recovery_hint}"
             )
         print("WARNING: using default input because no matching USB microphone was found.")
         return None
@@ -796,7 +1283,8 @@ def select_input_device(args: argparse.Namespace) -> int | None:
             raise RuntimeError(
                 f"No microphone matching --mic-keyword {keyword!r} was found. "
                 "USB audio is probably disconnected or the Jetson USB controller reset. "
-                "Run `lsusb`, `arecord -l`, or reset USB before starting the bridge."
+                "Run `lsusb`, `arecord -l`, or reset USB before starting the bridge.\n"
+                f"{recovery_hint}"
             )
         print("WARNING: using default input because no matching USB microphone was found.")
     return selected
@@ -837,6 +1325,7 @@ def select_beep_output_device(args: argparse.Namespace) -> int | None:
 def build_wake_hook(
     args: argparse.Namespace,
     camera_manager: CameraManager | None,
+    robot: RobotUartController,
     turn_state: dict[str, Any],
 ) -> Any:
     def on_wake(info: dict[str, Any]) -> dict[str, Any]:
@@ -878,7 +1367,11 @@ def build_wake_hook(
                 volume=args.beep_volume,
                 device=args.beep_device,
             )
+            print("beep played.")
         timing.mark("beep done")
+        robot.set_screen_state("Thinking")
+        print("UART Thinking sent.")
+        timing.mark("UART Thinking sent")
 
         return {
             "image_future": image_future,
@@ -917,21 +1410,305 @@ def response_vision_summary(response: dict[str, Any]) -> None:
         print(f"  vision_error      : {error}")
 
 
+def estimate_tts_seconds(text: str) -> float:
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    english_words = len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
+    other_chars = max(0, len(text.strip()) - cjk_chars)
+    estimate = cjk_chars / 4.5 + english_words / 2.6 + other_chars / 18.0 + 0.5
+    return max(1.2, min(20.0, estimate))
+
+
+def tts_queue_url(tts_url: str) -> str:
+    return urllib.parse.urljoin(voice_chat.tts_base_url(tts_url) + "/", "queue")
+
+
+def wait_for_tts_job(job_id: str, args: argparse.Namespace, *, timeout_sec: float) -> bool:
+    if not job_id:
+        time.sleep(timeout_sec)
+        print(f"TTS estimated finished after {timeout_sec:.1f}s (no job id).")
+        return True
+
+    queue_url = tts_queue_url(args.tts_url)
+    deadline = time.monotonic() + timeout_sec
+    last_error = ""
+    saw_current_job = False
+    while time.monotonic() < deadline:
+        try:
+            status = voice_chat.get_json(queue_url, timeout_sec=min(args.tts_timeout, 2.0))
+        except Exception as exc:
+            last_error = str(exc)
+            time.sleep(0.25)
+            continue
+
+        last_result = status.get("last_result") if isinstance(status.get("last_result"), dict) else {}
+        if last_result.get("job_id") == job_id:
+            print(f"TTS finished: job_id={job_id}")
+            return True
+        current = status.get("current") if isinstance(status.get("current"), dict) else {}
+        if current.get("id") == job_id:
+            saw_current_job = True
+        last_error_value = str(status.get("last_error", "") or "").strip()
+        if last_error_value and saw_current_job and not status.get("running"):
+            print(f"WARNING: TTS worker error for job_id={job_id}: {last_error_value}")
+            return False
+        time.sleep(0.2)
+
+    print(f"WARNING: TTS wait timed out after {timeout_sec:.1f}s for job_id={job_id}. last_error={last_error}")
+    return False
+
+
+def run_self_test() -> int:
+    print("Running wake bridge self-test...")
+    response_cases = [
+        (
+            {
+                "transcript": "去睡覺吧",
+                "reply": '{"reply":"好，我先安靜陪你休息。","control":{"persistent_state":"normal","emotion":"happy","head_motion":"nod","reason":"model"}}',
+            },
+            "sleep",
+            "sleepy",
+            "sleepy_drop",
+        ),
+        (
+            {
+                "transcript": "起床，回來",
+                "reply": "我回來了，繼續待命！",
+                "control": {"persistent_state": "sleep", "emotion": "sleepy", "head_motion": "sleepy_drop"},
+            },
+            "normal",
+            "happy",
+            "nod",
+        ),
+        (
+            {
+                "transcript": "講個笑話",
+                "reply": '{"reply":"嘿嘿，這個有趣。","control":{"persistent_state":"unchanged","emotion":"happy","head_motion":"nod","reason":"joke"}}',
+            },
+            "unchanged",
+            "happy",
+            "nod",
+        ),
+        (
+            {
+                "transcript": "講個笑話",
+                "reply": "emotion 是 happy，所以我要送 Happy 0 0。",
+            },
+            "unchanged",
+            "neutral",
+            "none",
+        ),
+    ]
+    for response, expected_state, expected_emotion, expected_motion in response_cases:
+        control = normalize_control(response)
+        response["control"] = control
+        reply = sanitize_reply(response)
+        if control["persistent_state"] != expected_state:
+            raise AssertionError(f"bad persistent_state: {control}")
+        if control["emotion"] != expected_emotion:
+            raise AssertionError(f"bad emotion: {control}")
+        if control["head_motion"] != expected_motion:
+            raise AssertionError(f"bad head_motion: {control}")
+        lowered_reply = reply.lower()
+        if any(marker in lowered_reply for marker in ("json", "uart", "motorpitch", "motoryaw", "persistent_state", "head_motion")):
+            raise AssertionError(f"reply leaked internal text: {reply!r}")
+
+    for motion, sequence in HEAD_MOTION_SEQUENCES.items():
+        if not sequence:
+            raise AssertionError(f"empty head motion sequence: {motion}")
+        for command, v1, v2 in sequence:
+            if command not in MOTOR_COMMANDS:
+                raise AssertionError(f"head motion {motion} uses non-motor command {command}")
+            if clamp_int(v1, MOTOR_MIN, MOTOR_MAX) != int(v1) or clamp_int(v2, MOTOR_MIN, MOTOR_MAX) != int(v2):
+                raise AssertionError(f"head motion {motion} value out of range: {command} {v1} {v2}")
+
+    dry_args = argparse.Namespace(
+        no_uart=False,
+        uart_dry_run=True,
+        require_uart=False,
+        uart_port="auto",
+        uart_baudrate=115200,
+        uart_timeout=0.2,
+        uart_read_ms=30,
+        uart_line_ending="crlf",
+        uart_debug=False,
+    )
+    robot = RobotUartController(dry_args)
+    if not robot.send_uart_command("Thinking", 0, 0, reason="self-test"):
+        raise AssertionError("Thinking dry-run failed")
+    if robot.send_uart_command("UnknownCommand", 0, 0, reason="self-test"):
+        raise AssertionError("unknown UART command should be rejected")
+    if robot._validate_command("MotorPitch", 99, 0) != ("MotorPitch", MOTOR_MAX, 0):
+        raise AssertionError("MotorPitch clamp failed")
+    if robot._validate_command("MotorYaw", -99, 0) != ("MotorYaw", MOTOR_MIN, 0):
+        raise AssertionError("MotorYaw clamp failed")
+    robot.send_emotion_screen("happy")
+    head_thread = robot.start_head_motion("nod")
+    head_thread.join(timeout=3.0)
+    if head_thread.is_alive():
+        raise AssertionError("head motion thread did not finish in self-test")
+
+    queue_url = tts_queue_url("http://127.0.0.1:8777/speak_async")
+    if queue_url != "http://127.0.0.1:8777/queue":
+        raise AssertionError(f"bad TTS queue URL: {queue_url}")
+    if estimate_tts_seconds("好，我先安靜陪你休息。") < 1.2:
+        raise AssertionError("TTS estimate below minimum")
+
+    print("wake bridge self-test OK")
+    return 0
+
+
+def speak_reply_and_wait(response: dict[str, Any], args: argparse.Namespace) -> bool:
+    if args.no_tts:
+        print("TTS skipped by --no-tts.")
+        return True
+
+    reply = str(response.get("reply", "")).strip()
+    if not reply:
+        print("TTS skipped: empty reply.")
+        return True
+
+    payload = voice_chat.build_tts_payload(reply, args)
+    estimated_sec = estimate_tts_seconds(reply)
+    timeout_sec = max(float(getattr(args, "tts_playback_timeout", 0.0) or 0.0), estimated_sec + 25.0)
+    timeout_sec = min(max(timeout_sec, 8.0), 60.0)
+
+    print(f"TTS started: estimated={estimated_sec:.1f}s timeout={timeout_sec:.1f}s")
+    started = time.monotonic()
+    try:
+        tts_path = urllib.parse.urlsplit(args.tts_url).path.rstrip("/")
+        post_timeout = timeout_sec if tts_path.endswith("/speak") else args.tts_timeout
+        result = voice_chat.post_json(args.tts_url, payload, timeout_sec=post_timeout)
+    except Exception as exc:
+        print(f"WARNING: TTS speak failed: {exc}")
+        return False
+
+    post_ms = int((time.monotonic() - started) * 1000)
+    job_id = str(result.get("job_id", "")).strip()
+    if args.tts_debug:
+        print()
+        print("TTS:")
+        print(f"  url          : {args.tts_url}")
+        print(f"  post_ms      : {post_ms}")
+        print(f"  queued       : {result.get('queued', False)}")
+        if job_id:
+            print(f"  job_id       : {job_id}")
+    if result.get("queued") and job_id:
+        return wait_for_tts_job(job_id, args, timeout_sec=timeout_sec)
+
+    # /speak blocking path: returning from POST means playback is done.
+    playback = result.get("playback") if isinstance(result.get("playback"), dict) else {}
+    if playback:
+        print("TTS finished: blocking playback returned.")
+        return True
+
+    time.sleep(estimated_sec)
+    print(f"TTS estimated finished after {estimated_sec:.1f}s.")
+    return True
+
+
+def print_control_summary(control: dict[str, str]) -> None:
+    print()
+    print("AI control:")
+    print(f"  persistent_state : {control.get('persistent_state')}")
+    print(f"  emotion          : {control.get('emotion')}")
+    print(f"  head_motion      : {control.get('head_motion')}")
+    print(f"  reason           : {control.get('reason')}")
+
+
+def emotion_summary_from_control(control: dict[str, str]) -> dict[str, Any]:
+    primary = control.get("emotion", "neutral")
+    if primary not in VALID_EMOTIONS:
+        primary = "neutral"
+    presets = {
+        "neutral": (0.25, 0.0, 0.25, False, "自然中性互動。"),
+        "happy": (0.65, 0.65, 0.55, False, "回覆語氣偏愉快。"),
+        "curious": (0.45, 0.10, 0.45, False, "正在回答問題或分析畫面。"),
+        "excited": (0.80, 0.75, 0.80, False, "互動能量較高。"),
+        "confused": (0.55, -0.15, 0.45, False, "資訊不清楚或判斷不確定。"),
+        "concerned": (0.65, -0.35, 0.35, True, "使用者可能需要關心。"),
+        "sleepy": (0.50, -0.05, 0.15, False, "進入休息或睡眠互動。"),
+    }
+    intensity, valence, arousal, support_needed, summary = presets[primary]
+    return {
+        "primary": primary,
+        "intensity": intensity,
+        "valence": valence,
+        "arousal": arousal,
+        "support_needed": support_needed,
+        "summary": summary,
+    }
+
+
 def handle_wake_chat_response(
     response: dict[str, Any],
     args: argparse.Namespace,
+    robot: RobotUartController,
     timing: TimingLogger | None,
 ) -> bool:
+    control = normalize_control(response)
+    response["control"] = control
+    reply = sanitize_reply(response)
+    emotion_obj = response.get("emotion") if isinstance(response.get("emotion"), dict) else {}
+    if not emotion_obj or str(emotion_obj.get("primary", "")).strip().lower() != control["emotion"]:
+        response["emotion"] = emotion_summary_from_control(control)
+    print_control_summary(control)
+    print(f"parsed reply: {reply}")
+    print(f"parsed control: {json.dumps(control, ensure_ascii=False)}")
+
     voice_chat.print_result(response, verbose_debug=args.debug)
     response_vision_summary(response)
-    if not bridge.send_frdm_for_response(response, args):
-        return False
+
+    if control["persistent_state"] in {"normal", "sleep"}:
+        robot.set_persistent_state(control["persistent_state"])
+
+    robot.set_screen_state("Speaking")
+    print("UART Speaking sent.")
+    robot.send_emotion_screen(control["emotion"])
+
+    head_thread = robot.start_head_motion(control["head_motion"])
     if timing is not None:
-        timing.mark("UART sent")
-    voice_chat.speak_reply(response, args)
+        timing.mark("UART Speaking/emotion sent")
+
+    tts_ok = speak_reply_and_wait(response, args)
     if timing is not None:
-        timing.mark("TTS triggered")
-    return True
+        timing.mark("TTS finished or estimated finished")
+
+    head_thread.join(timeout=2.0)
+    if head_thread.is_alive():
+        print("WARNING: head motion thread still running after TTS; restore will continue.")
+
+    robot.restore_persistent_screen_state()
+    if timing is not None:
+        timing.mark("UART Normal/Sleep sent")
+    return tts_ok or not getattr(args, "require_tts", False)
+
+
+def run_wake_text_mode(args: argparse.Namespace) -> int:
+    if not voice_chat.preflight_server(args):
+        return 1
+    if not voice_chat.preflight_tts(args):
+        return 1
+
+    text_url = voice_chat.endpoint_url(args.server_url, "/text-chat")
+    robot = RobotUartController(args)
+    timing = TimingLogger()
+    print(f"POST text to {text_url}")
+    robot.set_screen_state("Thinking")
+    print("UART Thinking sent.")
+    timing.mark("UART Thinking sent")
+    try:
+        response = voice_chat.post_json(text_url, {"text": args.text}, timeout_sec=args.timeout)
+    except Exception as exc:
+        print(f"ERROR: text-chat failed: {exc}")
+        robot.restore_persistent_screen_state()
+        return 1
+
+    timing.mark("AI reply received")
+    debug_obj = response.get("debug") if isinstance(response.get("debug"), dict) else {}
+    raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
+    if raw_preview:
+        print(f"AI raw response preview: {raw_preview}")
+    return 0 if handle_wake_chat_response(response, args, robot, timing) else 1
 
 
 def run_wake_voice_loop(args: argparse.Namespace) -> int:
@@ -990,11 +1767,12 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     else:
         print("Camera disabled by --no-camera.")
 
+    robot = RobotUartController(args)
     turn_state: dict[str, Any] = {}
     recorder = WakeVolumeRecorder(
         args,
         sample_rate=input_sample_rate,
-        wake_hook=build_wake_hook(args, camera_manager, turn_state),
+        wake_hook=build_wake_hook(args, camera_manager, robot, turn_state),
     )
     try:
         recorder.load_wake_model()
@@ -1038,6 +1816,10 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             try:
                 audio, meta = recorder.record_once()
                 if audio is None:
+                    wake_context = meta.get("wake_context") if isinstance(meta.get("wake_context"), dict) else {}
+                    if wake_context:
+                        print(f"No send after wake: {meta.get('reason', 'unknown')}; restoring persistent screen state.")
+                        robot.restore_persistent_screen_state()
                     continue
 
                 wake_context = meta.get("wake_context") if isinstance(meta.get("wake_context"), dict) else {}
@@ -1052,6 +1834,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                 print(f"Recorded {meta.get('duration_sec', 0.0):.2f}s; RMS={rms:.5f}")
                 if rms < args.rms_threshold:
                     print("SKIP: audio RMS too low; not sending.")
+                    robot.restore_persistent_screen_state()
                     continue
 
                 image_future = wake_context.get("image_future")
@@ -1092,13 +1875,18 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                     timing.mark("uploaded to server")
                     timing.mark("transcript received")
                     timing.mark("AI reply received")
-                if not handle_wake_chat_response(response, args, timing):
+                debug_obj = response.get("debug") if isinstance(response.get("debug"), dict) else {}
+                raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
+                if raw_preview:
+                    print(f"AI raw response preview: {raw_preview}")
+                if not handle_wake_chat_response(response, args, robot, timing):
                     return 1
             except KeyboardInterrupt:
                 print()
                 return 0
             except Exception as exc:
                 print(f"ERROR: {exc}")
+                robot.restore_persistent_screen_state()
             finally:
                 if wav_path is not None:
                     try:
@@ -1117,6 +1905,7 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     safety_group = parser.add_argument_group("demo safety")
     safety_group.add_argument("--instance-lock", default=os.getenv("WAKE_BRIDGE_LOCK", DEFAULT_INSTANCE_LOCK))
     safety_group.add_argument("--no-instance-lock", action="store_true", help="Allow multiple bridge processes. Not recommended for demos.")
+    safety_group.add_argument("--self-test", action="store_true", help="Run parser/UART/TTS timing dry-run checks and exit without hardware.")
     safety_group.add_argument(
         "--allow-default-mic",
         action="store_true",
@@ -1163,6 +1952,13 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     vision_group = parser.add_argument_group("vision routing")
     vision_group.add_argument("--force-vision", action="store_true", help="Force Windows server to use the uploaded image when one is available.")
     vision_group.add_argument("--no-vision", action="store_true", help="Disable camera capture and Windows vision analysis for this client.")
+    tts_timing_group = parser.add_argument_group("tts timing")
+    tts_timing_group.add_argument(
+        "--tts-playback-timeout",
+        type=float,
+        default=_env_float("TTS_PLAYBACK_TIMEOUT", 45.0),
+        help="Maximum seconds to wait for /speak_async queue completion before restoring Normal/Sleep.",
+    )
     return parser
 
 
@@ -1188,10 +1984,12 @@ def main() -> int:
         list_sounddevice_inputs()
         list_sounddevice_outputs()
         return 0
+    if args.self_test:
+        return run_self_test()
     if args.check_server:
         return bridge.run_check_server(args)
     if args.text:
-        return bridge.run_text_mode(args)
+        return run_wake_text_mode(args)
     return run_wake_voice_loop(args)
 
 

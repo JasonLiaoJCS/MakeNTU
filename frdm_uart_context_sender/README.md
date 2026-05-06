@@ -1,89 +1,56 @@
 # FRDM Wake Voice Chat + Vision Bridge
 
-這個資料夾是 MakeNTU demo 的 Jetson 端整合層，負責：
+這個資料夾是 MakeNTU 桌上寵物機器人的 Jetson 整合層。正式操作請先看 [QUICK_START.md](QUICK_START.md)；本 README 用來理解架構、資料流、控制格式與除錯。
+
+## What This Does
 
 ```text
-wake word -> beep -> camera capture -> voice recording
--> Windows ASR/Ollama server
--> Jetson TTS
--> FRDM-MCXN947 UART
+Hey Jarvis wake word
+-> short beep
+-> camera JPEG capture in memory
+-> record speech until silence
+-> POST audio + optional image to Windows /voice-chat
+-> Windows ASR transcript
+-> rule-based vision intent routing
+-> qwen35-fast:latest text or vision response
+-> Jetson parses reply/control
+-> TTS speaks natural reply
+-> FRDM UART controls screen/emotion/head motion
 ```
 
-正式操作請優先看 [QUICK_START.md](QUICK_START.md)。
+不使用 Gemini、OpenAI 或雲端 API。ASR 與 Ollama 在 Windows 桌機本機；wake word、camera、TTS、UART 在 Jetson 本機。
 
-## 每次完整啟動三個 Terminal
-
-日常 demo 最常用的是三個 terminal：
+## Files
 
 ```text
-Terminal 1: Windows ASR/Ollama server
-Terminal 2: Jetson Piper TTS server
-Terminal 3: Jetson wake_voice_chat_frdm_bridge.py
+wake_voice_chat_frdm_bridge.py   # 正式 Hey Jarvis hands-free demo
+voice_chat_frdm_uart_bridge.py   # 手動 Enter 錄音版本
+frdm_uart_context_sender.py      # 單獨測 FRDM UART command
+recover_demo_usb.sh              # Jetson USB host controller recovery
+QUICK_START.md                   # 現場操作手冊
 ```
 
-完整可複製版本放在 [QUICK_START.md](QUICK_START.md) 最前面。這裡保留同一組核心指令，方便從 README 也能找到。
+Windows server 檔案：
 
-### Terminal 1: Windows ASR/Ollama Server
-
-Windows PowerShell：
-
-```powershell
-try {
-  Invoke-RestMethod http://127.0.0.1:11434/api/tags | Out-Null
-} catch {
-  Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Minimized
-  Start-Sleep -Seconds 3
-}
-
-ollama pull qwen35-fast:latest
-
-cd "$env:USERPROFILE\Desktop\windows_desktop_server_bundle"
-.\.venv\Scripts\Activate.ps1
-
-python desktop_fast_chat_server.py `
-  --host 0.0.0.0 `
-  --port 8766 `
-  --ollama-model qwen35-fast:latest `
-  --vision-model qwen35-fast:latest `
-  --no-think
+```text
+emotion_robot_controller/voice_stt_remote/desktop_fast_chat_server.py
+emotion_robot_controller/voice_stt_remote/windows_desktop_server_bundle/desktop_fast_chat_server.py
 ```
 
-### Terminal 2: Jetson Piper TTS
+Windows 桌面實際執行的是 bundle 版本，所以 server 有改時需要 scp 同步。
 
-Jetson：
+## Standard Startup
+
+完整可複製三個 terminal 指令在 [QUICK_START.md](QUICK_START.md) 最前面。核心參數如下：
 
 ```bash
-cd /home/asrlab-yian/MakeNTU/jetson_piper_tts
-source .venv/bin/activate
-pkill -f 'jetson_piper_tts.server' 2>/dev/null || true
-
-python -m jetson_piper_tts.server \
-  --host 0.0.0.0 \
-  --port 8777 \
-  --no-warmup
-```
-
-TTS `.env` 建議：
-
-```text
-AUDIO_DEVICE=auto:UACDemo
-```
-
-### Terminal 3: Jetson Wake Bridge
-
-Jetson：
-
-```bash
-cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
-source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-
 python3 wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
   --uart-port auto \
   --wake-threshold 0.75 \
   --wake-volume-min 350 \
-  --volume-min 3000 \
+  --volume-min 700 \
   --silence-duration 1.2 \
   --camera-id auto \
   --camera-width 320 \
@@ -93,59 +60,34 @@ python3 wake_voice_chat_frdm_bridge.py \
   --uart-debug
 ```
 
-啟動後應看到：
+正式 demo 不要固定 USB index：
 
 ```text
-USB auto-discovery: mic=keyword 'UACDemo'; beep=keyword 'UACDemo'; camera=auto; FRDM UART=auto
-Listening for wake word 'hey_jarvis'
+不要用 --device 25
+不要用 --beep-device 24
+不要用 --camera-id 0
+不要用 --uart-port /dev/ttyACM0
 ```
 
-正式 demo 請不要用固定數字或固定 port，例如 `--device 25`、`--beep-device 24`、`--camera-id 0`、`--uart-port /dev/ttyACM0`。重插 USB 後這些值會變；用 keyword / auto 才能自動追回設備。
-
-## 程式
+請用：
 
 ```text
-wake_voice_chat_frdm_bridge.py   # 正式 demo：Hey Jarvis hands-free 流程
-voice_chat_frdm_uart_bridge.py   # 手動 Enter 錄音版本
-frdm_uart_context_sender.py      # 單獨測 FRDM UART command
-recover_demo_usb.sh              # Jetson USB controller 掉線時的救援腳本
+mic       : --mic-keyword UACDemo
+beep      : --beep-keyword UACDemo
+TTS audio : AUDIO_DEVICE=auto:UACDemo
+camera    : --camera-id auto
+FRDM      : --uart-port auto
 ```
-
-## 架構
-
-```text
-Jetson UACDemo microphone
--> openWakeWord hey_jarvis
--> short local beep
--> one-shot camera JPEG capture in memory
--> record speech until silence
--> POST multipart/form-data to Windows /voice-chat
-   - audio: WAV
-   - image: optional JPEG
-   - metadata: vision_mode, image_size_bytes, wake info
--> Windows Qwen ASR transcript
--> detect_vision_intent(transcript)
--> Windows Ollama qwen35-fast:latest
-   - pure text path for normal chat/control
-   - vision path when current camera view is needed
--> Jetson prints transcript/reply/vision debug
--> Jetson sends UART command to FRDM
--> Jetson queues Piper TTS reply
-```
-
-本 demo 不使用 Gemini、OpenAI 或其他雲端 API。ASR 和 Ollama 都跑在 Windows 桌機本機；wake word、camera、TTS、UART 都在 Jetson 本機。
 
 ## Windows Server
 
-Windows server 必須是最新版，因為 vision routing 是在 Windows 端做的。Jetson 端改了 server bundle 後，不會自動更新 Windows 桌面那份檔案。
-
-在 Windows PowerShell 同步 server 檔案：
+同步最新版 server 到 Windows：
 
 ```powershell
 scp asrlab-yian@100.110.90.72:/home/asrlab-yian/MakeNTU/emotion_robot_controller/voice_stt_remote/windows_desktop_server_bundle/desktop_fast_chat_server.py "$env:USERPROFILE\Desktop\windows_desktop_server_bundle\desktop_fast_chat_server.py"
 ```
 
-啟動 Windows server：
+啟動：
 
 ```powershell
 cd "$env:USERPROFILE\Desktop\windows_desktop_server_bundle"
@@ -154,24 +96,169 @@ ollama pull qwen35-fast:latest
 python desktop_fast_chat_server.py --host 0.0.0.0 --port 8766 --ollama-model qwen35-fast:latest --vision-model qwen35-fast:latest --no-think
 ```
 
-確認版本：
-
-```powershell
-curl.exe http://127.0.0.1:8766/health
-```
-
-應看到：
+Health 必須看到：
 
 ```text
-debug_version: 9
+debug_version: 10
+chat_ready   : True
+asr_loaded   : True
+ollama_model : qwen35-fast:latest
 vision_model : qwen35-fast:latest
 ```
 
-如果仍看到 `debug_version: 7` 或舊 model，代表 Windows 還在跑舊檔或舊 process。
+如果 `debug_version` 不是 10，代表 Windows 還在跑舊檔或舊 process。
+
+## Structured Reply And Control
+
+Windows `qwen35-fast:latest` 被要求只回傳一個 JSON object：
+
+```json
+{
+  "reply": "自然語言回覆，給 TTS 播放。不可提到 JSON、UART、MotorPitch、MotorYaw 或內部控制欄位。",
+  "control": {
+    "persistent_state": "normal | sleep | unchanged",
+    "emotion": "neutral | happy | curious | excited | confused | concerned | sleepy",
+    "head_motion": "none | nod | double_nod | look_around | shake | gentle_nod | sleepy_drop",
+    "reason": "簡短內部理由，不給使用者播放"
+  }
+}
+```
+
+Jetson robust parser：
+
+```text
+合法 JSON                  -> 使用 reply/control
+前後混入文字              -> 抽第一個 JSON object
+server 回舊欄位 uart       -> normalize 成 control
+reply 裡混入 JSON/control  -> 抽出自然 reply，不讓 TTS 唸控制資訊
+parse 失敗                -> 自然 fallback reply + neutral/none/unchanged
+```
+
+`reply` 永遠是給使用者聽的自然語言；`control` 永遠是內部控制。
+
+## FRDM UART Timing
+
+正式時序：
+
+```text
+Wake detected
+-> beep
+-> Thinking 0 0
+-> user speech / recording / image capture / upload / ASR / Ollama
+-> receive reply/control
+-> Speaking 0 0
+-> emotion screen command, e.g. Happy 0 0
+-> TTS starts
+-> head motion thread starts
+-> TTS finishes or estimated finished
+-> restore Normal 0 0 or Sleep 0 0
+```
+
+Persistent state：
+
+```text
+normal
+sleep
+```
+
+Temporary screen state：
+
+```text
+Thinking
+Speaking
+```
+
+Sleep intent examples：
+
+```text
+去睡覺
+睡覺吧
+休息一下
+晚安
+安靜一下
+sleep
+go to sleep
+standby
+```
+
+Wake/normal intent examples：
+
+```text
+起床
+醒來
+回來
+回到正常
+不要睡了
+wake up
+come back
+normal
+```
+
+## Emotion And Head Motion
+
+Emotion screen command mapping：
+
+```text
+neutral   -> Neutral
+happy     -> Happy
+curious   -> Curious
+excited   -> Excited
+confused  -> Confused
+concerned -> Concerned
+sleepy    -> Sleepy
+```
+
+Head motion fallback：
+
+```text
+neutral   -> none
+happy     -> nod
+curious   -> look_around
+excited   -> double_nod
+confused  -> shake
+concerned -> gentle_nod
+sleepy    -> sleepy_drop
+```
+
+Motor safety：
+
+```text
+MOTOR_MIN=-15
+MOTOR_MAX=15
+MOTOR_STEP_DELAY_SEC=0.08
+```
+
+所有 `MotorPitch` / `MotorYaw` 都會 clamp 到安全範圍。動作結束一定回原位：
+
+```text
+MotorPitch 0 0
+MotorYaw 0 0
+```
+
+目前允許送給 FRDM 的 command：
+
+```text
+Sleep
+Normal
+Thinking
+Speaking
+ShowNum
+MotorPitch
+MotorYaw
+Neutral
+Happy
+Curious
+Excited
+Confused
+Concerned
+Sleepy
+```
+
+未來情緒 command 若 FRDM 還沒實作，Jetson 不會 crash；之後在 FRDM monitor command list 補 handler 即可。
 
 ## Vision Routing
 
-Windows server 會先做 ASR，取得 `transcript` 後才判斷是否需要圖片。
+Windows server 先做 ASR，拿到 `transcript` 後才判斷是否需要圖片。
 
 核心函式：
 
@@ -180,9 +267,9 @@ detect_vision_intent(transcript: str) -> tuple[bool, str]
 should_use_vision(transcript: str) -> bool
 ```
 
-判斷策略是高召回率 rule-based，不額外呼叫 LLM。只要回答需要目前鏡頭畫面，就使用 vision path。
+策略是高召回率 rule-based，不額外呼叫 LLM。只要回答需要目前鏡頭畫面，就使用 vision path。
 
-會使用 vision 的例子：
+會使用 vision：
 
 ```text
 我現在是什麼表情
@@ -205,7 +292,7 @@ identify this
 analyze this
 ```
 
-不使用 vision 的例子：
+不使用 vision：
 
 ```text
 幫我開電風扇
@@ -214,196 +301,134 @@ analyze this
 今天幾號
 講個笑話
 解釋 PID 控制
-把表情切成開心
 馬達往前走
 ```
 
-混合句只要有視覺需求就會使用 vision，例如：
+混合句只要有視覺需求就走 vision：
 
 ```text
 看一下燈有沒有開，沒有的話幫我開燈
 我現在是不是在笑，然後把螢幕切成開心表情
 ```
 
-server log 會印：
+Vision mode priority：
 
 ```text
-transcript='...'
-normalized_transcript='...'
-vision_intent=True/False
-reason=keyword:... or pattern:...
-image_received=True/False
-image_size_bytes=...
-calling vision model=qwen35-fast:latest image_bytes=...
+--no-vision     disables camera and vision
+--force-vision  forces vision whenever image exists
+auto            detect_vision_intent(transcript)
 ```
 
-Jetson 端 response summary 會印：
+## Camera And Image Storage
+
+正式 bridge 的 camera capture 是 memory-only：
 
 ```text
-Vision routing:
-  normalized_transcript : ...
-  vision_intent         : True/False
-  vision_reason         : ...
-  auto_intent           : ...
-  used_vision           : True/False
-  image_received        : True/False
-  image_size_bytes      : ...
-  vision_model          : qwen35-fast:latest
-  vision_error          : ...
+wake detected
+-> one-shot camera subprocess
+-> JPEG bytes in memory
+-> multipart/form-data image field
+-> Windows reads image bytes in memory
+-> no permanent jpg/png saved by bridge
 ```
 
-## Jetson Start
+正式建議：
 
-進入資料夾並啟用 venv：
+```text
+320x240
+JPEG quality 70
+camera-id auto
+```
+
+如果 camera timeout、busy 或未接上，流程不 crash，會送 audio only。若 transcript 需要 vision 但 image 缺失，server 會 log `vision_error` 並 fallback 純文字回答。
+
+注意：`vision/camera_ollama_status.py` 是 standalone 測試程式，可能會把測試照片存到 `vision/`；正式 bridge 不會永久存照片。
+
+## TTS Playback Completion
+
+Jetson 預設使用：
+
+```text
+http://127.0.0.1:8777/speak_async
+```
+
+流程：
+
+```text
+POST /speak_async -> get job_id
+poll /queue until job_id appears in last_result
+if queue status unavailable -> estimate by reply length
+restore Normal/Sleep after TTS finished or estimated finished
+```
+
+可調 timeout：
+
+```bash
+--tts-playback-timeout 45
+```
+
+TTS `.env` 建議：
+
+```text
+AUDIO_DEVICE=auto:UACDemo
+ENABLE_STREAM_PLAYBACK=true
+```
+
+USB recovery 或重插 speaker 後，建議重開 TTS server。
+
+## USB Replug Auto Discovery
+
+Bridge 在這些時機重新掃設備：
+
+```text
+每次開錄音 stream 前 -> 找 UACDemo input
+每次 beep 前          -> 找 UACDemo output
+每次 wake capture     -> 掃 /dev/video*
+每次 UART send        -> 找 FRDM serial
+```
+
+啟動時看到這行代表設定正確：
+
+```text
+USB auto-discovery: mic=keyword 'UACDemo'; beep=keyword 'UACDemo'; camera=auto; FRDM UART=auto
+```
+
+如果 USB controller 掉線、`lsusb` 看不到 UACDemo/camera/FRDM：
+
+```bash
+cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+./recover_demo_usb.sh
+```
+
+成功應看到：
+
+```text
+Jieli Technology UACDemoV1.0
+Global Shutter Camera
+NXP Semiconductors MCU-LINK FRDM-MCXN947
+/dev/video0 /dev/video1
+/dev/ttyACM0
+```
+
+## Self-Test And Preflight
+
+Jetson self-test：
 
 ```bash
 cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+python3 wake_voice_chat_frdm_bridge.py --self-test
 ```
 
-純語音穩定測試：
+Windows self-test：
 
-```bash
-python3 wake_voice_chat_frdm_bridge.py \
-  --server-url http://100.108.141.26:8766/voice-chat \
-  --mic-keyword UACDemo \
-  --uart-port auto \
-  --no-camera \
-  --no-beep \
-  --wake-threshold 0.75 \
-  --wake-volume-min 350 \
-  --volume-min 3000 \
-  --silence-duration 1.2 \
-  --tts-debug \
-  --uart-debug
+```powershell
+cd "$env:USERPROFILE\Desktop\windows_desktop_server_bundle"
+.\.venv\Scripts\Activate.ps1
+python desktop_fast_chat_server.py --self-test
 ```
 
-正式 voice + camera + vision：
-
-```bash
-python3 wake_voice_chat_frdm_bridge.py \
-  --server-url http://100.108.141.26:8766/voice-chat \
-  --mic-keyword UACDemo \
-  --uart-port auto \
-  --wake-threshold 0.75 \
-  --wake-volume-min 350 \
-  --volume-min 3000 \
-  --silence-duration 1.2 \
-  --camera-id auto \
-  --camera-width 320 \
-  --camera-height 240 \
-  --camera-jpeg-quality 70 \
-  --tts-debug \
-  --uart-debug
-```
-
-強制測試 camera -> server -> vision：
-
-```bash
-python3 wake_voice_chat_frdm_bridge.py \
-  --server-url http://100.108.141.26:8766/voice-chat \
-  --mic-keyword UACDemo \
-  --uart-port auto \
-  --force-vision \
-  --wake-threshold 0.75 \
-  --wake-volume-min 350 \
-  --volume-min 3000 \
-  --camera-id auto \
-  --camera-width 320 \
-  --camera-height 240 \
-  --camera-jpeg-quality 70 \
-  --tts-debug \
-  --uart-debug
-```
-
-完全關閉 vision 和 camera：
-
-```bash
---no-vision
-```
-
-只關 camera、server 仍可自動判斷但沒有圖片可用：
-
-```bash
---no-camera
-```
-
-## Vision Mode Priority
-
-```text
---no-vision     highest priority, disables camera and vision analysis
---force-vision  uses uploaded image whenever available
-auto            detect_vision_intent(transcript)
-```
-
-`--force-vision` 是 debug 用，適合測試「camera 有拍到、server 有收到、qwen35-fast 真的有被呼叫」。
-
-## Camera
-
-camera capture 是 memory-only one-shot subprocess：
-
-```text
-wake detected
--> start camera capture task
--> capture JPEG bytes
--> no permanent jpg/png saved
--> upload as multipart image field
-```
-
-預設建議解析度：
-
-```text
-320x240, JPEG quality 70
-```
-
-如果 camera busy、沒有接相機、OpenCV timeout，主流程不會 crash，會 fallback 純語音。
-
-## Beep
-
-wake 後會播放短 beep。程式會自動用 `--beep-keyword UACDemo` 找 USB speaker output。
-
-關閉 beep：
-
-```bash
---no-beep
-```
-
-不建議在正式 demo 用固定數字 output，例如 `--beep-device 24`。USB 重新插拔後，sounddevice index 可能會變，固定 index 會讓 beep 找錯裝置。正式跑請省略 `--beep-device`，保留預設：
-
-```text
---beep-keyword UACDemo
-```
-
-## FRDM UART
-
-目前支援 FRDM monitor commands：
-
-```text
-Sleep
-Normal
-ShowNum <0..999999>
-MotorPitch <0..180>
-MotorYaw <0..180>
-```
-
-預設 serial：
-
-```text
---uart-port auto
-baudrate: 115200
-line ending: CRLF
-```
-
-只測 UART：
-
-```bash
-python3 frdm_uart_context_sender.py --list-ports
-python3 frdm_uart_context_sender.py --command Sleep --port auto
-python3 frdm_uart_context_sender.py --command Normal --port auto
-python3 frdm_uart_context_sender.py --command "ShowNum 123" --port auto
-```
-
-## Preflight
+Device/server checks：
 
 ```bash
 python3 wake_voice_chat_frdm_bridge.py --list-mics
@@ -411,69 +436,110 @@ python3 wake_voice_chat_frdm_bridge.py --list-uarts
 python3 wake_voice_chat_frdm_bridge.py --server-url http://100.108.141.26:8766/voice-chat --check-server --uart-dry-run --tts-debug
 ```
 
-`--list-mics` 應看到 UACDemo input。`--list-uarts` 應看到 `/dev/ttyACM0` 或 `/dev/serial/by-id/...`。
+`--list-mics` 應看到 UACDemo input；`--list-uarts` 應看到 `/dev/ttyACM0` 或 `/dev/serial/by-id/...`。
 
-## USB Replug Auto Discovery
+## Debug Log Guide
 
-正式 demo 請使用名稱或 `auto`，不要綁固定數字 index：
-
-```text
-mic       : --mic-keyword UACDemo
-speaker  : --beep-keyword UACDemo, 不要加 --beep-device 24
-TTS audio : /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env 使用 AUDIO_DEVICE=auto:UACDemo
-camera   : --camera-id auto
-FRDM     : --uart-port auto
-```
-
-`wake_voice_chat_frdm_bridge.py` 會在每次開錄音 stream 前重新掃描 UACDemo input，wake 後播放 beep 前重新掃描 UACDemo output，camera one-shot capture 會在每次 wake 重新掃 `/dev/video*`，FRDM UART 則在每次送 command 前用 `--uart-port auto` 重新選 `/dev/ttyACM*`、`/dev/ttyUSB*` 或 `/dev/serial/by-id/*`。
-
-啟動時看到這行代表是 replug-friendly 設定：
+Jetson upload：
 
 ```text
-USB auto-discovery: mic=keyword 'UACDemo'; beep=keyword 'UACDemo'; camera=auto; FRDM UART=auto
+Image captured: 13001 bytes
+POST audio+image ... (vision_mode=auto, image_size_bytes=13001)
 ```
 
-如果你手動傳了 `--device` 或 `--beep-device`，程式會提醒這是固定數字 index，重插 USB 後不保證穩。
+Vision summary：
 
-## USB Recovery
-
-Jetson USB controller 卡住、camera 卡住、程式停不了或裝置消失時：
-
-```bash
-cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
-./recover_demo_usb.sh
+```text
+Vision routing:
+  normalized_transcript : ...
+  vision_intent         : True/False
+  vision_reason         : keyword:... or pattern:...
+  used_vision           : True/False
+  image_received        : True/False
+  image_size_bytes      : ...
+  vision_model          : qwen35-fast:latest
+  vision_error          : ...
 ```
 
-如果只想殺掉 bridge：
+Windows server vision path：
 
-```bash
-pkill -9 -f wake_voice_chat_frdm_bridge.py
+```text
+voice-chat xxxx: transcript='我手上拿什麼'
+voice-chat xxxx: normalized_transcript='我手上拿什麼'
+voice-chat xxxx: vision_intent=True reason=keyword:我手上 ...
+voice-chat xxxx: calling vision model=qwen35-fast:latest image_bytes=...
 ```
+
+UART timing：
+
+```text
+FRDM UART TX: Thinking 0 0
+FRDM UART TX: Speaking 0 0
+FRDM UART TX: Happy 0 0
+FRDM UART TX: MotorPitch ...
+FRDM UART TX: Normal 0 0
+```
+
+Recording wait：
+
+```text
+Waiting for speech... volume=xxx < volume_min=700
+```
+
+表示 wake 成功，但錄音音量還沒超過 speech threshold。靠近 mic 或降低 `--volume-min`。
 
 ## Troubleshooting
 
 ```text
-Windows health debug_version 不是 9
--> Windows server 沒同步新版 desktop_fast_chat_server.py，或還在跑舊 process。
+No microphone matching UACDemo
+-> Jetson 沒看到 USB mic。跑 lsusb / --list-mics；若 lsusb 看不到 UACDemo，跑 ./recover_demo_usb.sh。
 
-vision_intent=True 但 used_vision=False
--> 看 vision_error。通常是 image missing、server vision disabled、Ollama error。
-
-image_received=False
--> Jetson 沒有送 image。檢查 camera log、--no-camera、--no-vision。
-
-image_size_bytes=0
--> multipart 有 image 欄位但讀不到有效 bytes，檢查 camera capture。
-
-calling vision model 沒出現
--> 沒走 vision path。看 vision_intent 和 vision_reason。
-
-TTS ready 但沒聲音
--> 檢查 /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env 的 AUDIO_DEVICE=auto:UACDemo，重開 TTS server。
+Recording 後像卡住
+-> 看 Waiting for speech log。可把 --volume-min 700 降到 500。
 
 Wake 被 ignore
--> 這是低音量保護。正式建議 --wake-volume-min 350；仍漏叫可降到 200，但誤觸發會增加。
+-> 低音量保護。正式用 --wake-volume-min 350；仍漏叫可降到 200。
+
+Camera timeout
+-> 不會 crash。跑 lsusb / ls -l /dev/video* / ./recover_demo_usb.sh。
+
+Windows health timeout
+-> 確認 Windows server terminal 開著、Tailscale IP 正確、port 8766 沒被舊 process 占用。
+
+debug_version 不是 10
+-> 重新 scp 同步 Windows bundle，關掉舊 server，重開。
+
+TTS ready 但沒聲音
+-> curl /health，確認 AUDIO_DEVICE=auto:UACDemo 和 audio.device 是 UACDemo；重開 TTS。
+
+vision_intent=True 但 used_vision=False
+-> 看 image_received / image_size_bytes / vision_error。
 
 FRDM 沒反應
--> 先跑 --list-uarts，再確認 J17 MCU-LINK USB-C、data cable、J18 open、baudrate 115200、line ending CRLF。
+-> --list-uarts、lsusb、/dev/ttyACM*；確認 MCU-LINK USB-C、data cable、baudrate 115200、CRLF。
+```
+
+## Demo Checklist
+
+Windows：
+
+```text
+[ ] desktop_fast_chat_server.py 已同步
+[ ] ollama list 有 qwen35-fast:latest
+[ ] /health debug_version=10
+[ ] vision_model=qwen35-fast:latest
+```
+
+Jetson：
+
+```text
+[ ] TTS /health ready=true
+[ ] TTS audio device 是 UACDemo
+[ ] --list-mics 有 UACDemo input
+[ ] --list-uarts 有 FRDM
+[ ] lsusb 有 UACDemo / Global Shutter Camera / MCU-LINK
+[ ] wake bridge self-test OK
+[ ] 純語音 used_vision=False
+[ ] 視覺句 used_vision=True
+[ ] FRDM UART TX/RX 正常
 ```
