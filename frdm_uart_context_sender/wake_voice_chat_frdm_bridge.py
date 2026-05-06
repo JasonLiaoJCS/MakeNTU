@@ -357,6 +357,9 @@ def main() -> int:
     args.tts_interrupt = not args.tts_no_interrupt
     args.tts_stream = False if args.tts_file_playback else None
 
+    if args.list_uarts:
+        bridge.print_uart_ports()
+        return 0
     if args.list_mics:
         voice_chat.list_microphones()
         list_sounddevice_inputs()

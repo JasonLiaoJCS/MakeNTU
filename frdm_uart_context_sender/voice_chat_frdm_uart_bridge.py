@@ -57,6 +57,16 @@ from frdm_uart_context_sender import (  # noqa: E402
 DEFAULT_UART_OUTPUT = str(THIS_DIR / "uart.json")
 DEFAULT_TTS_VOICE = "zh_CN-xiao_ya-medium"
 DEFAULT_MIC_KEYWORD = os.getenv("MIC_DEVICE_KEYWORD", "UACDemo")
+UART_PREFERRED_KEYWORDS = (
+    "frdm",
+    "mcu",
+    "cmsis",
+    "dap",
+    "nxp",
+    "j-link",
+    "linkserver",
+    "mbed",
+)
 
 
 def _input_device_info(device_index: int | None) -> dict[str, Any] | None:
@@ -141,6 +151,99 @@ def line_ending_bytes(name: str) -> bytes:
     return b"\r\n" if name == "crlf" else b"\n"
 
 
+def discover_uart_ports() -> list[dict[str, Any]]:
+    ports: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    try:
+        from serial.tools import list_ports
+
+        for port in list_ports.comports():
+            device = str(port.device)
+            text = " ".join(
+                str(value)
+                for value in (
+                    port.device,
+                    port.description,
+                    port.manufacturer,
+                    port.product,
+                    port.hwid,
+                )
+                if value
+            )
+            lowered = text.lower()
+            ports.append(
+                {
+                    "device": device,
+                    "description": port.description or "",
+                    "hwid": port.hwid or "",
+                    "preferred": any(keyword in lowered for keyword in UART_PREFERRED_KEYWORDS),
+                }
+            )
+            seen.add(device)
+    except Exception:
+        pass
+
+    for pattern in ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*"):
+        for path in sorted(Path("/").glob(pattern.lstrip("/"))):
+            device = str(path)
+            if device in seen:
+                continue
+            ports.append({"device": device, "description": "", "hwid": "", "preferred": False})
+            seen.add(device)
+
+    return sorted(ports, key=lambda item: (not bool(item.get("preferred")), str(item.get("device", ""))))
+
+
+def print_uart_ports() -> None:
+    ports = discover_uart_ports()
+    print("UART serial ports:")
+    if not ports:
+        print("  (none)")
+        print("  Plug the FRDM debug/USB-serial cable into the Jetson, then run this again.")
+        return
+    for port in ports:
+        marker = "*" if port.get("preferred") else " "
+        description = str(port.get("description", "")).strip()
+        hwid = str(port.get("hwid", "")).strip()
+        detail = " ".join(part for part in (description, hwid) if part)
+        suffix = f"  {detail}" if detail else ""
+        print(f" {marker} {port['device']}{suffix}")
+
+
+def resolve_uart_port(port: str) -> str:
+    requested = str(port or "").strip()
+    if requested and requested.lower() != "auto" and Path(requested).exists():
+        return requested
+
+    ports = discover_uart_ports()
+    preferred = [item for item in ports if item.get("preferred")]
+    candidates = preferred or ports
+
+    if len(candidates) == 1:
+        selected = str(candidates[0]["device"])
+        reason = "preferred match" if preferred else "only serial port"
+        if requested.lower() == "auto" or requested != selected:
+            print(f"Selected FRDM UART {selected} ({reason}).")
+        return selected
+
+    if requested and requested.lower() != "auto" and not requested.startswith("/dev/"):
+        return requested
+
+    if not ports:
+        raise RuntimeError(
+            f"No UART serial device is visible; requested {requested or 'auto'}. "
+            "Plug the FRDM debug/USB-serial cable into the Jetson, then check "
+            "`python3 wake_voice_chat_frdm_bridge.py --list-uarts`."
+        )
+
+    details = ", ".join(str(item["device"]) for item in ports)
+    raise RuntimeError(
+        f"Could not choose a UART port automatically; requested {requested or 'auto'}. "
+        f"Candidates: {details}. Pass the right one with --uart-port."
+    )
+
+
 def print_uart_summary(
     uart_doc: dict[str, Any],
     *,
@@ -198,9 +301,10 @@ def send_frdm_for_response(response: dict[str, Any], args: argparse.Namespace) -
         started = time.monotonic()
         results: list[dict[str, Any]]
         if commands:
+            uart_port = args.uart_port if args.uart_dry_run else resolve_uart_port(args.uart_port)
             results = send_uart(
                 commands,
-                port=args.uart_port,
+                port=uart_port,
                 baudrate=args.uart_baudrate,
                 timeout=args.uart_timeout,
                 line_ending=line_ending_bytes(args.uart_line_ending),
@@ -209,10 +313,11 @@ def send_frdm_for_response(response: dict[str, Any], args: argparse.Namespace) -
                 dry_run=args.uart_dry_run,
             )
         else:
+            uart_port = args.uart_port
             results = []
 
         uart_doc["serial"] = {
-            "port": args.uart_port,
+            "port": uart_port,
             "baudrate": args.uart_baudrate,
             "line_ending": args.uart_line_ending,
             "dry_run": args.uart_dry_run,
@@ -385,7 +490,8 @@ def add_uart_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--no-uart", action="store_true", help="Do not write uart.json or send UART.")
     group.add_argument("--require-uart", action="store_true", help="Exit with error if UART send fails.")
     group.add_argument("--uart-dry-run", action="store_true", help="Build uart.json and print TX, but do not open serial.")
-    group.add_argument("--uart-port", default=DEFAULT_PORT, help="FRDM USB serial port, e.g. /dev/ttyACM0.")
+    group.add_argument("--uart-port", default=DEFAULT_PORT, help="FRDM USB serial port, e.g. /dev/ttyACM0, /dev/ttyUSB0, or auto.")
+    group.add_argument("--list-uarts", action="store_true", help="List visible UART serial ports and exit.")
     group.add_argument("--uart-baudrate", type=int, default=DEFAULT_BAUDRATE)
     group.add_argument("--uart-timeout", type=float, default=1.0)
     group.add_argument("--uart-read-ms", type=int, default=300, help="Read FRDM replies for this many ms after each TX.")
@@ -410,6 +516,9 @@ def main() -> int:
     args.tts_interrupt = not args.tts_no_interrupt
     args.tts_stream = False if args.tts_file_playback else None
 
+    if args.list_uarts:
+        print_uart_ports()
+        return 0
     if args.list_mics:
         voice_chat.list_microphones()
         return 0

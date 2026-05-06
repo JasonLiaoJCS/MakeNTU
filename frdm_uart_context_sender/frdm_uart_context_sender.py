@@ -30,6 +30,16 @@ DEFAULT_PORT = "/dev/ttyACM0"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_OUTPUT = "uart.json"
 DEFAULT_LINE_ENDING = "crlf"
+UART_PREFERRED_KEYWORDS = (
+    "frdm",
+    "mcu",
+    "cmsis",
+    "dap",
+    "nxp",
+    "j-link",
+    "linkserver",
+    "mbed",
+)
 
 COMMAND_ARITY = {
     "Sleep": 0,
@@ -368,6 +378,99 @@ def write_uart_json(path: Path, document: dict[str, Any]) -> None:
     path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def discover_uart_ports() -> list[dict[str, Any]]:
+    ports: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    try:
+        from serial.tools import list_ports
+
+        for port in list_ports.comports():
+            device = str(port.device)
+            text = " ".join(
+                str(value)
+                for value in (
+                    port.device,
+                    port.description,
+                    port.manufacturer,
+                    port.product,
+                    port.hwid,
+                )
+                if value
+            )
+            lowered = text.lower()
+            ports.append(
+                {
+                    "device": device,
+                    "description": port.description or "",
+                    "hwid": port.hwid or "",
+                    "preferred": any(keyword in lowered for keyword in UART_PREFERRED_KEYWORDS),
+                }
+            )
+            seen.add(device)
+    except Exception:
+        pass
+
+    for pattern in ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*"):
+        for path in sorted(Path("/").glob(pattern.lstrip("/"))):
+            device = str(path)
+            if device in seen:
+                continue
+            ports.append({"device": device, "description": "", "hwid": "", "preferred": False})
+            seen.add(device)
+
+    return sorted(ports, key=lambda item: (not bool(item.get("preferred")), str(item.get("device", ""))))
+
+
+def print_uart_ports() -> None:
+    ports = discover_uart_ports()
+    print("UART serial ports:")
+    if not ports:
+        print("  (none)")
+        print("  Plug the FRDM debug/USB-serial cable into the Jetson, then run this again.")
+        return
+    for port in ports:
+        marker = "*" if port.get("preferred") else " "
+        description = str(port.get("description", "")).strip()
+        hwid = str(port.get("hwid", "")).strip()
+        detail = " ".join(part for part in (description, hwid) if part)
+        suffix = f"  {detail}" if detail else ""
+        print(f" {marker} {port['device']}{suffix}")
+
+
+def resolve_uart_port(port: str) -> str:
+    requested = str(port or "").strip()
+    if requested and requested.lower() != "auto" and Path(requested).exists():
+        return requested
+
+    ports = discover_uart_ports()
+    preferred = [item for item in ports if item.get("preferred")]
+    candidates = preferred or ports
+
+    if len(candidates) == 1:
+        selected = str(candidates[0]["device"])
+        reason = "preferred match" if preferred else "only serial port"
+        if requested.lower() == "auto" or requested != selected:
+            print(f"Selected UART {selected} ({reason}).")
+        return selected
+
+    if requested and requested.lower() != "auto" and not requested.startswith("/dev/"):
+        return requested
+
+    if not ports:
+        raise RuntimeError(
+            f"No UART serial device is visible; requested {requested or 'auto'}. "
+            "Plug the FRDM debug/USB-serial cable into the Jetson, then check "
+            "`python3 frdm_uart_context_sender.py --list-ports`."
+        )
+
+    details = ", ".join(str(item["device"]) for item in ports)
+    raise RuntimeError(
+        f"Could not choose a UART port automatically; requested {requested or 'auto'}. "
+        f"Candidates: {details}. Pass the right one with --port."
+    )
+
+
 def send_uart(
     commands: list[UartCommand],
     *,
@@ -423,7 +526,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Where to write uart.json.")
     parser.add_argument("--no-write-json", action="store_true", help="Do not write uart.json.")
     parser.add_argument("--no-default-normal", action="store_true", help="Do not send Normal when no other state is detected.")
-    parser.add_argument("--port", default=DEFAULT_PORT, help="USB serial port, e.g. /dev/ttyACM0 or /dev/ttyUSB0.")
+    parser.add_argument("--port", default=DEFAULT_PORT, help="USB serial port, e.g. /dev/ttyACM0, /dev/ttyUSB0, or auto.")
+    parser.add_argument("--list-ports", action="store_true", help="List visible UART serial ports and exit.")
     parser.add_argument("--baudrate", type=int, default=DEFAULT_BAUDRATE)
     parser.add_argument("--timeout", type=float, default=1.0)
     parser.add_argument("--read-ms", type=int, default=250, help="Read FRDM replies for this many ms after each TX.")
@@ -436,6 +540,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.list_ports:
+        print_uart_ports()
+        return 0
+
     try:
         payload = load_payload(args)
         commands = decide_commands(payload, default_normal=not args.no_default_normal)
@@ -450,9 +558,10 @@ def main() -> int:
             print()
 
         line_ending = b"\r\n" if args.line_ending == "crlf" else b"\n"
+        port = args.port if args.dry_run else resolve_uart_port(args.port)
         results = send_uart(
             commands,
-            port=args.port,
+            port=port,
             baudrate=args.baudrate,
             timeout=args.timeout,
             line_ending=line_ending,
@@ -461,7 +570,7 @@ def main() -> int:
             dry_run=args.dry_run,
         )
         uart_doc["serial"] = {
-            "port": args.port,
+            "port": port,
             "baudrate": args.baudrate,
             "line_ending": args.line_ending,
             "dry_run": args.dry_run,
