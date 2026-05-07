@@ -20,6 +20,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import queue
 import re
 import signal
 import subprocess
@@ -34,6 +35,8 @@ from typing import Any
 
 import numpy as np
 
+
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parent
@@ -53,6 +56,32 @@ import jetson_fast_voice_chat as voice_chat  # noqa: E402
 
 CLIENT_VERSION = "wake_voice_chat_frdm_bridge_vision_v2"
 DEFAULT_INSTANCE_LOCK = "/tmp/wake_voice_chat_frdm_bridge.lock"
+DEMO_STALE_PROCESS_PATTERNS = (
+    "wake_voice_chat_frdm_bridge.py",
+    "camera_ollama_status.py",
+    "cameraTest.py",
+    "latest_frame_camera.py",
+    "camera_object_comment.py",
+    "camera_gemini.py",
+    "arecord",
+    "aplay",
+    "mpv",
+    "ffplay",
+    "paplay",
+)
+DEVICE_OWNER_ALLOW_PATTERNS = (
+    "jetson_piper_tts.server",
+    "pulseaudio",
+    "pipewire",
+    "wireplumber",
+)
+DEMO_PREFLIGHT_SKIP_ARGS = (
+    "--self-test",
+    "--device-preflight-only",
+    "--help",
+    "--list-mics",
+    "--list-uarts",
+)
 
 CORE_SCREEN_COMMANDS = {"Sleep", "Normal", "Thinking", "Speaking"}
 MOTOR_COMMANDS = {"MotorPitch", "MotorYaw"}
@@ -170,7 +199,12 @@ import re
 import sys
 import time
 
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 import cv2
+try:
+    cv2.setLogLevel(2)
+except Exception:
+    pass
 
 
 def parse_camera_id(raw):
@@ -307,6 +341,41 @@ def int16_volume(audio_int16: np.ndarray) -> int:
     return int(np.abs(audio_int16.astype(np.int32)).mean())
 
 
+def percentile_int(values: list[int], percentile: float, *, fallback: int = 0) -> int:
+    cleaned = [int(value) for value in values if int(value) >= 0]
+    if not cleaned:
+        return int(fallback)
+    return int(np.percentile(np.asarray(cleaned, dtype=np.float32), float(percentile)))
+
+
+def adaptive_recording_thresholds(args: argparse.Namespace, ambient_volumes: list[int], *, fallback_volume: int) -> tuple[int, int, int]:
+    """Return ambient floor, speech-start threshold, and base silence threshold."""
+    noise_floor = percentile_int(
+        ambient_volumes,
+        getattr(args, "noise_floor_percentile", 75.0),
+        fallback=fallback_volume,
+    )
+    speech_start_threshold = int(getattr(args, "volume_min", 700))
+    silence_base_threshold = speech_start_threshold
+    if not getattr(args, "no_adaptive_volume", False):
+        speech_start_threshold = max(
+            speech_start_threshold,
+            noise_floor + int(getattr(args, "speech_start_margin", 350)),
+        )
+        silence_base_threshold = max(
+            int(getattr(args, "volume_min", 700)),
+            noise_floor + int(getattr(args, "silence_margin", 500)),
+        )
+    return noise_floor, speech_start_threshold, silence_base_threshold
+
+
+def adaptive_silence_threshold(args: argparse.Namespace, silence_base_threshold: int, peak_volume: int) -> int:
+    if getattr(args, "no_adaptive_volume", False):
+        return int(getattr(args, "volume_min", 700))
+    peak_ratio = float(getattr(args, "silence_peak_ratio", 0.35))
+    return max(int(silence_base_threshold), int(round(max(0, peak_volume) * peak_ratio)))
+
+
 def find_device_by_keyword(keyword: str) -> int | None:
     try:
         import sounddevice as sd
@@ -333,6 +402,44 @@ def find_output_device_by_keyword(keyword: str) -> int | None:
         if keyword.lower() in name.lower() and int(device.get("max_output_channels", 0)) > 0:
             return index
     return None
+
+
+def wait_for_sounddevice_keyword(keyword: str, *, output: bool, timeout_sec: float, label: str) -> int | None:
+    keyword = str(keyword or "").strip()
+    if not keyword:
+        return None
+    finder = find_output_device_by_keyword if output else find_device_by_keyword
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    last_report_at = 0.0
+    while True:
+        selected = finder(keyword)
+        if selected is not None:
+            print(f"Device ready: selected {label} device {selected} by keyword {keyword!r}.")
+            return selected
+        now = time.monotonic()
+        if now >= deadline:
+            return None
+        if now - last_report_at >= 2.0:
+            print(f"Device preflight: waiting for sounddevice {label} keyword {keyword!r}...")
+            last_report_at = now
+        time.sleep(0.5)
+
+
+def wait_for_path_candidates(description: str, glob_pattern: str, *, timeout_sec: float) -> list[str]:
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    last_report_at = 0.0
+    while True:
+        matches = sorted(glob.glob(glob_pattern))
+        if matches:
+            print(f"Device ready: {description}: {', '.join(matches)}")
+            return matches
+        now = time.monotonic()
+        if now >= deadline:
+            return []
+        if now - last_report_at >= 2.0:
+            print(f"Device preflight: waiting for {description} ({glob_pattern})...")
+            last_report_at = now
+        time.sleep(0.5)
 
 
 def output_device_info(device_index: int | None) -> dict[str, Any] | None:
@@ -429,6 +536,290 @@ class InstanceLock:
             handle.close()
         except OSError:
             pass
+
+
+def process_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    text = raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+    if text:
+        return text
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def iter_process_cmdlines() -> list[tuple[int, str]]:
+    processes: list[tuple[int, str]] = []
+    for item in Path("/proc").iterdir():
+        if not item.name.isdigit():
+            continue
+        pid = int(item.name)
+        if pid == os.getpid():
+            continue
+        cmdline = process_cmdline(pid)
+        if cmdline:
+            processes.append((pid, cmdline))
+    return processes
+
+
+def command_matches(cmdline: str, patterns: tuple[str, ...] | list[str]) -> bool:
+    lowered = cmdline.lower()
+    return any(pattern.lower() in lowered for pattern in patterns if pattern)
+
+
+def is_protected_process(cmdline: str, args: argparse.Namespace) -> bool:
+    if getattr(args, "kill_audio_servers", False):
+        protected = tuple(pattern for pattern in DEVICE_OWNER_ALLOW_PATTERNS if pattern not in {"pulseaudio", "pipewire", "wireplumber"})
+    else:
+        protected = DEVICE_OWNER_ALLOW_PATTERNS
+    return command_matches(cmdline, protected)
+
+
+def terminate_pids(pid_reasons: dict[int, str], *, dry_run: bool, grace_sec: float = 0.8) -> None:
+    if not pid_reasons:
+        return
+    for pid, reason in sorted(pid_reasons.items()):
+        cmdline = process_cmdline(pid)
+        if dry_run:
+            print(f"Device preflight dry-run: would stop pid={pid} ({reason}) cmd={cmdline}")
+            continue
+        try:
+            print(f"Device preflight: stopping pid={pid} ({reason}) cmd={cmdline}")
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            print(f"WARNING: cannot stop pid={pid} ({reason}): {exc}")
+
+    if dry_run:
+        return
+
+    deadline = time.monotonic() + max(0.1, grace_sec)
+    while time.monotonic() < deadline:
+        alive = [pid for pid in pid_reasons if Path(f"/proc/{pid}").exists()]
+        if not alive:
+            return
+        time.sleep(0.05)
+
+    for pid, reason in sorted(pid_reasons.items()):
+        if not Path(f"/proc/{pid}").exists():
+            continue
+        try:
+            print(f"Device preflight: force-killing pid={pid} ({reason})")
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            print(f"WARNING: cannot force-kill pid={pid} ({reason}): {exc}")
+
+
+def uacdemo_audio_device_paths() -> list[Path]:
+    paths: list[Path] = []
+    try:
+        cards_text = Path("/proc/asound/cards").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return paths
+    cards: list[str] = []
+    for line in cards_text.splitlines():
+        match = re.match(r"\s*(\d+)\s+\[[^\]]+\]\s*:\s*.*UACDemo", line)
+        if match:
+            cards.append(match.group(1))
+    for card in cards:
+        for path in glob.glob(f"/dev/snd/pcmC{card}D*"):
+            paths.append(Path(path))
+    return paths
+
+
+def demo_device_paths(args: argparse.Namespace) -> list[Path]:
+    paths: list[Path] = []
+    if not getattr(args, "no_camera", False) and not getattr(args, "no_vision", False):
+        paths.extend(Path(path) for path in glob.glob("/dev/video*"))
+    if str(getattr(args, "uart_port", "auto")).lower() == "auto":
+        paths.extend(Path(path) for path in glob.glob("/dev/ttyACM*"))
+    else:
+        uart_path = Path(str(args.uart_port))
+        if str(uart_path).startswith("/dev/"):
+            paths.append(uart_path)
+    paths.extend(uacdemo_audio_device_paths())
+    existing: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            continue
+        if resolved not in seen and path.exists():
+            existing.append(path)
+            seen.add(resolved)
+    return existing
+
+
+def missing_demo_devices(args: argparse.Namespace) -> list[str]:
+    missing: list[str] = []
+    try:
+        asound_cards = Path("/proc/asound/cards").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        asound_cards = ""
+    if str(getattr(args, "mic_keyword", "") or "").strip().lower() == "uacdemo" and "UACDemo" not in asound_cards:
+        missing.append("UACDemo audio")
+    if not getattr(args, "no_camera", False) and not getattr(args, "no_vision", False) and not glob.glob("/dev/video*"):
+        missing.append("camera /dev/video*")
+    if str(getattr(args, "uart_port", "auto")).lower() == "auto" and not glob.glob("/dev/ttyACM*"):
+        missing.append("FRDM /dev/ttyACM*")
+    return missing
+
+
+def reset_usb_host_if_missing(args: argparse.Namespace) -> None:
+    missing = missing_demo_devices(args)
+    if not missing:
+        return
+    if getattr(args, "no_usb_reset_if_missing", False):
+        print(f"WARNING: missing demo devices ({', '.join(missing)}), but USB reset is disabled.")
+        return
+    controller = str(getattr(args, "usb_controller", "3610000.usb") or "3610000.usb")
+    command = (
+        f"echo {controller} > /sys/bus/platform/drivers/tegra-xusb/unbind; "
+        "sleep 2; "
+        f"echo {controller} > /sys/bus/platform/drivers/tegra-xusb/bind"
+    )
+    if getattr(args, "device_preflight_dry_run", False):
+        print(f"Device preflight dry-run: would reset USB host because missing: {', '.join(missing)}")
+        print(f"  sudo sh -c {command!r}")
+        return
+
+    print(f"Device preflight: missing {', '.join(missing)}; resetting Jetson USB host {controller}.")
+    print("Device preflight: sudo may ask for your password in this terminal.")
+    try:
+        result = subprocess.run(["sudo", "sh", "-c", command], check=False, timeout=20)
+    except subprocess.TimeoutExpired:
+        print("WARNING: USB host reset timed out.")
+        return
+    except Exception as exc:
+        print(f"WARNING: USB host reset failed: {exc}")
+        return
+    if result.returncode != 0:
+        print(f"WARNING: USB host reset returned exit code {result.returncode}.")
+        return
+    wait_sec = max(0.0, float(getattr(args, "usb_reset_wait", 6.0)))
+    print(f"Device preflight: waiting {wait_sec:.1f}s for USB devices to re-enumerate.")
+    time.sleep(wait_sec)
+    still_missing = missing_demo_devices(args)
+    if still_missing:
+        print(f"WARNING: still missing after USB reset: {', '.join(still_missing)}")
+    else:
+        print("Device preflight: USB devices re-enumerated.")
+
+
+def collect_device_owner_pids(paths: list[Path], args: argparse.Namespace) -> dict[int, str]:
+    resolved_paths: dict[str, str] = {}
+    for path in paths:
+        try:
+            resolved_paths[str(path.resolve())] = str(path)
+        except OSError:
+            pass
+    if not resolved_paths:
+        return {}
+
+    owners: dict[int, str] = {}
+    for pid, cmdline in iter_process_cmdlines():
+        if is_protected_process(cmdline, args):
+            continue
+        fd_dir = Path(f"/proc/{pid}/fd")
+        try:
+            fds = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        matched: list[str] = []
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            if not target.startswith("/dev/"):
+                continue
+            target = target.removesuffix(" (deleted)")
+            try:
+                resolved = str(Path(target).resolve())
+            except OSError:
+                resolved = target
+            if resolved in resolved_paths:
+                matched.append(resolved_paths[resolved])
+        if matched:
+            owners[pid] = "owns " + ", ".join(sorted(set(matched)))
+    return owners
+
+
+def kill_stale_demo_processes(args: argparse.Namespace) -> None:
+    patterns = DEMO_STALE_PROCESS_PATTERNS
+    if getattr(args, "device_preflight_keep_music", False):
+        patterns = tuple(pattern for pattern in patterns if pattern not in {"mpv", "ffplay"})
+    pid_reasons: dict[int, str] = {}
+    for pid, cmdline in iter_process_cmdlines():
+        if is_protected_process(cmdline, args):
+            continue
+        if command_matches(cmdline, DEMO_PREFLIGHT_SKIP_ARGS):
+            continue
+        if command_matches(cmdline, patterns):
+            pid_reasons[pid] = "stale demo/audio process"
+    terminate_pids(pid_reasons, dry_run=args.device_preflight_dry_run, grace_sec=args.device_preflight_grace)
+
+
+def wait_for_demo_devices_ready(args: argparse.Namespace) -> None:
+    if getattr(args, "device_preflight_dry_run", False):
+        return
+    timeout_sec = float(getattr(args, "device_ready_timeout", 12.0) or 0.0)
+    if timeout_sec <= 0:
+        return
+
+    if not getattr(args, "no_camera", False) and not getattr(args, "no_vision", False):
+        wait_for_path_candidates("camera nodes", "/dev/video*", timeout_sec=timeout_sec)
+    if str(getattr(args, "uart_port", "auto")).lower() == "auto":
+        wait_for_path_candidates("FRDM UART nodes", "/dev/ttyACM*", timeout_sec=timeout_sec)
+
+    manual_input = bool(getattr(args, "_manual_input_device", getattr(args, "device", None) is not None))
+    if not manual_input:
+        wait_for_sounddevice_keyword(
+            str(getattr(args, "mic_keyword", "") or ""),
+            output=False,
+            timeout_sec=timeout_sec,
+            label="input",
+        )
+
+    manual_beep = bool(getattr(args, "_manual_beep_device", getattr(args, "beep_device", None) is not None))
+    if not getattr(args, "no_beep", False) and not manual_beep:
+        wait_for_sounddevice_keyword(
+            str(getattr(args, "beep_keyword", "") or ""),
+            output=True,
+            timeout_sec=timeout_sec,
+            label="output",
+        )
+
+
+def device_preflight(args: argparse.Namespace) -> None:
+    if getattr(args, "no_device_preflight", False):
+        print("Device preflight skipped by --no-device-preflight.")
+        return
+    print("Device preflight: releasing stale demo device owners.")
+    kill_stale_demo_processes(args)
+    reset_usb_host_if_missing(args)
+    paths = demo_device_paths(args)
+    if getattr(args, "device_preflight_verbose", False):
+        if paths:
+            print("Device preflight: target device nodes:")
+            for path in paths:
+                print(f"  {path}")
+        else:
+            print("Device preflight: no current target device nodes found yet.")
+    owners = collect_device_owner_pids(paths, args)
+    terminate_pids(owners, dry_run=args.device_preflight_dry_run, grace_sec=args.device_preflight_grace)
+    if not owners and not getattr(args, "device_preflight_dry_run", False):
+        print("Device preflight: target devices look free.")
+    time.sleep(max(0.0, float(getattr(args, "device_preflight_settle", 0.8))))
+    wait_for_demo_devices_ready(args)
 
 
 def clamp_int(value: Any, low: int, high: int, default: int = 0) -> int:
@@ -765,6 +1156,20 @@ class RobotUartController:
         print(f"emotion screen command sent: {command} 0 0")
         return command
 
+    def send_speaking_and_emotion(self, emotion: str) -> str:
+        """Switch to Speaking and apply the emotion screen in one serial session."""
+        normalized = emotion if emotion in VALID_EMOTIONS else "neutral"
+        command = EMOTION_TO_SCREEN_COMMAND.get(normalized, "Neutral")
+        self.send_uart_sequence(
+            [("Speaking", 0, 0), (command, 0, 0)],
+            reason=f"speaking + emotion {normalized}",
+            delay_sec=0.02,
+            read_ms=80,
+        )
+        print("UART Speaking sent.")
+        print(f"emotion screen command sent: {command} 0 0")
+        return command
+
     def run_head_motion(self, head_motion: str) -> None:
         motion = head_motion if head_motion in HEAD_MOTION_SEQUENCES else "none"
         sequence = list(HEAD_MOTION_SEQUENCES.get(motion, HEAD_MOTION_SEQUENCES["none"]))
@@ -857,7 +1262,10 @@ class CameraManager:
         max_side: int,
         jpeg_quality: int,
         read_timeout: float,
+        latest_timeout: float,
+        frame_max_age: float,
         warmup_frames: int,
+        continuous: bool,
     ) -> None:
         self.enabled = enabled
         self.camera_id = camera_id
@@ -866,23 +1274,39 @@ class CameraManager:
         self.max_side = max_side
         self.jpeg_quality = max(1, min(int(jpeg_quality), 100))
         self.read_timeout = read_timeout
+        self.latest_timeout = max(0.0, float(latest_timeout))
+        self.frame_max_age = max(0.1, float(frame_max_age))
         self.warmup_frames = max(1, int(warmup_frames))
+        self.continuous = continuous
         self.executor: ThreadPoolExecutor | None = None
+        self._latest_lock = threading.Lock()
+        self._latest_jpeg: bytes | None = None
+        self._latest_at = 0.0
+        self._latest_detail = ""
+        self._camera_stop = threading.Event()
+        self._camera_thread: threading.Thread | None = None
 
     def start(self) -> None:
         if not self.enabled:
             return
         candidates = self._camera_candidates()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wake_camera")
-        print("Camera ready in one-shot mode.")
+        mode = "continuous warm-reader mode" if self.continuous else "one-shot mode"
+        print(f"Camera ready in {mode}.")
         if candidates:
             print(f"  candidates       : {', '.join(str(item) for item in candidates)}")
         else:
             print("  candidates       : none now; auto mode will rescan /dev/video* on every wake")
         print(f"  capture          : {self.width}x{self.height}, jpeg_quality={self.jpeg_quality}")
         print(f"  timeout          : {self.read_timeout:.2f}s")
+        if self.continuous:
+            print(f"  latest timeout   : {self.latest_timeout:.2f}s, max_age={self.frame_max_age:.2f}s")
         if str(self.camera_id).lower() == "auto":
             print("  replug handling  : enabled; camera device numbers may change")
+        if self.continuous:
+            self._camera_stop.clear()
+            self._camera_thread = threading.Thread(target=self._continuous_capture_loop, name="wake_camera_warm_reader", daemon=True)
+            self._camera_thread.start()
 
     def capture_async(self) -> Future[bytes | None] | None:
         if not self.enabled or self.executor is None:
@@ -892,6 +1316,13 @@ class CameraManager:
     def capture_jpeg_bytes(self) -> bytes | None:
         if not self.enabled:
             return None
+        if self.continuous:
+            latest = self._wait_for_latest_frame()
+            if latest is not None:
+                return latest
+            print("WARNING: camera warm reader has no fresh frame; continuing without image.")
+            return None
+
         started = time.perf_counter()
         command = [
             sys.executable,
@@ -929,6 +1360,11 @@ class CameraManager:
             return None
 
     def release(self) -> None:
+        self._camera_stop.set()
+        thread = self._camera_thread
+        self._camera_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
         executor = self.executor
         self.executor = None
         if executor is not None:
@@ -945,6 +1381,131 @@ class CameraManager:
             except ValueError:
                 candidates.append(path)
         return sorted(candidates, key=lambda item: str(item))
+
+    def _wait_for_latest_frame(self) -> bytes | None:
+        deadline = time.monotonic() + self.latest_timeout
+        while True:
+            with self._latest_lock:
+                latest = self._latest_jpeg
+                latest_at = self._latest_at
+                detail = self._latest_detail
+            age = time.monotonic() - latest_at if latest_at > 0 else float("inf")
+            if latest is not None and age <= self.frame_max_age:
+                print(f"Image captured: {len(latest)} bytes, capture_ms=0")
+                if detail:
+                    print(f"  camera detail: {detail}, frame_age_ms={int(age * 1000)}")
+                return latest
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.03)
+
+    def _store_latest_frame(self, frame: Any, candidate: str | int) -> None:
+        try:
+            import cv2
+
+            h, w = frame.shape[:2]
+            largest_side = max(w, h)
+            if self.max_side > 0 and largest_side > self.max_side:
+                scale = self.max_side / float(largest_side)
+                frame = cv2.resize(
+                    frame,
+                    (max(1, int(w * scale)), max(1, int(h * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+            if not ok:
+                return
+            data = encoded.tobytes()
+            with self._latest_lock:
+                self._latest_jpeg = data
+                self._latest_at = time.monotonic()
+                self._latest_detail = f"continuous camera={candidate} bytes={len(data)}"
+        except Exception:
+            return
+
+    def _open_capture(self, candidate: str | int) -> Any | None:
+        import cv2
+
+        if hasattr(cv2, "CAP_V4L2"):
+            cap = cv2.VideoCapture(candidate, cv2.CAP_V4L2)
+            if cap.isOpened():
+                return cap
+            cap.release()
+        cap = cv2.VideoCapture(candidate)
+        if cap.isOpened():
+            return cap
+        cap.release()
+        return None
+
+    def _configure_capture(self, cap: Any) -> None:
+        import cv2
+
+        if hasattr(cv2, "CAP_PROP_FOURCC"):
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if hasattr(cv2, "CAP_PROP_FPS"):
+            cap.set(cv2.CAP_PROP_FPS, 10)
+
+    def _continuous_capture_loop(self) -> None:
+        try:
+            import cv2  # noqa: F401
+            try:
+                cv2.setLogLevel(2)
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"WARNING: camera warm reader disabled: {exc}")
+            return
+
+        last_warn_at = 0.0
+        while not self._camera_stop.is_set():
+            candidates = self._camera_candidates()
+            if not candidates:
+                now = time.monotonic()
+                if now - last_warn_at >= 10.0:
+                    print("WARNING: camera warm reader found no /dev/video* candidates.")
+                    last_warn_at = now
+                time.sleep(1.0)
+                continue
+
+            opened = False
+            for candidate in candidates:
+                if self._camera_stop.is_set():
+                    return
+                cap = self._open_capture(candidate)
+                if cap is None:
+                    continue
+                opened = True
+                print(f"Camera warm reader opened camera {candidate}.")
+                try:
+                    self._configure_capture(cap)
+                    missed_reads = 0
+                    while not self._camera_stop.is_set():
+                        ok, frame = cap.read()
+                        if ok and frame is not None:
+                            missed_reads = 0
+                            self._store_latest_frame(frame, candidate)
+                        else:
+                            missed_reads += 1
+                            if missed_reads >= 10:
+                                break
+                        time.sleep(0.03)
+                except Exception as exc:
+                    print(f"WARNING: camera warm reader error on {candidate}: {exc}")
+                finally:
+                    cap.release()
+                if not self._camera_stop.is_set():
+                    time.sleep(0.5)
+                    break
+
+            if not opened:
+                now = time.monotonic()
+                if now - last_warn_at >= 10.0:
+                    print(f"WARNING: camera warm reader could not open candidates: {candidates}")
+                    last_warn_at = now
+                time.sleep(1.0)
 
 
 def capture_jpeg_bytes(camera_manager: CameraManager | None) -> bytes | None:
@@ -1092,6 +1653,28 @@ class WakeVolumeRecorder:
         if self.oww is not None:
             self.oww.reset()
 
+    def recording_meta(
+        self,
+        *,
+        reason: str,
+        wake_score: float,
+        wake_context: dict[str, Any],
+        noise_floor: int = 0,
+        speech_start_threshold: int | None = None,
+        silence_base_threshold: int | None = None,
+        peak_volume: int = 0,
+    ) -> dict[str, Any]:
+        return {
+            "wake_score": wake_score,
+            "reason": reason,
+            "wake_context": wake_context,
+            "input_sample_rate": self.sample_rate,
+            "noise_floor": noise_floor,
+            "speech_start_threshold": speech_start_threshold,
+            "silence_base_threshold": silence_base_threshold,
+            "peak_volume": peak_volume,
+        }
+
     def record_once(self) -> tuple[np.ndarray | None, dict[str, Any]]:
         import sounddevice as sd
 
@@ -1114,7 +1697,48 @@ class WakeVolumeRecorder:
         wake_score_at_start = 0.0
         wake_context: dict[str, Any] = {}
         last_ignored_wake_at = 0.0
-        last_waiting_speech_log_at = 0.0
+        last_recording_progress_log_at = 0.0
+        ambient_volumes: list[int] = []
+        ambient_max_chunks = max(5, int(round(5.0 * self.sample_rate / self.frames_per_chunk)))
+        pre_speech_chunks: list[np.ndarray] = []
+        pre_speech_max_chunks = max(1, int(round(self.args.pre_speech_seconds * self.sample_rate / self.frames_per_chunk)))
+        noise_floor = 0
+        speech_start_threshold = int(self.args.volume_min)
+        silence_base_threshold = int(self.args.volume_min)
+        peak_volume = 0
+        last_audio_timeout_warn_at = 0.0
+        audio_status_warn_at = 0.0
+        max_queue_chunks = max(20, int(round(3.0 * self.sample_rate / self.frames_per_chunk)))
+        audio_read_timeout = max(0.1, float(getattr(self.args, "audio_read_timeout", 1.0) or 1.0))
+        progress_interval = max(0.25, float(getattr(self.args, "recording_progress_interval", 1.0) or 1.0))
+        audio_queue: queue.Queue = queue.Queue(maxsize=max_queue_chunks)
+        callback_state = {"dropped_chunks": 0}
+
+        def audio_callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
+            del frames, time_info
+            chunk = np.asarray(indata, dtype=np.float32).reshape(-1).copy()
+            item = (chunk, status)
+            try:
+                audio_queue.put_nowait(item)
+            except queue.Full:
+                try:
+                    audio_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    audio_queue.put_nowait(item)
+                except queue.Full:
+                    pass
+                callback_state["dropped_chunks"] = int(callback_state.get("dropped_chunks", 0)) + 1
+
+        def drain_audio_queue() -> int:
+            drained = 0
+            while True:
+                try:
+                    audio_queue.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    return drained
 
         with sd.InputStream(
             samplerate=self.sample_rate,
@@ -1122,16 +1746,77 @@ class WakeVolumeRecorder:
             dtype="float32",
             device=self.args.device,
             blocksize=self.frames_per_chunk,
-        ) as stream:
+            callback=audio_callback,
+        ):
             while True:
-                audio_float, overflowed = stream.read(self.frames_per_chunk)
-                chunk = np.asarray(audio_float, dtype=np.float32).reshape(-1)
+                now = time.monotonic()
+                try:
+                    chunk, input_status = audio_queue.get(timeout=audio_read_timeout)
+                except queue.Empty:
+                    now = time.monotonic()
+                    if state == "recording" and wake_detected_at is not None:
+                        elapsed_since_wake = now - wake_detected_at
+                        max_recording_seconds = float(getattr(self.args, "max_recording_seconds", 0.0) or 0.0)
+                        if max_recording_seconds > 0.0 and elapsed_since_wake >= max_recording_seconds:
+                            if speech_started_at is not None and record_chunks:
+                                print(
+                                    f"Max recording wall-clock reached ({max_recording_seconds:.1f}s since wake) "
+                                    "during audio input timeout; sending buffered audio."
+                                )
+                                break
+                            print(
+                                f"Max recording wall-clock reached ({max_recording_seconds:.1f}s since wake) "
+                                "during audio input timeout before speech; returning to standby."
+                            )
+                            return None, self.recording_meta(
+                                reason="max_recording_before_speech_audio_timeout",
+                                wake_score=wake_score_at_start,
+                                wake_context=wake_context,
+                                noise_floor=noise_floor,
+                                speech_start_threshold=speech_start_threshold,
+                                silence_base_threshold=silence_base_threshold,
+                                peak_volume=peak_volume,
+                            )
+                        if speech_started_at is None and elapsed_since_wake >= self.args.wake_listen_timeout:
+                            print(
+                                "No speech after wake word while audio input was timing out; returning to standby."
+                            )
+                            return None, self.recording_meta(
+                                reason="no_speech_after_wake_audio_timeout",
+                                wake_score=wake_score_at_start,
+                                wake_context=wake_context,
+                                noise_floor=noise_floor,
+                                speech_start_threshold=speech_start_threshold,
+                                silence_base_threshold=silence_base_threshold,
+                                peak_volume=peak_volume,
+                            )
+                    if now - last_audio_timeout_warn_at >= 2.0:
+                        print(
+                            "WARNING: microphone input produced no audio chunk for "
+                            f"{audio_read_timeout:.1f}s; "
+                            "will recover by exiting/reopening this recording loop if it persists."
+                        )
+                        last_audio_timeout_warn_at = now
+                    if state == "waiting_wake":
+                        return None, self.recording_meta(
+                            reason="audio_input_timeout_waiting_wake",
+                            wake_score=wake_score_at_start,
+                            wake_context=wake_context,
+                        )
+                    continue
+
                 audio_16k_int16 = self.chunk_to_16k_int16(chunk)
                 volume = int16_volume(audio_16k_int16)
                 now = time.monotonic()
 
-                if overflowed:
-                    print("Audio input overflow; continuing.")
+                if input_status:
+                    if now - audio_status_warn_at >= 2.0:
+                        print(f"Audio input status: {input_status}; continuing.")
+                        audio_status_warn_at = now
+                dropped_chunks = int(callback_state.get("dropped_chunks", 0))
+                if dropped_chunks:
+                    callback_state["dropped_chunks"] = 0
+                    print(f"Audio input queue dropped {dropped_chunks} stale chunk(s); continuing.")
 
                 if state == "waiting_wake":
                     score = self.wake_score(audio_16k_int16)
@@ -1148,16 +1833,30 @@ class WakeVolumeRecorder:
                             last_ignored_wake_at = now
 
                     if score >= self.args.wake_threshold and volume >= self.args.wake_volume_min:
+                        noise_floor, speech_start_threshold, silence_base_threshold = adaptive_recording_thresholds(
+                            self.args,
+                            ambient_volumes,
+                            fallback_volume=volume,
+                        )
                         wake_detected_at = now
                         wake_score_at_start = score
                         state = "recording"
                         record_chunks = []
+                        pre_speech_chunks = []
                         speech_started_at = None
                         silence_started_at = None
-                        last_waiting_speech_log_at = 0.0
+                        last_recording_progress_log_at = 0.0
+                        peak_volume = 0
                         self.reset_wake()
                         print()
                         print(f"Wake detected: {self.args.wake_word} score={score:.2f}")
+                        print(
+                            "Recording thresholds: "
+                            f"noise_floor={noise_floor}, "
+                            f"speech_start_threshold={speech_start_threshold}, "
+                            f"silence_base_threshold={silence_base_threshold}, "
+                            f"adaptive={'off' if self.args.no_adaptive_volume else 'on'}"
+                        )
                         if self.wake_hook is not None:
                             try:
                                 hook_result = self.wake_hook(
@@ -1171,43 +1870,113 @@ class WakeVolumeRecorder:
                                     wake_context = hook_result
                             except Exception as exc:
                                 print(f"WARNING: wake hook failed: {exc}")
+                        drained_chunks = drain_audio_queue()
+                        if drained_chunks and self.args.listen_debug:
+                            print(f"Drained {drained_chunks} pre-recording audio chunk(s) after wake hook.")
                         print("Recording. Speak now; I will stop after silence.")
+                    else:
+                        ambient_volumes.append(volume)
+                        if len(ambient_volumes) > ambient_max_chunks:
+                            del ambient_volumes[: len(ambient_volumes) - ambient_max_chunks]
                     continue
 
-                is_voice_loud = volume >= self.args.volume_min
-                if self.args.listen_debug:
-                    print(f"vol={volume:5d} | recording", end="\r", file=sys.stderr)
+                elapsed_since_wake = now - wake_detected_at if wake_detected_at is not None else 0.0
+                max_recording_seconds = float(getattr(self.args, "max_recording_seconds", 0.0) or 0.0)
+                if wake_detected_at is not None and max_recording_seconds > 0.0 and elapsed_since_wake >= max_recording_seconds:
+                    if speech_started_at is not None and record_chunks:
+                        print(
+                            f"Max recording wall-clock reached ({max_recording_seconds:.1f}s since wake); sending."
+                        )
+                        break
+                    print(
+                        f"Max recording wall-clock reached ({max_recording_seconds:.1f}s since wake) "
+                        "before speech; returning to standby."
+                    )
+                    return None, self.recording_meta(
+                        reason="max_recording_before_speech",
+                        wake_score=wake_score_at_start,
+                        wake_context=wake_context,
+                        noise_floor=noise_floor,
+                        speech_start_threshold=speech_start_threshold,
+                        silence_base_threshold=silence_base_threshold,
+                        peak_volume=peak_volume,
+                    )
 
-                if is_voice_loud:
+                is_voice_loud = volume >= speech_start_threshold
+                if self.args.listen_debug:
+                    current_silence_threshold = adaptive_silence_threshold(self.args, silence_base_threshold, peak_volume)
+                    print(
+                        f"vol={volume:5d} | start>={speech_start_threshold} "
+                        f"| silence<={current_silence_threshold} | recording",
+                        end="\r",
+                        file=sys.stderr,
+                    )
+                elif wake_detected_at is not None and now - last_recording_progress_log_at >= progress_interval:
+                    current_silence_threshold = adaptive_silence_threshold(self.args, silence_base_threshold, peak_volume)
+                    phase = "speech" if speech_started_at is not None else "waiting_speech"
+                    cap_label = f", max_recording={max_recording_seconds:.1f}s" if max_recording_seconds > 0 else ""
+                    wait_label = ""
+                    if speech_started_at is None and wake_detected_at is not None:
+                        remaining = max(0.0, self.args.wake_listen_timeout - elapsed_since_wake)
+                        wait_label = f", wake_timeout_in={remaining:.1f}s"
+                    print(
+                        f"Recording progress: phase={phase}, elapsed={elapsed_since_wake:.1f}s, "
+                        f"volume={volume}, start_threshold={speech_start_threshold}, "
+                        f"silence_threshold={current_silence_threshold}, peak={peak_volume}{cap_label}{wait_label}"
+                    )
+                    last_recording_progress_log_at = now
+
+                if speech_started_at is None:
+                    pre_speech_chunks.append(chunk.copy())
+                    if len(pre_speech_chunks) > pre_speech_max_chunks:
+                        del pre_speech_chunks[: len(pre_speech_chunks) - pre_speech_max_chunks]
+
+                if speech_started_at is None and is_voice_loud:
                     if speech_started_at is None:
                         speech_started_at = now
-                        print(f"Speech started. volume={volume}")
+                        peak_volume = max(peak_volume, volume)
+                        record_chunks.extend(pre_speech_chunks)
+                        pre_speech_chunks = []
+                        print(
+                            f"Speech started. volume={volume}, "
+                            f"start_threshold={speech_start_threshold}, noise_floor={noise_floor}"
+                        )
                     silence_started_at = None
-                    record_chunks.append(chunk.copy())
                 elif speech_started_at is not None:
+                    peak_volume = max(peak_volume, volume)
                     record_chunks.append(chunk.copy())
-                    if silence_started_at is None:
-                        silence_started_at = now
-                    elif now - silence_started_at >= self.args.silence_duration:
-                        break
-                elif wake_detected_at is not None and now - last_waiting_speech_log_at >= 1.0:
-                    remaining = max(0.0, self.args.wake_listen_timeout - (now - wake_detected_at))
-                    print(
-                        f"Waiting for speech... volume={volume} < volume_min={self.args.volume_min}; "
-                        f"timeout in {remaining:.1f}s"
-                    )
-                    last_waiting_speech_log_at = now
+                    silence_threshold = adaptive_silence_threshold(self.args, silence_base_threshold, peak_volume)
+                    is_silence = volume <= silence_threshold
+                    if is_silence:
+                        if silence_started_at is None:
+                            silence_started_at = now
+                            if self.args.listen_debug:
+                                print(
+                                    f"\nSilence candidate. volume={volume} <= "
+                                    f"silence_threshold={silence_threshold}, peak={peak_volume}"
+                                )
+                        elif now - silence_started_at >= self.args.silence_duration:
+                            print(
+                                f"Silence detected. volume={volume}, "
+                                f"silence_threshold={silence_threshold}, peak={peak_volume}"
+                            )
+                            break
+                    else:
+                        silence_started_at = None
                 elif wake_detected_at is not None and now - wake_detected_at >= self.args.wake_listen_timeout:
                     print(
                         "No speech after wake word; returning to standby. "
-                        f"If you were speaking, lower --volume-min from {self.args.volume_min}."
+                        f"If you were speaking, lower --volume-min or --speech-start-margin."
                     )
-                    return None, {
-                        "wake_score": wake_score_at_start,
-                        "reason": "no_speech_after_wake",
-                        "wake_context": wake_context,
-                        "input_sample_rate": self.sample_rate,
-                    }
+                    return None, self.recording_meta(
+                        reason="no_speech_after_wake",
+                        wake_score=wake_score_at_start,
+                        wake_context=wake_context,
+                        noise_floor=noise_floor,
+                        speech_start_threshold=speech_start_threshold,
+                        silence_base_threshold=silence_base_threshold,
+                        peak_volume=peak_volume,
+                    )
 
                 if speech_started_at is not None and now - speech_started_at >= self.args.max_speech_seconds:
                     print(f"Max speech length reached ({self.args.max_speech_seconds:.1f}s); sending.")
@@ -1238,6 +2007,10 @@ class WakeVolumeRecorder:
             "reason": "ok",
             "wake_context": wake_context,
             "input_sample_rate": self.sample_rate,
+            "noise_floor": noise_floor,
+            "speech_start_threshold": speech_start_threshold,
+            "silence_base_threshold": silence_base_threshold,
+            "peak_volume": peak_volume,
         }
 
 
@@ -1254,6 +2027,13 @@ def select_input_device(args: argparse.Namespace) -> int | None:
     # instead of trusting the previous numeric index.
     if keyword and not manual_device and not bool(getattr(args, "no_mic_fallback", False)):
         selected = find_device_by_keyword(keyword)
+        if selected is None:
+            selected = wait_for_sounddevice_keyword(
+                keyword,
+                output=False,
+                timeout_sec=float(getattr(args, "device_ready_timeout", 12.0) or 0.0),
+                label="input",
+            )
         if selected is not None:
             if getattr(args, "_last_selected_input_device", None) != selected:
                 print(f"Selected input device {selected} by keyword {keyword!r}.")
@@ -1307,6 +2087,13 @@ def select_beep_output_device(args: argparse.Namespace) -> int | None:
     if not keyword:
         return None
     found = find_output_device_by_keyword(keyword)
+    if found is None:
+        found = wait_for_sounddevice_keyword(
+            keyword,
+            output=True,
+            timeout_sec=float(getattr(args, "device_ready_timeout", 12.0) or 0.0),
+            label="output",
+        )
     if found is not None:
         if getattr(args, "_last_selected_beep_device", None) != found:
             print(f"Selected beep output device {found} by keyword {keyword!r}.")
@@ -1432,12 +2219,13 @@ def wait_for_tts_job(job_id: str, args: argparse.Namespace, *, timeout_sec: floa
     deadline = time.monotonic() + timeout_sec
     last_error = ""
     saw_current_job = False
+    poll_interval = max(0.2, min(float(getattr(args, "tts_poll_interval", 0.75) or 0.75), 2.0))
     while time.monotonic() < deadline:
         try:
             status = voice_chat.get_json(queue_url, timeout_sec=min(args.tts_timeout, 2.0))
         except Exception as exc:
             last_error = str(exc)
-            time.sleep(0.25)
+            time.sleep(poll_interval)
             continue
 
         last_result = status.get("last_result") if isinstance(status.get("last_result"), dict) else {}
@@ -1451,7 +2239,7 @@ def wait_for_tts_job(job_id: str, args: argparse.Namespace, *, timeout_sec: floa
         if last_error_value and saw_current_job and not status.get("running"):
             print(f"WARNING: TTS worker error for job_id={job_id}: {last_error_value}")
             return False
-        time.sleep(0.2)
+        time.sleep(poll_interval)
 
     print(f"WARNING: TTS wait timed out after {timeout_sec:.1f}s for job_id={job_id}. last_error={last_error}")
     return False
@@ -1542,6 +2330,7 @@ def run_self_test() -> int:
     if robot._validate_command("MotorYaw", -99, 0) != ("MotorYaw", MOTOR_MIN, 0):
         raise AssertionError("MotorYaw clamp failed")
     robot.send_emotion_screen("happy")
+    robot.send_speaking_and_emotion("curious")
     head_thread = robot.start_head_motion("nod")
     head_thread.join(timeout=3.0)
     if head_thread.is_alive():
@@ -1552,6 +2341,25 @@ def run_self_test() -> int:
         raise AssertionError(f"bad TTS queue URL: {queue_url}")
     if estimate_tts_seconds("好，我先安靜陪你休息。") < 1.2:
         raise AssertionError("TTS estimate below minimum")
+
+    gate_args = argparse.Namespace(
+        volume_min=700,
+        no_adaptive_volume=False,
+        noise_floor_percentile=75.0,
+        speech_start_margin=350,
+        silence_margin=500,
+        silence_peak_ratio=0.35,
+    )
+    noise_floor, start_threshold, silence_base = adaptive_recording_thresholds(
+        gate_args,
+        [1000, 1100, 1200, 1250, 1300],
+        fallback_volume=1200,
+    )
+    if noise_floor <= 0 or start_threshold <= noise_floor or silence_base <= noise_floor:
+        raise AssertionError(f"adaptive gate thresholds look wrong: {noise_floor}, {start_threshold}, {silence_base}")
+    silence_threshold = adaptive_silence_threshold(gate_args, silence_base, peak_volume=4000)
+    if silence_threshold < silence_base:
+        raise AssertionError("adaptive silence threshold below base")
 
     print("wake bridge self-test OK")
     return 0
@@ -1661,9 +2469,7 @@ def handle_wake_chat_response(
     if control["persistent_state"] in {"normal", "sleep"}:
         robot.set_persistent_state(control["persistent_state"])
 
-    robot.set_screen_state("Speaking")
-    print("UART Speaking sent.")
-    robot.send_emotion_screen(control["emotion"])
+    robot.send_speaking_and_emotion(control["emotion"])
 
     head_thread = robot.start_head_motion(control["head_motion"])
     if timing is not None:
@@ -1712,6 +2518,7 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
 
 
 def run_wake_voice_loop(args: argparse.Namespace) -> int:
+    device_preflight(args)
     lock = InstanceLock(args.instance_lock, enabled=not args.no_instance_lock)
     if not lock.acquire():
         return 1
@@ -1761,7 +2568,10 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             max_side=args.camera_max_side,
             jpeg_quality=args.camera_jpeg_quality,
             read_timeout=args.camera_read_timeout,
+            latest_timeout=args.camera_latest_timeout,
+            frame_max_age=args.camera_frame_max_age,
             warmup_frames=args.camera_warmup_frames,
+            continuous=not args.camera_one_shot,
         )
         camera_manager.start()
     else:
@@ -1791,12 +2601,29 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     print(f"FRDM UART: {args.uart_port} @ {args.uart_baudrate}, line_ending={args.uart_line_ending}")
     print(f"Input sample rate: {input_sample_rate} Hz; upload WAV sample rate: {voice_chat.SAMPLE_RATE} Hz")
     print(f"Wake word: {'disabled' if args.no_wake_word else args.wake_word}")
-    print(f"wake_volume_min={args.wake_volume_min}, volume_min={args.volume_min}, silence_duration={args.silence_duration}s")
+    print(
+        f"wake_volume_min={args.wake_volume_min}, volume_min={args.volume_min}, "
+        f"silence_duration={args.silence_duration}s, max_speech={args.max_speech_seconds}s, "
+        f"max_recording={args.max_recording_seconds}s"
+    )
+    print(
+        "Adaptive recording gate: "
+        f"{'off' if args.no_adaptive_volume else 'on'}, "
+        f"noise_p{args.noise_floor_percentile:g}, "
+        f"speech_margin={args.speech_start_margin}, "
+        f"silence_margin={args.silence_margin}, "
+        f"peak_ratio={args.silence_peak_ratio:g}"
+    )
+    print(
+        f"Audio read watchdog: callback queue, timeout={args.audio_read_timeout:g}s, "
+        f"progress_interval={args.recording_progress_interval:g}s"
+    )
     beep_desc = "disabled" if args.no_beep else f"{args.beep_frequency:g} Hz, {args.beep_duration_ms} ms, device={args.beep_device if args.beep_device is not None else 'default'}"
     print(f"Recording beep: {beep_desc}")
     vision_mode = "off" if args.no_vision else ("force" if args.force_vision else "auto")
     print(f"Vision mode: {vision_mode}")
     print(f"Camera: {'disabled' if args.no_camera or args.no_vision else f'{args.camera_id}, {args.camera_width}x{args.camera_height}, jpeg_quality={args.camera_jpeg_quality}'}")
+    print(f"TTS queue polling: every {args.tts_poll_interval:g}s, playback_timeout={args.tts_playback_timeout:g}s")
     if args._manual_input_device:
         print("WARNING: --device pins a numeric microphone index. Omit --device and use --mic-keyword for USB replug recovery.")
     if args._manual_beep_device:
@@ -1832,6 +2659,14 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
 
                 rms = voice_chat.rms_level(audio)
                 print(f"Recorded {meta.get('duration_sec', 0.0):.2f}s; RMS={rms:.5f}")
+                if "speech_start_threshold" in meta:
+                    print(
+                        "Recording gate: "
+                        f"noise_floor={meta.get('noise_floor')}, "
+                        f"start_threshold={meta.get('speech_start_threshold')}, "
+                        f"silence_base={meta.get('silence_base_threshold')}, "
+                        f"peak={meta.get('peak_volume')}"
+                    )
                 if rms < args.rms_threshold:
                     print("SKIP: audio RMS too low; not sending.")
                     robot.restore_persistent_screen_state()
@@ -1906,6 +2741,18 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     safety_group.add_argument("--instance-lock", default=os.getenv("WAKE_BRIDGE_LOCK", DEFAULT_INSTANCE_LOCK))
     safety_group.add_argument("--no-instance-lock", action="store_true", help="Allow multiple bridge processes. Not recommended for demos.")
     safety_group.add_argument("--self-test", action="store_true", help="Run parser/UART/TTS timing dry-run checks and exit without hardware.")
+    safety_group.add_argument("--no-device-preflight", action="store_true", help="Do not release stale demo processes/device owners before opening mic/camera/UART.")
+    safety_group.add_argument("--device-preflight-only", action="store_true", help="Run startup device preflight and exit without opening the bridge.")
+    safety_group.add_argument("--device-preflight-dry-run", action="store_true", help="Print which processes would be stopped, but do not kill them.")
+    safety_group.add_argument("--device-preflight-verbose", action="store_true", help="Print target device nodes checked during startup preflight.")
+    safety_group.add_argument("--device-preflight-keep-music", action="store_true", help="Do not stop mpv/ffplay music playback during startup preflight.")
+    safety_group.add_argument("--kill-audio-servers", action="store_true", help="Also allow preflight to stop pulseaudio/pipewire/wireplumber if they own target audio devices.")
+    safety_group.add_argument("--device-preflight-grace", type=float, default=_env_float("DEVICE_PREFLIGHT_GRACE", 0.8))
+    safety_group.add_argument("--device-preflight-settle", type=float, default=_env_float("DEVICE_PREFLIGHT_SETTLE", 0.8))
+    safety_group.add_argument("--no-usb-reset-if-missing", action="store_true", help="Do not reset the Jetson USB host when demo USB devices are missing.")
+    safety_group.add_argument("--usb-controller", default=os.getenv("USB_CONTROLLER", "3610000.usb"))
+    safety_group.add_argument("--usb-reset-wait", type=float, default=_env_float("USB_RESET_WAIT", 6.0))
+    safety_group.add_argument("--device-ready-timeout", type=float, default=_env_float("DEVICE_READY_TIMEOUT", 12.0))
     safety_group.add_argument(
         "--allow-default-mic",
         action="store_true",
@@ -1922,14 +2769,41 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=_env_int("WAKE_VOLUME_MIN", 350),
         help="Mean abs int16 volume required before accepting a wake score. This filters low-volume false positives.",
     )
-    group.add_argument("--volume-min", type=int, default=_env_int("VOLUME_MIN", 14500), help="Mean abs int16 volume needed to count as speech.")
+    group.add_argument("--volume-min", type=int, default=_env_int("VOLUME_MIN", 700), help="Base mean abs int16 volume needed to count as speech.")
     group.add_argument("--silence-duration", type=float, default=_env_float("SILENCE_DURATION", 1.2))
     group.add_argument("--min-speech-seconds", type=float, default=_env_float("MIN_SPEECH_SECONDS", 0.4))
-    group.add_argument("--max-speech-seconds", type=float, default=_env_float("MAX_SPEECH_SECONDS", 15.0))
+    group.add_argument("--max-speech-seconds", type=float, default=_env_float("MAX_SPEECH_SECONDS", 5.0))
+    group.add_argument(
+        "--max-recording-seconds",
+        type=float,
+        default=_env_float("MAX_RECORDING_SECONDS", 7.0),
+        help=(
+            "Hard wall-clock recording cap from wake detection. "
+            "Unlike --max-speech-seconds, this also applies before speech is detected."
+        ),
+    )
+    group.add_argument(
+        "--audio-read-timeout",
+        type=float,
+        default=_env_float("AUDIO_READ_TIMEOUT", 0.75),
+        help="Input-stream watchdog timeout. If the USB mic stops producing chunks, reopen/exit the current recording loop.",
+    )
+    group.add_argument(
+        "--recording-progress-interval",
+        type=float,
+        default=_env_float("RECORDING_PROGRESS_INTERVAL", 1.0),
+        help="Seconds between concise recording progress logs after wake detection.",
+    )
     group.add_argument("--wake-listen-timeout", type=float, default=_env_float("WAKE_LISTEN_TIMEOUT", 6.0))
     group.add_argument("--wake-chunk-ms", type=int, default=_env_int("WAKE_CHUNK_MS", 80))
     group.add_argument("--idle-volume-print-min", type=int, default=_env_int("IDLE_VOLUME_PRINT_MIN", 100))
     group.add_argument("--listen-debug", action="store_true", help="Print standby/recording volume on every chunk.")
+    group.add_argument("--no-adaptive-volume", action="store_true", help="Disable adaptive noise-floor based speech/silence thresholds.")
+    group.add_argument("--noise-floor-percentile", type=float, default=_env_float("NOISE_FLOOR_PERCENTILE", 75.0))
+    group.add_argument("--speech-start-margin", type=int, default=_env_int("SPEECH_START_MARGIN", 350))
+    group.add_argument("--silence-margin", type=int, default=_env_int("SILENCE_MARGIN", 650))
+    group.add_argument("--silence-peak-ratio", type=float, default=_env_float("SILENCE_PEAK_RATIO", 0.35))
+    group.add_argument("--pre-speech-seconds", type=float, default=_env_float("PRE_SPEECH_SECONDS", 0.35))
 
     beep_group = parser.add_argument_group("recording cue beep")
     beep_group.add_argument("--no-beep", action="store_true", help="Disable the short beep after wake detection.")
@@ -1946,9 +2820,12 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     camera_group.add_argument("--camera-height", type=int, default=_env_int("WAKE_CAMERA_HEIGHT", 480))
     camera_group.add_argument("--camera-max-side", type=int, default=_env_int("WAKE_CAMERA_MAX_SIDE", 640))
     camera_group.add_argument("--camera-jpeg-quality", type=int, default=_env_int("WAKE_CAMERA_JPEG_QUALITY", 78))
-    camera_group.add_argument("--camera-read-timeout", type=float, default=_env_float("WAKE_CAMERA_READ_TIMEOUT", 2.5))
-    camera_group.add_argument("--camera-result-timeout", type=float, default=_env_float("WAKE_CAMERA_RESULT_TIMEOUT", 0.25))
+    camera_group.add_argument("--camera-read-timeout", type=float, default=_env_float("WAKE_CAMERA_READ_TIMEOUT", 7.0))
+    camera_group.add_argument("--camera-result-timeout", type=float, default=_env_float("WAKE_CAMERA_RESULT_TIMEOUT", 1.0))
+    camera_group.add_argument("--camera-latest-timeout", type=float, default=_env_float("WAKE_CAMERA_LATEST_TIMEOUT", 1.0))
+    camera_group.add_argument("--camera-frame-max-age", type=float, default=_env_float("WAKE_CAMERA_FRAME_MAX_AGE", 2.0))
     camera_group.add_argument("--camera-warmup-frames", type=int, default=_env_int("WAKE_CAMERA_WARMUP_FRAMES", 3))
+    camera_group.add_argument("--camera-one-shot", action="store_true", help="Disable the continuous warm reader and open the camera only at wake time.")
     vision_group = parser.add_argument_group("vision routing")
     vision_group.add_argument("--force-vision", action="store_true", help="Force Windows server to use the uploaded image when one is available.")
     vision_group.add_argument("--no-vision", action="store_true", help="Disable camera capture and Windows vision analysis for this client.")
@@ -1958,6 +2835,12 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=_env_float("TTS_PLAYBACK_TIMEOUT", 45.0),
         help="Maximum seconds to wait for /speak_async queue completion before restoring Normal/Sleep.",
+    )
+    tts_timing_group.add_argument(
+        "--tts-poll-interval",
+        type=float,
+        default=_env_float("TTS_POLL_INTERVAL", 0.75),
+        help="Seconds between /queue polls while waiting for /speak_async. Increase to reduce TTS terminal log spam.",
     )
     return parser
 
@@ -1986,6 +2869,9 @@ def main() -> int:
         return 0
     if args.self_test:
         return run_self_test()
+    if args.device_preflight_only:
+        device_preflight(args)
+        return 0
     if args.check_server:
         return bridge.run_check_server(args)
     if args.text:
