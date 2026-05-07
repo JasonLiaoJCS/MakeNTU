@@ -39,7 +39,7 @@ standby
 
 `整段對話結束`
 
-只要 ASR transcript 裡出現 `掰掰`、`拜拜`、`白白`、`bye bye`、`buy buy`、`good bye`、`結束對話`、`不用聽了` 這類結束詞，會立刻結束 conversation session，回到 standby。預設不會再念 AI 的告別回覆，這樣說完 `byebye` 後可以最快回到只聽喚醒詞。下一次要重新說 `Hey Jarvis`。
+只要 ASR transcript 裡出現 `掰掰`、`拜拜`、句尾的 `白白 / 八八`、`bye bye`、`buy buy`、`good bye`、`結束對話`、`不用聽了` 這類結束詞，會立刻結束 conversation session，回到 standby。預設不會再念 AI 的告別回覆，這樣說完 `byebye` 後可以最快回到只聽喚醒詞。下一次要重新說 `Hey Jarvis`。
 
 如果 AI 回覆完後 `--turn-listen-timeout` 秒內沒有偵測到新的有效人聲，也會判斷這段對話結束，回到 standby，只聽 `hey_jarvis`。
 

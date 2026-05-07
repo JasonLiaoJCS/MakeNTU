@@ -63,13 +63,13 @@ SESSION_END_KEYWORDS = (
     "stop listening",
     "goodbye",
     "good bye",
-    "白白",
     "by by",
     "buy buy",
 )
 SESSION_END_REGEXES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("bye-zh-variant", re.compile(r"(掰|拜){2,}")),
-    ("bye-asr-white-white", re.compile(r"白白")),
+    ("bye-asr-white-white", re.compile(r"白白(了|啦|囉|啰|喔|哦|唷|呀|啊|吧)?$")),
+    ("bye-asr-eight-eight", re.compile(r"八八(了|啦|囉|啰|喔|哦|唷|呀|啊|吧)?$")),
     ("bye-en-variant", re.compile(r"(bye|by|buy){2,}|good(bye|by)")),
     ("goodbye-zh", re.compile(r"再[見见會会]")),
 )
