@@ -1,0 +1,4 @@
+# Add only what you use.
+# Example:
+# yt-dlp>=2025.1.0
+# python-vlc>=3.0.0

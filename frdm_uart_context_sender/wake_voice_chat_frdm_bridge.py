@@ -39,6 +39,7 @@ THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parent
 VOICE_DIR = PROJECT_ROOT / "emotion_robot_controller" / "voice_stt_remote"
 VISION_DIR = PROJECT_ROOT / "vision"
+MUSIC_AGENT_DIR = PROJECT_ROOT / "music_agent"
 
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
@@ -46,9 +47,16 @@ if str(VOICE_DIR) not in sys.path:
     sys.path.insert(0, str(VOICE_DIR))
 if str(VISION_DIR) not in sys.path:
     sys.path.insert(0, str(VISION_DIR))
+if str(MUSIC_AGENT_DIR) not in sys.path:
+    sys.path.insert(0, str(MUSIC_AGENT_DIR))
 
 import voice_chat_frdm_uart_bridge as bridge  # noqa: E402
 import jetson_fast_voice_chat as voice_chat  # noqa: E402
+
+try:  # noqa: E402
+    from music_agent.orchestrator import CommandMusicOrchestrator
+except Exception:  # pragma: no cover - optional integration
+    CommandMusicOrchestrator = None  # type: ignore[assignment]
 
 
 CLIENT_VERSION = "wake_voice_chat_frdm_bridge_vision_v2"
@@ -614,6 +622,54 @@ def sanitize_reply(response: dict[str, Any]) -> str:
         reply = "我剛剛有收到，但這次回覆有點不穩，我先保持待命。"
         response["reply"] = reply
     return reply
+
+
+def build_music_orchestrator(args: argparse.Namespace) -> Any | None:
+    if not getattr(args, "enable_music_agent", False):
+        return None
+    if CommandMusicOrchestrator is None:
+        print("WARNING: music_agent package is unavailable; music control is disabled.")
+        return None
+
+    return CommandMusicOrchestrator(
+        play_cmd=getattr(args, "music_play_cmd", ""),
+        pause_cmd=getattr(args, "music_pause_cmd", ""),
+        resume_cmd=getattr(args, "music_resume_cmd", ""),
+        next_cmd=getattr(args, "music_next_cmd", ""),
+        stop_cmd=getattr(args, "music_stop_cmd", ""),
+        command_timeout_sec=getattr(args, "music_cmd_timeout", 8.0),
+    )
+
+
+def maybe_handle_music_command(response: dict[str, Any], args: argparse.Namespace, music_orchestrator: Any | None) -> None:
+    if music_orchestrator is None:
+        return
+
+    transcript = str(response.get("transcript", "")).strip()
+    if not transcript:
+        return
+
+    try:
+        result = music_orchestrator.handle_text(transcript)
+    except Exception as exc:
+        print(f"WARNING: music handler failed: {exc}")
+        return
+
+    if not getattr(result, "handled", False):
+        return
+
+    message = str(getattr(result, "message", "")).strip()
+    if not message:
+        return
+
+    response["reply"] = message
+    response["control"] = {
+        "persistent_state": "unchanged",
+        "emotion": "happy",
+        "head_motion": "nod",
+        "reason": "music command",
+    }
+    print(f"Music agent handled transcript: {transcript}")
 
 
 class RobotUartController:
@@ -1691,6 +1747,7 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
 
     text_url = voice_chat.endpoint_url(args.server_url, "/text-chat")
     robot = RobotUartController(args)
+    music_orchestrator = build_music_orchestrator(args)
     timing = TimingLogger()
     print(f"POST text to {text_url}")
     robot.set_screen_state("Thinking")
@@ -1704,6 +1761,7 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
         return 1
 
     timing.mark("AI reply received")
+    maybe_handle_music_command(response, args, music_orchestrator)
     debug_obj = response.get("debug") if isinstance(response.get("debug"), dict) else {}
     raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
     if raw_preview:
@@ -1768,6 +1826,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         print("Camera disabled by --no-camera.")
 
     robot = RobotUartController(args)
+    music_orchestrator = build_music_orchestrator(args)
     turn_state: dict[str, Any] = {}
     recorder = WakeVolumeRecorder(
         args,
@@ -1879,6 +1938,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                 raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
                 if raw_preview:
                     print(f"AI raw response preview: {raw_preview}")
+                maybe_handle_music_command(response, args, music_orchestrator)
                 if not handle_wake_chat_response(response, args, robot, timing):
                     return 1
             except KeyboardInterrupt:
@@ -1959,6 +2019,15 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=_env_float("TTS_PLAYBACK_TIMEOUT", 45.0),
         help="Maximum seconds to wait for /speak_async queue completion before restoring Normal/Sleep.",
     )
+
+    music_group = parser.add_argument_group("music agent (optional)")
+    music_group.add_argument("--enable-music-agent", action="store_true", help="Enable local music command handling from transcript.")
+    music_group.add_argument("--music-play-cmd", default=os.getenv("MUSIC_PLAY_CMD", ""), help="Command template for play action. Supports {query}.")
+    music_group.add_argument("--music-pause-cmd", default=os.getenv("MUSIC_PAUSE_CMD", ""), help="Command for pause action.")
+    music_group.add_argument("--music-resume-cmd", default=os.getenv("MUSIC_RESUME_CMD", ""), help="Command for resume action.")
+    music_group.add_argument("--music-next-cmd", default=os.getenv("MUSIC_NEXT_CMD", ""), help="Command for next action.")
+    music_group.add_argument("--music-stop-cmd", default=os.getenv("MUSIC_STOP_CMD", ""), help="Command for stop action.")
+    music_group.add_argument("--music-cmd-timeout", type=float, default=_env_float("MUSIC_CMD_TIMEOUT", 8.0), help="Timeout in seconds for each music command.")
     return parser
 
 
