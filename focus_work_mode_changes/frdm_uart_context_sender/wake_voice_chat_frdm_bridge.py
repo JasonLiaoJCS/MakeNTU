@@ -126,13 +126,9 @@ EMOTION_TO_HEAD_MOTION = {
 
 MOTOR_MIN = -15
 MOTOR_MAX = 15
-MOTOR_PITCH_MIN = -4
-MOTOR_PITCH_MAX = 4
-MOTOR_YAW_MIN = -15
-MOTOR_YAW_MAX = 15
-MOTOR_STEP_DELAY_SEC = 0.35
-MOTOR_RESET_REPEATS = 4
-MOTOR_RESET_DELAY_SEC = 0.22
+MOTOR_STEP_DELAY_SEC = 0.22
+MOTOR_RESET_REPEATS = 3
+MOTOR_RESET_DELAY_SEC = 0.16
 MOTOR_READ_MS = 35
 MOTOR_JOIN_TIMEOUT_SEC = 6.0
 
@@ -142,21 +138,21 @@ HEAD_MOTION_SEQUENCES = {
         ("MotorYaw", 0, 0),
     ],
     "nod": [
-        ("MotorPitch", 2, 0),
-        ("MotorPitch", 2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
+        ("MotorPitch", 8, 0),
+        ("MotorPitch", 8, 0),
+        ("MotorPitch", -5, 0),
+        ("MotorPitch", -5, 0),
         ("MotorPitch", 0, 0),
     ],
     "double_nod": [
-        ("MotorPitch", 3, 0),
-        ("MotorPitch", 3, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", 2, 0),
-        ("MotorPitch", 2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
+        ("MotorPitch", 10, 0),
+        ("MotorPitch", 10, 0),
+        ("MotorPitch", -6, 0),
+        ("MotorPitch", -6, 0),
+        ("MotorPitch", 9, 0),
+        ("MotorPitch", 9, 0),
+        ("MotorPitch", -5, 0),
+        ("MotorPitch", -5, 0),
         ("MotorPitch", 0, 0),
     ],
     "look_around": [
@@ -165,8 +161,8 @@ HEAD_MOTION_SEQUENCES = {
         ("MotorYaw", 10, 0),
         ("MotorYaw", 10, 0),
         ("MotorYaw", 0, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
+        ("MotorPitch", -5, 0),
+        ("MotorPitch", -5, 0),
         ("MotorPitch", 0, 0),
     ],
     "shake": [
@@ -179,17 +175,17 @@ HEAD_MOTION_SEQUENCES = {
         ("MotorYaw", 0, 0),
     ],
     "gentle_nod": [
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", 1, 0),
-        ("MotorPitch", 1, 0),
+        ("MotorPitch", -5, 0),
+        ("MotorPitch", -5, 0),
+        ("MotorPitch", 3, 0),
+        ("MotorPitch", 3, 0),
         ("MotorPitch", 0, 0),
     ],
     "sleepy_drop": [
-        ("MotorPitch", -3, 0),
-        ("MotorPitch", -3, 0),
-        ("MotorPitch", -4, 0),
-        ("MotorPitch", -4, 0),
+        ("MotorPitch", -10, 0),
+        ("MotorPitch", -10, 0),
+        ("MotorPitch", -14, 0),
+        ("MotorPitch", -14, 0),
         ("MotorPitch", 0, 0),
     ],
 }
@@ -226,6 +222,49 @@ WAKE_INTENT_KEYWORDS = (
     "normal",
     "don't sleep",
     "do not sleep",
+)
+
+FOCUS_START_INTENT_KEYWORDS = (
+    "開始工作",
+    "开始工作",
+    "專心工作",
+    "专心工作",
+    "進入工作模式",
+    "进入工作模式",
+    "工作模式",
+    "專心模式",
+    "专心模式",
+    "番茄鐘",
+    "番茄钟",
+    "我要工作",
+    "我要開始工作",
+    "我要开始工作",
+    "start work",
+    "work mode",
+    "focus mode",
+    "start focus",
+    "pomodoro",
+)
+
+FOCUS_STOP_INTENT_KEYWORDS = (
+    "結束工作",
+    "结束工作",
+    "停止工作",
+    "結束專心",
+    "结束专心",
+    "停止專心",
+    "停止专心",
+    "退出工作模式",
+    "離開工作模式",
+    "离开工作模式",
+    "下班",
+    "我完成了",
+    "完成工作",
+    "stop work",
+    "end work",
+    "stop focus",
+    "end focus",
+    "exit focus",
 )
 CAMERA_CAPTURE_HELPER = r"""
 import glob
@@ -881,6 +920,39 @@ def detect_persistent_state_intent(transcript: str) -> str | None:
     if contains_intent(transcript, SLEEP_INTENT_KEYWORDS):
         return "sleep"
     return None
+
+
+def detect_focus_mode_intent(transcript: str) -> str | None:
+    if contains_intent(transcript, FOCUS_STOP_INTENT_KEYWORDS):
+        return "stop"
+    if contains_intent(transcript, FOCUS_START_INTENT_KEYWORDS):
+        return "start"
+    return None
+
+
+def parse_focus_duration_min(transcript: str) -> float | None:
+    text = str(transcript or "")
+    for pattern, scale in (
+        (r"(\d+(?:\.\d+)?)\s*(?:分鐘|分钟|分|minute|minutes|min)", 1.0),
+        (r"(\d+(?:\.\d+)?)\s*(?:小時|小时|hour|hours|hr)", 60.0),
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            try:
+                return max(0.0, float(match.group(1)) * scale)
+            except ValueError:
+                return None
+    return None
+
+
+def extract_focus_task(transcript: str) -> str:
+    task = str(transcript or "").strip()
+    for keyword in FOCUS_START_INTENT_KEYWORDS:
+        task = re.sub(re.escape(keyword), " ", task, flags=re.IGNORECASE)
+    task = re.sub(r"\d+(?:\.\d+)?\s*(?:分鐘|分钟|分|小時|小时|minute|minutes|min|hour|hours|hr)", " ", task, flags=re.IGNORECASE)
+    task = re.sub(r"(幫我|帮我|請|请|我要|我想要|一下|模式|mode|start|focus|work)", " ", task, flags=re.IGNORECASE)
+    task = " ".join(task.split()).strip("，。,. ")
+    return task[:120]
 
 
 def extract_json_object(text: str) -> dict[str, Any] | None:
@@ -1588,12 +1660,9 @@ class RobotUartController:
             print(f"WARNING: refusing unknown UART command {command!r}.")
             return None
 
-        if name == "MotorPitch":
-            v1 = clamp_int(v1, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX)
-            v2 = clamp_int(v2, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX)
-        elif name == "MotorYaw":
-            v1 = clamp_int(v1, MOTOR_YAW_MIN, MOTOR_YAW_MAX)
-            v2 = clamp_int(v2, MOTOR_YAW_MIN, MOTOR_YAW_MAX)
+        if name in MOTOR_COMMANDS:
+            v1 = clamp_int(v1, MOTOR_MIN, MOTOR_MAX)
+            v2 = clamp_int(v2, MOTOR_MIN, MOTOR_MAX)
         elif name == "ShowNum":
             v1 = clamp_int(v1, 0, 999999)
             v2 = clamp_int(v2, 0, 999999)
@@ -1713,69 +1782,206 @@ class RobotUartController:
     def restore_persistent_screen_state(self) -> bool:
         command = "Sleep" if self.persistent_state == "sleep" else "Normal"
         ok = self.send_uart_command(command, 0, 0, reason=f"restore persistent state {self.persistent_state}", read_ms=100)
-        if ok:
-            print(f"UART {command} sent (restore persistent_state={self.persistent_state}).")
-        else:
-            print(f"WARNING: UART {command} not sent; FRDM UART is unavailable.")
+        print(f"UART {command} sent (restore persistent_state={self.persistent_state}).")
         return ok
 
     def send_emotion_screen(self, emotion: str) -> str:
         normalized = emotion if emotion in VALID_EMOTIONS else "neutral"
         command = EMOTION_TO_SCREEN_COMMAND.get(normalized, "Neutral")
-        ok = self.send_uart_command(command, 0, 0, reason=f"emotion {normalized}", read_ms=60)
-        if ok:
-            print(f"emotion screen command sent: {command} 0 0")
-        else:
-            print(f"WARNING: emotion screen command not sent: {command} 0 0")
+        self.send_uart_command(command, 0, 0, reason=f"emotion {normalized}", read_ms=60)
+        print(f"emotion screen command sent: {command} 0 0")
         return command
 
     def send_speaking_and_emotion(self, emotion: str) -> str:
         """Switch to Speaking and apply the emotion screen in one serial session."""
         normalized = emotion if emotion in VALID_EMOTIONS else "neutral"
         command = EMOTION_TO_SCREEN_COMMAND.get(normalized, "Neutral")
-        ok = self.send_uart_sequence(
+        self.send_uart_sequence(
             [("Speaking", 0, 0), (command, 0, 0)],
             reason=f"speaking + emotion {normalized}",
             delay_sec=0.02,
             read_ms=80,
         )
-        if ok:
-            print("UART Speaking sent.")
-            print(f"emotion screen command sent: {command} 0 0")
-        else:
-            print("WARNING: UART Speaking/emotion not sent; FRDM UART is unavailable.")
+        print("UART Speaking sent.")
+        print(f"emotion screen command sent: {command} 0 0")
         return command
 
-    def run_head_motion(self, head_motion: str) -> bool:
+    def run_head_motion(self, head_motion: str) -> None:
         motion = head_motion if head_motion in HEAD_MOTION_SEQUENCES else "none"
         sequence = list(HEAD_MOTION_SEQUENCES.get(motion, HEAD_MOTION_SEQUENCES["none"]))
-        ok = False
-        reset_ok = False
         try:
             print(
                 f"head motion started: {motion} "
                 f"(steps={len(sequence)}, step_delay={self.motor_step_delay():.2f}s, "
                 f"reset_repeats={self.motor_reset_repeats()})"
             )
-            ok = self.send_uart_sequence(
+            self.send_uart_sequence(
                 sequence,
                 reason=f"head_motion {motion}",
                 delay_sec=self.motor_step_delay(),
                 read_ms=self.motor_read_ms(),
             )
-            if not ok:
-                print(f"WARNING: head motion {motion} was not sent; FRDM head will not move.")
         except Exception as exc:
             print(f"WARNING: head motion failed: {exc}")
         finally:
-            reset_ok = self.reset_head_position(reason="head_motion reset")
+            self.reset_head_position(reason="head_motion reset")
             print(f"head motion ended: {motion}")
-        return ok and reset_ok
 
     def start_head_motion(self, head_motion: str) -> threading.Thread:
         thread = threading.Thread(target=self.run_head_motion, args=(head_motion,), name=f"head_motion_{head_motion}", daemon=True)
         thread.start()
         return thread
+
+
+class FocusModeManager:
+    def __init__(self, args: argparse.Namespace, camera_manager: Any | None = None) -> None:
+        self.args = args
+        self.camera_manager = camera_manager
+        self.process: subprocess.Popen[Any] | None = None
+        self.camera_released_for_focus = False
+
+    def is_enabled(self) -> bool:
+        return not bool(getattr(self.args, "no_focus_mode", False))
+
+    def is_running(self) -> bool:
+        self.poll()
+        return self.process is not None and self.process.poll() is None
+
+    def poll(self) -> None:
+        if self.process is None:
+            return
+        code = self.process.poll()
+        if code is None:
+            return
+        print(f"Focus work mode exited with code {code}.")
+        self.process = None
+        self._restart_camera_after_focus()
+
+    def start(self, transcript: str) -> tuple[bool, str]:
+        if not self.is_enabled():
+            return False, "專心工作模式目前沒有啟用。"
+        if self.is_running():
+            return True, "我已經在專心工作模式了。要結束的話，再叫我結束工作。"
+
+        script = Path(str(getattr(self.args, "focus_script", "") or (THIS_DIR / "focus_work_mode.py"))).expanduser()
+        if not script.exists():
+            return False, f"找不到專心工作模式腳本：{script}"
+
+        duration_min = parse_focus_duration_min(transcript)
+        if duration_min is None:
+            configured_duration = float(getattr(self.args, "focus_duration_min", 0.0) or 0.0)
+            duration_min = configured_duration if configured_duration > 0 else None
+        task = extract_focus_task(transcript) or str(getattr(self.args, "focus_task", "") or "").strip()
+
+        focus_server_url = str(getattr(self.args, "focus_server_url", "") or "").strip()
+        if not focus_server_url:
+            focus_server_url = voice_chat.endpoint_url(self.args.server_url, "/focus-check")
+
+        self._release_camera_for_focus()
+        command = [
+            sys.executable,
+            str(script),
+            "--server-url",
+            focus_server_url,
+            "--interval-sec",
+            str(getattr(self.args, "focus_interval_sec", 180)),
+            "--log-root",
+            str(getattr(self.args, "focus_log_root", THIS_DIR / "logs" / "focus_sessions")),
+            "--camera-id",
+            str(getattr(self.args, "camera_id", "auto")),
+            "--camera-width",
+            str(getattr(self.args, "camera_width", 640)),
+            "--camera-height",
+            str(getattr(self.args, "camera_height", 480)),
+            "--camera-max-side",
+            str(getattr(self.args, "camera_max_side", 640)),
+            "--camera-jpeg-quality",
+            str(getattr(self.args, "camera_jpeg_quality", 78)),
+            "--camera-warmup-frames",
+            str(getattr(self.args, "camera_warmup_frames", 3)),
+            "--uart-port",
+            str(getattr(self.args, "uart_port", "auto")),
+            "--uart-baudrate",
+            str(getattr(self.args, "uart_baudrate", 115200)),
+            "--uart-timeout",
+            str(getattr(self.args, "uart_timeout", 0.08)),
+            "--uart-line-ending",
+            str(getattr(self.args, "uart_line_ending", "crlf")),
+            "--alert-threshold",
+            str(getattr(self.args, "focus_alert_threshold", 2)),
+        ]
+        if task:
+            command.extend(["--task", task])
+        if duration_min is not None and duration_min > 0:
+            command.extend(["--duration-min", f"{duration_min:g}"])
+        if getattr(self.args, "no_uart", False):
+            command.append("--no-uart")
+        if getattr(self.args, "uart_dry_run", False):
+            command.append("--uart-dry-run")
+        if getattr(self.args, "uart_debug", False):
+            command.append("--uart-debug")
+        if getattr(self.args, "focus_save_images", False):
+            command.append("--save-images")
+
+        try:
+            self.process = subprocess.Popen(command, cwd=str(THIS_DIR))
+        except Exception as exc:
+            self._restart_camera_after_focus()
+            return False, f"專心工作模式啟動失敗：{exc}"
+
+        duration_text = f"{duration_min:g} 分鐘" if duration_min else "直到你叫我結束"
+        task_text = f"目標是「{task}」。" if task else ""
+        return True, f"好，我開始幫你記錄專心工作模式，{duration_text}。{task_text}"
+
+    def stop(self) -> tuple[bool, str]:
+        if not self.is_enabled():
+            return False, "專心工作模式目前沒有啟用。"
+        if not self.is_running():
+            self._restart_camera_after_focus()
+            return False, "目前沒有正在進行的專心工作模式。"
+        assert self.process is not None
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=8.0)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=3.0)
+        self.process = None
+        self._restart_camera_after_focus()
+        return True, "好，專心工作模式已結束，我幫你切回一般互動狀態。"
+
+    def _release_camera_for_focus(self) -> None:
+        if self.camera_manager is None or self.camera_released_for_focus:
+            return
+        try:
+            self.camera_manager.release()
+            self.camera_released_for_focus = True
+            print("Focus mode: released normal camera manager.")
+        except Exception as exc:
+            print(f"WARNING: could not release normal camera for focus mode: {exc}")
+
+    def _restart_camera_after_focus(self) -> None:
+        if self.camera_manager is None or not self.camera_released_for_focus:
+            return
+        try:
+            self.camera_manager.start()
+            print("Focus mode: normal camera manager restarted.")
+        except Exception as exc:
+            print(f"WARNING: could not restart normal camera after focus mode: {exc}")
+        finally:
+            self.camera_released_for_focus = False
+
+    def shutdown(self) -> None:
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self.process = None
+        self._restart_camera_after_focus()
 
 
 def parse_camera_id(raw: str) -> str | int:
@@ -2744,10 +2950,8 @@ def build_wake_hook(
             )
             print("beep played.")
         timing.mark("beep done")
-        if robot.set_screen_state("Thinking"):
-            print("UART Thinking sent.")
-        else:
-            print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
+        robot.set_screen_state("Thinking")
+        print("UART Thinking sent.")
         timing.mark("UART Thinking sent")
 
         return {
@@ -2896,11 +3100,7 @@ def run_self_test() -> int:
         for command, v1, v2 in sequence:
             if command not in MOTOR_COMMANDS:
                 raise AssertionError(f"head motion {motion} uses non-motor command {command}")
-            if command == "MotorPitch":
-                in_range = clamp_int(v1, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX) == int(v1) and clamp_int(v2, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX) == int(v2)
-            else:
-                in_range = clamp_int(v1, MOTOR_YAW_MIN, MOTOR_YAW_MAX) == int(v1) and clamp_int(v2, MOTOR_YAW_MIN, MOTOR_YAW_MAX) == int(v2)
-            if not in_range:
+            if clamp_int(v1, MOTOR_MIN, MOTOR_MAX) != int(v1) or clamp_int(v2, MOTOR_MIN, MOTOR_MAX) != int(v2):
                 raise AssertionError(f"head motion {motion} value out of range: {command} {v1} {v2}")
 
     dry_args = argparse.Namespace(
@@ -2919,14 +3119,14 @@ def run_self_test() -> int:
         raise AssertionError("Thinking dry-run failed")
     if robot.send_uart_command("UnknownCommand", 0, 0, reason="self-test"):
         raise AssertionError("unknown UART command should be rejected")
-    if robot._validate_command("MotorPitch", 99, 0) != ("MotorPitch", MOTOR_PITCH_MAX, 0):
+    if robot._validate_command("MotorPitch", 99, 0) != ("MotorPitch", MOTOR_MAX, 0):
         raise AssertionError("MotorPitch clamp failed")
-    if robot._validate_command("MotorYaw", -99, 0) != ("MotorYaw", MOTOR_YAW_MIN, 0):
+    if robot._validate_command("MotorYaw", -99, 0) != ("MotorYaw", MOTOR_MIN, 0):
         raise AssertionError("MotorYaw clamp failed")
     robot.send_emotion_screen("happy")
     robot.send_speaking_and_emotion("curious")
     head_thread = robot.start_head_motion("nod")
-    head_thread.join(timeout=6.0)
+    head_thread.join(timeout=3.0)
     if head_thread.is_alive():
         raise AssertionError("head motion thread did not finish in self-test")
 
@@ -2987,6 +3187,17 @@ def run_self_test() -> int:
     non_weather_route = detect_weather_route({"transcript": "講個笑話"}, weather_args)
     if non_weather_route.get("intent"):
         raise AssertionError(f"non-weather route should not trigger: {non_weather_route}")
+
+    if detect_focus_mode_intent("開始專心工作 25 分鐘 寫 UART 報告") != "start":
+        raise AssertionError("focus start intent detection failed")
+    if detect_focus_mode_intent("結束工作，切回一般模式") != "stop":
+        raise AssertionError("focus stop intent detection failed")
+    duration = parse_focus_duration_min("開始工作 1.5 小時")
+    if duration != 90.0:
+        raise AssertionError(f"focus duration parsing failed: {duration}")
+    task = extract_focus_task("開始專心工作 25 分鐘 寫 UART 報告")
+    if "UART" not in task:
+        raise AssertionError(f"focus task extraction failed: {task!r}")
 
     print("wake bridge self-test OK")
     return 0
@@ -3074,12 +3285,74 @@ def emotion_summary_from_control(control: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def handle_focus_mode_response(
+    response: dict[str, Any],
+    args: argparse.Namespace,
+    robot: RobotUartController,
+    timing: TimingLogger | None,
+    focus_manager: FocusModeManager,
+) -> bool | None:
+    transcript = str(response.get("transcript", "") or "").strip()
+    focus_manager.poll()
+    intent = detect_focus_mode_intent(transcript)
+    if intent is None and not focus_manager.is_running():
+        return None
+
+    emotion = "curious"
+    head_motion = "gentle_nod"
+    if intent == "start":
+        ok, reply = focus_manager.start(transcript)
+        emotion = "happy" if ok else "confused"
+        head_motion = "nod" if ok else "shake"
+    elif intent == "stop":
+        ok, reply = focus_manager.stop()
+        emotion = "happy" if ok else "confused"
+        head_motion = "nod" if ok else "shake"
+    else:
+        ok = True
+        reply = "我還在專心工作模式中。要結束的話，再叫我結束工作。"
+        emotion = "curious"
+        head_motion = "gentle_nod"
+
+    control = {
+        "persistent_state": "unchanged",
+        "emotion": emotion,
+        "head_motion": head_motion,
+        "reason": f"focus mode {intent or 'active'}",
+    }
+    response["reply"] = reply
+    response["control"] = control
+    response["emotion"] = emotion_summary_from_control(control)
+
+    print_control_summary(control)
+    print(f"parsed reply: {reply}")
+    print(f"parsed control: {json.dumps(control, ensure_ascii=False)}")
+    voice_chat.print_result(response, verbose_debug=args.debug)
+    robot.send_speaking_and_emotion(emotion)
+    if timing is not None:
+        timing.mark("focus mode command handled")
+    tts_ok = speak_reply_and_wait(response, args)
+    if timing is not None:
+        timing.mark("TTS finished or estimated finished")
+    if intent == "start" and ok and focus_manager.is_running():
+        robot.set_screen_state("Thinking")
+    elif intent == "stop":
+        robot.restore_persistent_screen_state()
+    return tts_ok or not getattr(args, "require_tts", False)
+
+
 def handle_wake_chat_response(
     response: dict[str, Any],
     args: argparse.Namespace,
     robot: RobotUartController,
     timing: TimingLogger | None,
+    focus_manager: FocusModeManager | None = None,
 ) -> bool:
+    if focus_manager is not None:
+        handled = handle_focus_mode_response(response, args, robot, timing, focus_manager)
+        if handled is not None:
+            return handled
+
     weather_result = maybe_apply_weather_response(response, args)
     if weather_result is not None and timing is not None:
         timing.mark("weather tool handled" if weather_result.get("ok") else "weather tool failed")
@@ -3137,12 +3410,11 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
 
     text_url = voice_chat.endpoint_url(args.server_url, "/text-chat")
     robot = RobotUartController(args)
+    focus_manager = FocusModeManager(args, None)
     timing = TimingLogger()
     print(f"POST text to {text_url}")
-    if robot.set_screen_state("Thinking"):
-        print("UART Thinking sent.")
-    else:
-        print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
+    robot.set_screen_state("Thinking")
+    print("UART Thinking sent.")
     timing.mark("UART Thinking sent")
     try:
         response = voice_chat.post_json(text_url, {"text": args.text}, timeout_sec=args.timeout)
@@ -3156,65 +3428,7 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
     raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
     if raw_preview:
         print(f"AI raw response preview: {raw_preview}")
-    return 0 if handle_wake_chat_response(response, args, robot, timing) else 1
-
-
-def run_head_motion_test(args: argparse.Namespace) -> int:
-    """Exercise FRDM head motion directly without mic, camera, TTS, or AI."""
-    if not getattr(args, "uart_dry_run", False):
-        if not getattr(args, "no_uart", False):
-            args.require_uart = True
-        device_preflight(args)
-
-    robot = RobotUartController(args)
-    requested = str(getattr(args, "test_head_motion", "") or "").strip()
-    if requested == "all":
-        motions = ["nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop", "none"]
-    else:
-        motions = [requested]
-
-    repeats = max(1, min(10, int(getattr(args, "test_head_repeat", 1) or 1)))
-    gap_sec = max(0.0, float(getattr(args, "test_head_gap", 0.7) or 0.0))
-
-    print("Head motion hardware test.")
-    print("This mode does not open microphone, camera, TTS, or Windows server.")
-    print(
-        "Motor settings: "
-        f"pitch_range={MOTOR_PITCH_MIN}..{MOTOR_PITCH_MAX}, "
-        f"yaw_range={MOTOR_YAW_MIN}..{MOTOR_YAW_MAX}, "
-        f"step_delay={robot.motor_step_delay():.2f}s, "
-        f"reset_repeats={robot.motor_reset_repeats()}, "
-        f"reset_delay={robot.motor_reset_delay():.2f}s, "
-        f"read_ms={robot.motor_read_ms()}"
-    )
-    if getattr(args, "uart_dry_run", False):
-        print("UART mode: dry-run; commands will be printed but not sent.")
-    else:
-        print(f"UART mode: {args.uart_port} @ {args.uart_baudrate}")
-        bridge.print_uart_ports()
-
-    all_ok = True
-    try:
-        for repeat_index in range(repeats):
-            if repeats > 1:
-                print(f"Head motion test pass {repeat_index + 1}/{repeats}.")
-            for motion in motions:
-                if motion not in HEAD_MOTION_SEQUENCES:
-                    print(f"ERROR: unknown head motion {motion!r}.")
-                    return 2
-                print()
-                print(f"Testing head motion: {motion}")
-                all_ok = robot.run_head_motion(motion) and all_ok
-                if gap_sec > 0:
-                    time.sleep(gap_sec)
-        if not all_ok:
-            print("ERROR: one or more head motion commands failed.")
-        return 0 if all_ok else 1
-    except KeyboardInterrupt:
-        print()
-        print("Head motion test interrupted; sending reset.")
-        robot.reset_head_position(reason="head_motion test interrupt reset")
-        return 130
+    return 0 if handle_wake_chat_response(response, args, robot, timing, focus_manager) else 1
 
 
 def run_wake_voice_loop(args: argparse.Namespace) -> int:
@@ -3278,6 +3492,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         print("Camera disabled by --no-camera.")
 
     robot = RobotUartController(args)
+    focus_manager = FocusModeManager(args, camera_manager)
     turn_state: dict[str, Any] = {}
     recorder = WakeVolumeRecorder(
         args,
@@ -3323,6 +3538,8 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     vision_mode = "off" if args.no_vision else ("force" if args.force_vision else "auto")
     print(f"Vision mode: {vision_mode}")
     print(f"Camera: {'disabled' if args.no_camera or args.no_vision else f'{args.camera_id}, {args.camera_width}x{args.camera_height}, jpeg_quality={args.camera_jpeg_quality}'}")
+    focus_desc = "disabled" if args.no_focus_mode else f"enabled, interval={args.focus_interval_sec:g}s, duration_default={args.focus_duration_min:g}min"
+    print(f"Focus work mode: {focus_desc}")
     if args.no_music:
         music_desc = "disabled"
     else:
@@ -3436,7 +3653,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                 raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
                 if raw_preview:
                     print(f"AI raw response preview: {raw_preview}")
-                if not handle_wake_chat_response(response, args, robot, timing):
+                if not handle_wake_chat_response(response, args, robot, timing, focus_manager):
                     return 1
             except KeyboardInterrupt:
                 print()
@@ -3451,6 +3668,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                     except OSError:
                         pass
     finally:
+        focus_manager.shutdown()
         if camera_manager is not None:
             camera_manager.release()
         signal.signal(signal.SIGINT, previous_sigint)
@@ -3551,6 +3769,18 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     vision_group = parser.add_argument_group("vision routing")
     vision_group.add_argument("--force-vision", action="store_true", help="Force Windows server to use the uploaded image when one is available.")
     vision_group.add_argument("--no-vision", action="store_true", help="Disable camera capture and Windows vision analysis for this client.")
+
+    focus_group = parser.add_argument_group("focus work mode")
+    focus_group.add_argument("--no-focus-mode", action="store_true", help="Disable voice-triggered focus work mode start/stop.")
+    focus_group.add_argument("--focus-script", default=str(THIS_DIR / "focus_work_mode.py"), help="Path to focus_work_mode.py.")
+    focus_group.add_argument("--focus-server-url", default=os.getenv("FOCUS_SERVER_URL", ""), help="Optional /focus-check URL. Defaults to the current server base.")
+    focus_group.add_argument("--focus-interval-sec", type=float, default=_env_float("FOCUS_INTERVAL_SEC", 180.0))
+    focus_group.add_argument("--focus-duration-min", type=float, default=_env_float("FOCUS_DURATION_MIN", 0.0), help="Default auto-stop duration. 0 means wait for voice stop.")
+    focus_group.add_argument("--focus-log-root", default=os.getenv("FOCUS_LOG_ROOT", str(THIS_DIR / "logs" / "focus_sessions")))
+    focus_group.add_argument("--focus-task", default=os.getenv("FOCUS_TASK", ""), help="Default focus task if the start command does not include one.")
+    focus_group.add_argument("--focus-alert-threshold", type=int, default=_env_int("FOCUS_ALERT_THRESHOLD", 2))
+    focus_group.add_argument("--focus-save-images", action="store_true", help="Debug only: let focus_work_mode.py save sampled images.")
+
     music_group = parser.add_argument_group("music tool routing")
     music_group.add_argument("--no-music", action="store_true", help="Disable local Music Web Player sidecar routing.")
     music_group.add_argument("--music-url", default=os.getenv("MUSIC_TOOL_URL", DEFAULT_MUSIC_TOOL_URL), help="Music Web Player /music endpoint.")
@@ -3606,24 +3836,6 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=_env_float("MOTOR_JOIN_TIMEOUT_SEC", MOTOR_JOIN_TIMEOUT_SEC),
         help="Maximum seconds to wait after TTS for the head motion thread to finish resetting before restoring Normal/Sleep.",
     )
-    motor_group.add_argument(
-        "--test-head-motion",
-        choices=sorted(VALID_HEAD_MOTIONS | {"all"}),
-        default="",
-        help="Run a direct FRDM head-motion test and exit. Does not open mic/camera/TTS/Windows server.",
-    )
-    motor_group.add_argument(
-        "--test-head-repeat",
-        type=int,
-        default=1,
-        help="Repeat count for --test-head-motion.",
-    )
-    motor_group.add_argument(
-        "--test-head-gap",
-        type=float,
-        default=0.7,
-        help="Seconds to wait between motions in --test-head-motion all.",
-    )
     tts_timing_group = parser.add_argument_group("tts timing")
     tts_timing_group.add_argument(
         "--tts-playback-timeout",
@@ -3666,8 +3878,6 @@ def main() -> int:
         return 0
     if args.self_test:
         return run_self_test()
-    if args.test_head_motion:
-        return run_head_motion_test(args)
     if args.device_preflight_only:
         device_preflight(args)
         return 0

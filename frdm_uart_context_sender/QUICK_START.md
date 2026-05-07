@@ -279,6 +279,10 @@ python3 wake_voice_chat_frdm_bridge.py \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
+  --motor-step-delay 0.35 \
+  --motor-reset-repeats 4 \
+  --motor-reset-delay 0.22 \
+  --motor-join-timeout 6 \
   --device-preflight-verbose \
   --tts-poll-interval 0.75 \
   --tts-debug \
@@ -298,10 +302,54 @@ Camera ready in continuous warm-reader mode
 Camera warm reader opened camera 0
 Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
+Head motor motion: step_delay=0.35s, reset_repeats=4, reset_delay=0.22s, read_ms=35, join_timeout=6s
 Listening for wake word 'hey_jarvis'
 ```
 
-### 0.8 一輪互動正常 log
+目前 Pitch 已縮小保護，`MotorPitch` 會被 clamp 在 `-4..4`，Yaw 維持原本 `-15..15`。如果 pitch 仍會卡死，先把程式常數 `MOTOR_PITCH_MIN/MAX` 再縮到 `-3..3`。
+
+### 0.8 直接測 FRDM 頭部馬達
+
+如果頭沒有連續動作、沒有回正，先不要跑完整 Hey Jarvis 流程，直接測 UART 馬達：
+
+```bash
+cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+
+python3 wake_voice_chat_frdm_bridge.py \
+  --uart-port auto \
+  --uart-debug \
+  --test-head-motion nod
+```
+
+測全部動作：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py \
+  --uart-port auto \
+  --uart-debug \
+  --test-head-motion all \
+  --motor-step-delay 0.35 \
+  --motor-reset-repeats 4 \
+  --motor-reset-delay 0.22
+```
+
+只看會送什麼、不真的動馬達：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py \
+  --uart-dry-run \
+  --test-head-motion all
+```
+
+這個模式不會開麥克風、相機、TTS、Windows server，只會碰 FRDM UART。若看到 `No UART serial device is visible`，代表 FRDM 沒接上或 `/dev/ttyACM0` 消失，先跑：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py --list-uarts
+./recover_demo_usb.sh
+```
+
+### 0.9 一輪互動正常 log
 
 ```text
 Wake detected
@@ -320,7 +368,7 @@ FRDM UART TX: Normal 0 0 或 Sleep 0 0
 Listening for wake word 'hey_jarvis'
 ```
 
-### 0.9 最常用恢復指令
+### 0.10 最常用恢復指令
 
 Jetson 找不到 UACDemo/camera/FRDM：
 
@@ -526,6 +574,10 @@ python3 wake_voice_chat_frdm_bridge.py \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
+  --motor-step-delay 0.35 \
+  --motor-reset-repeats 4 \
+  --motor-reset-delay 0.22 \
+  --motor-join-timeout 6 \
   --device-preflight-verbose \
   --tts-poll-interval 0.75 \
   --tts-debug \
@@ -602,6 +654,7 @@ Adaptive recording gate: on, noise_p75, speech_margin=350, silence_margin=650, p
 Audio read watchdog: callback queue, timeout=0.75s, progress_interval=1s
 Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
+Head motor motion: step_delay=0.35s, reset_repeats=4, reset_delay=0.22s, read_ms=35, join_timeout=6s
 TTS queue polling: every 0.75s, playback_timeout=45s
 USB auto-discovery: mic=keyword 'UACDemo'; beep=keyword 'UACDemo'; camera=auto; FRDM UART=auto
 Listening for wake word 'hey_jarvis'

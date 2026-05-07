@@ -130,6 +130,10 @@ python3 wake_voice_chat_frdm_bridge.py \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
+  --motor-step-delay 0.35 \
+  --motor-reset-repeats 4 \
+  --motor-reset-delay 0.22 \
+  --motor-join-timeout 6 \
   --device-preflight-verbose \
   --tts-poll-interval 0.75 \
   --tts-debug \
@@ -592,15 +596,71 @@ Motor safety：
 ```text
 MOTOR_MIN=-15
 MOTOR_MAX=15
-MOTOR_STEP_DELAY_SEC=0.08
+MOTOR_PITCH_MIN=-4
+MOTOR_PITCH_MAX=4
+MOTOR_YAW_MIN=-15
+MOTOR_YAW_MAX=15
+MOTOR_STEP_DELAY_SEC=0.35
+MOTOR_RESET_REPEATS=4
+MOTOR_RESET_DELAY_SEC=0.22
+MOTOR_JOIN_TIMEOUT_SEC=6.0
 ```
 
-所有 `MotorPitch` / `MotorYaw` 都會 clamp 到安全範圍。動作結束一定回原位：
+`MotorPitch` 目前比 `MotorYaw` 更保守，因為 pitch 角度太大容易卡死。所有 `MotorPitch` 都會 clamp 到 `-4..4`，`MotorYaw` 仍維持 `-15..15`。每個動作 step 會 hold 一小段時間，不再像早期 `0.08s` 那樣太快。動作結束一定多次回原位：
 
 ```text
 MotorPitch 0 0
 MotorYaw 0 0
+MotorPitch 0 0
+MotorYaw 0 0
+MotorPitch 0 0
+MotorYaw 0 0
 ```
+
+如果實體馬達看起來還是只抽一下，先把 `--motor-step-delay` 調到 `0.45` 或 `0.50`。如果偶爾沒有回正，把 `--motor-reset-repeats` 調到 `5`。如果 pitch 還是卡，先在程式常數把 `MOTOR_PITCH_MIN/MAX` 再縮小，例如 `-3..3`；yaw 不用一起改。這些動作在 thread 裡跑，不會阻塞 TTS 開始播放；TTS 結束後會最多等 `--motor-join-timeout` 秒讓 reset 完成，再送 Normal/Sleep。
+
+### Direct Head Motion Test
+
+要調馬達時，先用 `--test-head-motion`，不要透過 Hey Jarvis、ASR、TTS、AI。這個模式只會開 FRDM UART，方便確認「指令有沒有送到、delay 是否夠、最後有沒有回正」：
+
+```bash
+cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+
+python3 wake_voice_chat_frdm_bridge.py \
+  --uart-port auto \
+  --uart-debug \
+  --test-head-motion nod
+```
+
+一次測全部動作：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py \
+  --uart-port auto \
+  --uart-debug \
+  --test-head-motion all \
+  --motor-step-delay 0.35 \
+  --motor-reset-repeats 4 \
+  --motor-reset-delay 0.22
+```
+
+先 dry-run 看完整 UART 序列：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py \
+  --uart-dry-run \
+  --test-head-motion all
+```
+
+如果 dry-run 有 `MotorPitch/MotorYaw`，但實體完全不動，先檢查：
+
+```bash
+python3 wake_voice_chat_frdm_bridge.py --list-uarts
+./recover_demo_usb.sh
+```
+
+看到 `No UART serial device is visible` 時，代表 Jetson 當下沒有看到 FRDM 的 `/dev/ttyACM*`，程式會跳過 UART 並繼續 TTS，但馬達不會動。
 
 目前允許送給 FRDM 的 command：
 
