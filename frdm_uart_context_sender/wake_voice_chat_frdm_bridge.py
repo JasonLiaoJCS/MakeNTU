@@ -44,6 +44,7 @@ PROJECT_ROOT = THIS_DIR.parent
 VOICE_DIR = PROJECT_ROOT / "emotion_robot_controller" / "voice_stt_remote"
 VISION_DIR = PROJECT_ROOT / "vision"
 MUSIC_DIR = PROJECT_ROOT / "music_web_player"
+DEFAULT_FOCUS_SCRIPT = THIS_DIR / "focus_work_mode.py"
 
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
@@ -62,11 +63,42 @@ except Exception:
     music_tool = None  # type: ignore[assignment]
 
 
-CLIENT_VERSION = "wake_voice_chat_frdm_bridge_vision_v2"
+CLIENT_VERSION = "wake_voice_chat_frdm_bridge_vision_conversation_motor_safe_v4"
 DEFAULT_INSTANCE_LOCK = "/tmp/wake_voice_chat_frdm_bridge.lock"
 DEFAULT_MUSIC_TOOL_URL = os.getenv("MUSIC_TOOL_URL", "http://127.0.0.1:8788/music")
 DEFAULT_WEATHER_TOOL_URL = os.getenv("WEATHER_TOOL_URL", "http://127.0.0.1:8788/weather")
 DEFAULT_WEATHER_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "Taipei")
+SESSION_END_KEYWORDS = (
+    "結束對話",
+    "退出對話模式",
+    "結束",
+    "不用了",
+    "不用聽了",
+    "先這樣",
+    "沒事了",
+    "掰掰",
+    "拜拜",
+    "再見",
+    "再會",
+    "休息",
+    "你可以睡了",
+    "bye bye",
+    "byebye",
+    "bye",
+    "go to sleep",
+    "stop listening",
+    "goodbye",
+    "good bye",
+    "by by",
+    "buy buy",
+)
+SESSION_END_REGEXES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("bye-zh-variant", re.compile(r"(掰|拜){2,}")),
+    ("bye-asr-white-white", re.compile(r"白白(了|啦|囉|啰|喔|哦|唷|呀|啊|吧)?$")),
+    ("bye-asr-eight-eight", re.compile(r"八八(了|啦|囉|啰|喔|哦|唷|呀|啊|吧)?$")),
+    ("bye-en-variant", re.compile(r"(bye|by|buy){2,}|good(bye|by)")),
+    ("goodbye-zh", re.compile(r"再[見见會会]")),
+)
 DEMO_STALE_PROCESS_PATTERNS = (
     "wake_voice_chat_frdm_bridge.py",
     "camera_ollama_status.py",
@@ -124,73 +156,259 @@ EMOTION_TO_HEAD_MOTION = {
     "sleepy": "sleepy_drop",
 }
 
-MOTOR_MIN = -15
-MOTOR_MAX = 15
-MOTOR_PITCH_MIN = -4
-MOTOR_PITCH_MAX = 4
-MOTOR_YAW_MIN = -15
-MOTOR_YAW_MAX = 15
-MOTOR_STEP_DELAY_SEC = 0.35
+# FRDM head motors use absolute servo angles:
+# MotorPitch 65=down limit, 90=center, 115=up limit.
+# MotorYaw 0=right limit, 90=center, 180=left limit.
+# Motor UART wire format is single-argument: "MotorPitch 90".
+MOTOR_PITCH_MIN = 65
+MOTOR_PITCH_CENTER = 90
+MOTOR_PITCH_MAX = 115
+MOTOR_YAW_MIN = 0
+MOTOR_YAW_CENTER = 90
+MOTOR_YAW_MAX = 180
+PITCH_DOWN_LIMIT = MOTOR_PITCH_MIN
+PITCH_DOWN_STRONG = 72
+PITCH_DOWN = 74
+PITCH_DOWN_SOFT = 80
+PITCH_DROWSY = 82
+PITCH_CENTER = MOTOR_PITCH_CENTER
+PITCH_ATTENTIVE = 98
+PITCH_UP_SOFT = 100
+PITCH_UP = 106
+PITCH_UP_STRONG = 110
+PITCH_UP_LIMIT = MOTOR_PITCH_MAX
+YAW_RIGHT_LIMIT = MOTOR_YAW_MIN
+YAW_RIGHT = 35
+YAW_RIGHT_SOFT = 45
+YAW_RIGHT_SMALL = 55
+YAW_CENTER = MOTOR_YAW_CENTER
+YAW_LEFT_SOFT = 135
+YAW_LEFT = 145
+YAW_LEFT_LIMIT = MOTOR_YAW_MAX
+MOTOR_STEP_DELAY_SEC = 0.80
+MOTOR_LIVE_MIN_STEP_DELAY_SEC = 0.30
+MOTOR_SMOOTH_STEP_DEG = 10
+MOTOR_SPEAKING_STEP_DELAY_SEC = 0.75
+MOTOR_SPEAKING_SMOOTH_STEP_DEG = 60
+MOTOR_STOP_TIMEOUT_SEC = 6.0
 MOTOR_RESET_REPEATS = 4
-MOTOR_RESET_DELAY_SEC = 0.22
+MOTOR_RESET_DELAY_SEC = 0.35
+MOTOR_LIVE_MIN_RESET_DELAY_SEC = 0.20
 MOTOR_READ_MS = 35
 MOTOR_JOIN_TIMEOUT_SEC = 6.0
+MOTOR_ACK_RE = re.compile(r"\bMotor\s+(Pitch|Yaw)\s*=\s*(-?\d+)\b", re.IGNORECASE)
+MotorStep = tuple[str, int, int]
+
+
+def pitch(angle: int) -> MotorStep:
+    return ("MotorPitch", angle, 0)
+
+
+def yaw(angle: int) -> MotorStep:
+    return ("MotorYaw", angle, 0)
+
+
+def repeat_step(step: MotorStep, count: int = 2) -> list[MotorStep]:
+    return [step for _ in range(max(1, int(count)))]
+
+
+def center_head_steps() -> list[MotorStep]:
+    return [pitch(PITCH_CENTER), yaw(YAW_CENTER)]
+
+
+def format_motor_sequence(steps: list[MotorStep]) -> str:
+    return " -> ".join(f"{command}:{value}" for command, value, _unused in steps)
+
+
+def format_uart_wire_command(command: str, v1: int, v2: int) -> str:
+    if command in MOTOR_COMMANDS:
+        return f"{command} {v1}"
+    return f"{command} {v1} {v2}"
+
+
+def motor_command_limits(command: str) -> tuple[int, int]:
+    if command == "MotorPitch":
+        return MOTOR_PITCH_MIN, MOTOR_PITCH_MAX
+    if command == "MotorYaw":
+        return MOTOR_YAW_MIN, MOTOR_YAW_MAX
+    return -999999, 999999
+
+
+def motor_ack_problem(command: str, expected_value: int, rx_lines: list[str]) -> str:
+    if command not in MOTOR_COMMANDS:
+        return ""
+
+    low, high = motor_command_limits(command)
+    expected_axis = "Pitch" if command == "MotorPitch" else "Yaw"
+    for line in rx_lines:
+        match = MOTOR_ACK_RE.search(line)
+        if not match:
+            continue
+        axis = match.group(1).title()
+        if axis != expected_axis:
+            continue
+        reported = int(match.group(2))
+        if low <= reported <= high:
+            return ""
+
+        pointer_hint = ""
+        if 0x20000000 <= reported <= 0x3FFFFFFF:
+            pointer_hint = " The value looks like a Cortex-M RAM pointer, so FRDM likely used char* pValue as an int instead of atoi(pValue)."
+        return (
+            f"FRDM motor ACK out of range after {command} {expected_value}: {line!r}. "
+            f"Expected {low}..{high}.{pointer_hint}"
+        )
+    return ""
+
+
+def clamp_motor_value(command: str, value: int) -> int:
+    if command == "MotorPitch":
+        return clamp_int(value, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX)
+    if command == "MotorYaw":
+        return clamp_int(value, MOTOR_YAW_MIN, MOTOR_YAW_MAX)
+    return int(value)
+
+
+def smooth_motor_sequence(keyframes: list[MotorStep], max_step_deg: int) -> list[MotorStep]:
+    """Expand absolute-angle keyframes into small UART steps for visible motion."""
+    step_deg = max(1, int(max_step_deg or MOTOR_SMOOTH_STEP_DEG))
+    expanded: list[MotorStep] = []
+    current_by_command: dict[str, int] = {}
+    for command, raw_value, _unused in keyframes:
+        value = clamp_motor_value(command, int(raw_value))
+        if command not in MOTOR_COMMANDS:
+            expanded.append((command, value, 0))
+            continue
+
+        previous = current_by_command.get(command)
+        if previous is None:
+            expanded.append((command, value, 0))
+            current_by_command[command] = value
+            continue
+
+        delta = value - previous
+        if delta == 0:
+            expanded.append((command, value, 0))
+            continue
+
+        segments = max(1, (abs(delta) + step_deg - 1) // step_deg)
+        for index in range(1, segments + 1):
+            interpolated = int(round(previous + (delta * index / segments)))
+            interpolated = clamp_motor_value(command, interpolated)
+            step = (command, interpolated, 0)
+            if expanded and expanded[-1] == step:
+                continue
+            expanded.append(step)
+        current_by_command[command] = value
+    return expanded
+
+
+def sleep_interruptible(duration_sec: float, stop_event: threading.Event | None = None) -> bool:
+    """Sleep up to duration_sec. Return False if stop_event was set."""
+    duration = max(0.0, float(duration_sec or 0.0))
+    if duration <= 0.0:
+        return stop_event is None or not stop_event.is_set()
+    if stop_event is None:
+        time.sleep(duration)
+        return True
+    return not stop_event.wait(duration)
+
 
 HEAD_MOTION_SEQUENCES = {
-    "none": [
-        ("MotorPitch", 0, 0),
-        ("MotorYaw", 0, 0),
-    ],
+    "none": center_head_steps(),
     "nod": [
-        ("MotorPitch", 2, 0),
-        ("MotorPitch", 2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", 0, 0),
+        pitch(PITCH_CENTER),
+        *repeat_step(pitch(PITCH_UP)),
+        *repeat_step(pitch(PITCH_DOWN)),
+        pitch(PITCH_CENTER),
     ],
     "double_nod": [
-        ("MotorPitch", 3, 0),
-        ("MotorPitch", 3, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", 2, 0),
-        ("MotorPitch", 2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", 0, 0),
+        pitch(PITCH_CENTER),
+        *repeat_step(pitch(PITCH_UP_STRONG)),
+        *repeat_step(pitch(PITCH_DOWN_STRONG)),
+        *repeat_step(pitch(PITCH_UP)),
+        *repeat_step(pitch(PITCH_DOWN)),
+        pitch(PITCH_CENTER),
     ],
     "look_around": [
-        ("MotorYaw", -10, 0),
-        ("MotorYaw", -10, 0),
-        ("MotorYaw", 10, 0),
-        ("MotorYaw", 10, 0),
-        ("MotorYaw", 0, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", 0, 0),
+        *center_head_steps(),
+        pitch(PITCH_ATTENTIVE),
+        *repeat_step(yaw(YAW_RIGHT)),
+        *repeat_step(yaw(YAW_LEFT)),
+        yaw(YAW_CENTER),
+        pitch(PITCH_CENTER),
     ],
     "shake": [
-        ("MotorYaw", -8, 0),
-        ("MotorYaw", -8, 0),
-        ("MotorYaw", 8, 0),
-        ("MotorYaw", 8, 0),
-        ("MotorYaw", -6, 0),
-        ("MotorYaw", -6, 0),
-        ("MotorYaw", 0, 0),
+        yaw(YAW_CENTER),
+        *repeat_step(yaw(YAW_RIGHT_SOFT)),
+        *repeat_step(yaw(YAW_LEFT_SOFT)),
+        *repeat_step(yaw(YAW_RIGHT_SMALL)),
+        yaw(YAW_CENTER),
     ],
     "gentle_nod": [
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", -2, 0),
-        ("MotorPitch", 1, 0),
-        ("MotorPitch", 1, 0),
-        ("MotorPitch", 0, 0),
+        pitch(PITCH_CENTER),
+        *repeat_step(pitch(PITCH_DOWN_SOFT)),
+        *repeat_step(pitch(PITCH_UP_SOFT)),
+        pitch(PITCH_CENTER),
     ],
     "sleepy_drop": [
-        ("MotorPitch", -3, 0),
-        ("MotorPitch", -3, 0),
-        ("MotorPitch", -4, 0),
-        ("MotorPitch", -4, 0),
-        ("MotorPitch", 0, 0),
+        pitch(PITCH_CENTER),
+        pitch(PITCH_DROWSY),
+        pitch(PITCH_DOWN),
+        *repeat_step(pitch(PITCH_DOWN_LIMIT)),
+        pitch(PITCH_CENTER),
+    ],
+}
+
+SPEAKING_HEAD_MOTION_LOOPS = {
+    "none": center_head_steps(),
+    "nod": [
+        pitch(PITCH_CENTER),
+        pitch(PITCH_UP),
+        pitch(PITCH_CENTER),
+        pitch(PITCH_DOWN),
+        pitch(PITCH_CENTER),
+    ],
+    "double_nod": [
+        pitch(PITCH_CENTER),
+        pitch(PITCH_UP_STRONG),
+        pitch(PITCH_CENTER),
+        pitch(PITCH_DOWN_STRONG),
+        pitch(PITCH_CENTER),
+        pitch(PITCH_UP),
+        pitch(PITCH_CENTER),
+        pitch(PITCH_DOWN),
+        pitch(PITCH_CENTER),
+    ],
+    "look_around": [
+        *center_head_steps(),
+        pitch(PITCH_ATTENTIVE),
+        yaw(YAW_RIGHT),
+        yaw(YAW_CENTER),
+        yaw(YAW_LEFT),
+        yaw(YAW_CENTER),
+        pitch(PITCH_CENTER),
+    ],
+    "shake": [
+        yaw(YAW_CENTER),
+        yaw(YAW_RIGHT_SOFT),
+        yaw(YAW_CENTER),
+        yaw(YAW_LEFT_SOFT),
+        yaw(YAW_CENTER),
+    ],
+    "gentle_nod": [
+        pitch(PITCH_CENTER),
+        pitch(PITCH_DOWN_SOFT),
+        pitch(PITCH_CENTER),
+        pitch(PITCH_UP_SOFT),
+        pitch(PITCH_CENTER),
+    ],
+    "sleepy_drop": [
+        pitch(PITCH_CENTER),
+        pitch(PITCH_DROWSY),
+        pitch(PITCH_DOWN),
+        pitch(PITCH_DOWN_LIMIT),
+        pitch(PITCH_CENTER),
     ],
 }
 
@@ -226,6 +444,49 @@ WAKE_INTENT_KEYWORDS = (
     "normal",
     "don't sleep",
     "do not sleep",
+)
+
+FOCUS_START_INTENT_KEYWORDS = (
+    "開始工作",
+    "开始工作",
+    "專心工作",
+    "专心工作",
+    "進入工作模式",
+    "进入工作模式",
+    "工作模式",
+    "專心模式",
+    "专心模式",
+    "番茄鐘",
+    "番茄钟",
+    "我要工作",
+    "我要開始工作",
+    "我要开始工作",
+    "start work",
+    "work mode",
+    "focus mode",
+    "start focus",
+    "pomodoro",
+)
+
+FOCUS_STOP_INTENT_KEYWORDS = (
+    "結束工作",
+    "结束工作",
+    "停止工作",
+    "結束專心",
+    "结束专心",
+    "停止專心",
+    "停止专心",
+    "退出工作模式",
+    "離開工作模式",
+    "离开工作模式",
+    "下班",
+    "我完成了",
+    "完成工作",
+    "stop work",
+    "end work",
+    "stop focus",
+    "end focus",
+    "exit focus",
 )
 CAMERA_CAPTURE_HELPER = r"""
 import glob
@@ -409,6 +670,27 @@ def adaptive_silence_threshold(args: argparse.Namespace, silence_base_threshold:
         return int(getattr(args, "volume_min", 700))
     peak_ratio = float(getattr(args, "silence_peak_ratio", 0.35))
     return max(int(silence_base_threshold), int(round(max(0, peak_volume) * peak_ratio)))
+
+
+def normalize_session_text(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    return re.sub(r"[\s，。！？!?、,.：:；;「」『』\"'`~\-_/]+", "", lowered)
+
+
+def end_session_keyword(transcript: str) -> str | None:
+    cleaned = normalize_session_text(transcript)
+    for label, pattern in SESSION_END_REGEXES:
+        if pattern.search(cleaned):
+            return label
+    for keyword in SESSION_END_KEYWORDS:
+        normalized_keyword = normalize_session_text(keyword)
+        if normalized_keyword and normalized_keyword in cleaned:
+            return keyword
+    return None
+
+
+def should_end_conversation_session(transcript: str) -> bool:
+    return end_session_keyword(transcript) is not None
 
 
 def find_device_by_keyword(keyword: str) -> int | None:
@@ -883,6 +1165,52 @@ def detect_persistent_state_intent(transcript: str) -> str | None:
     return None
 
 
+def detect_focus_mode_intent(transcript: str) -> str | None:
+    if contains_intent(transcript, FOCUS_STOP_INTENT_KEYWORDS):
+        return "stop"
+    if contains_intent(transcript, FOCUS_START_INTENT_KEYWORDS):
+        return "start"
+    return None
+
+
+def should_end_conversation_after_focus_turn(
+    args: argparse.Namespace,
+    *,
+    focus_intent: str | None,
+    focus_was_running: bool,
+    focus_is_running: bool,
+) -> bool:
+    if not getattr(args, "conversation_mode", False):
+        return False
+    return focus_intent is not None or focus_was_running or focus_is_running
+
+
+def parse_focus_duration_min(transcript: str) -> float | None:
+    text = str(transcript or "")
+    for pattern, scale in (
+        (r"(\d+(?:\.\d+)?)\s*(?:分鐘|分钟|分|minute|minutes|min)", 1.0),
+        (r"(\d+(?:\.\d+)?)\s*(?:小時|小时|hour|hours|hr)", 60.0),
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            return max(0.0, float(match.group(1)) * scale)
+        except ValueError:
+            return None
+    return None
+
+
+def extract_focus_task(transcript: str) -> str:
+    task = str(transcript or "").strip()
+    for keyword in FOCUS_START_INTENT_KEYWORDS:
+        task = re.sub(re.escape(keyword), " ", task, flags=re.IGNORECASE)
+    task = re.sub(r"\d+(?:\.\d+)?\s*(?:分鐘|分钟|分|小時|小时|minute|minutes|min|hour|hours|hr)", " ", task, flags=re.IGNORECASE)
+    task = re.sub(r"(幫我|帮我|請|请|我要|我想要|一下|模式|mode|start|focus|work)", " ", task, flags=re.IGNORECASE)
+    task = " ".join(task.split()).strip("，。,. ")
+    return task[:120]
+
+
 def extract_json_object(text: str) -> dict[str, Any] | None:
     cleaned = str(text or "").strip()
     cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
@@ -939,6 +1267,14 @@ def local_control_from_transcript(transcript: str, response: dict[str, Any] | No
     }
 
 
+def head_motion_for_emotion(emotion: str, requested_head_motion: str = "") -> str:
+    normalized_emotion = emotion if emotion in VALID_EMOTIONS else "neutral"
+    requested = str(requested_head_motion or "").strip().lower()
+    if requested in VALID_HEAD_MOTIONS and requested != "none":
+        return requested
+    return EMOTION_TO_HEAD_MOTION.get(normalized_emotion, "none")
+
+
 def normalize_control(response: dict[str, Any]) -> dict[str, str]:
     transcript = str(response.get("transcript", "")).strip()
     fallback = local_control_from_transcript(transcript, response)
@@ -969,9 +1305,7 @@ def normalize_control(response: dict[str, Any]) -> dict[str, str]:
     if emotion not in VALID_EMOTIONS:
         emotion = fallback["emotion"]
 
-    head_motion = str(source.get("head_motion", "")).strip().lower()
-    if head_motion not in VALID_HEAD_MOTIONS:
-        head_motion = EMOTION_TO_HEAD_MOTION.get(emotion, fallback["head_motion"])
+    head_motion = head_motion_for_emotion(emotion, str(source.get("head_motion", "") or ""))
 
     reason = str(source.get("reason", fallback["reason"])).strip() or fallback["reason"]
 
@@ -1350,6 +1684,29 @@ def pause_music_for_wake(args: argparse.Namespace) -> dict[str, Any] | None:
         return {"ok": False, "action": "pause", "error": str(exc)}
 
 
+def settle_after_music_wake_pause(args: argparse.Namespace, pause_result: dict[str, Any] | None) -> None:
+    if not isinstance(pause_result, dict):
+        return
+    if not (pause_result.get("paused") or pause_result.get("stopped")):
+        return
+    settle_sec = max(0.0, float(getattr(args, "music_wake_beep_settle", 0.18) or 0.0))
+    if settle_sec <= 0.0:
+        return
+    if getattr(args, "music_debug", False):
+        print(f"Music wake pause settled for {settle_sec:.2f}s before beep.")
+    time.sleep(settle_sec)
+
+
+def post_music_standby_cooldown(args: argparse.Namespace, action: str) -> None:
+    if action not in {"play", "resume"}:
+        return
+    cooldown_sec = max(0.0, float(getattr(args, "post_music_standby_cooldown", 0.8) or 0.0))
+    if cooldown_sec <= 0.0:
+        return
+    print(f"Post-music standby cooldown: {cooldown_sec:.1f}s before listening for Hey Jarvis again.")
+    time.sleep(cooldown_sec)
+
+
 def execute_music_route(route: dict[str, Any], args: argparse.Namespace, response: dict[str, Any], *, phase: str) -> dict[str, Any] | None:
     if not route.get("should_call"):
         return None
@@ -1548,18 +1905,57 @@ class RobotUartController:
         self.args = args
         self.persistent_state = "normal"
         self._lock = threading.RLock()
+        self._motor_safety_lockout_reason = ""
 
     def motor_step_delay(self) -> float:
-        return max(0.02, float(getattr(self.args, "motor_step_delay", MOTOR_STEP_DELAY_SEC) or MOTOR_STEP_DELAY_SEC))
+        requested = float(getattr(self.args, "motor_step_delay", MOTOR_STEP_DELAY_SEC) or MOTOR_STEP_DELAY_SEC)
+        live_floor = 0.0 if getattr(self.args, "uart_dry_run", False) else MOTOR_LIVE_MIN_STEP_DELAY_SEC
+        return max(live_floor, requested)
+
+    def motor_smooth_step_deg(self) -> int:
+        return max(1, min(45, int(getattr(self.args, "motor_smooth_step_deg", MOTOR_SMOOTH_STEP_DEG) or MOTOR_SMOOTH_STEP_DEG)))
+
+    def motor_speaking_step_delay(self) -> float:
+        requested = float(getattr(self.args, "motor_speaking_step_delay", MOTOR_SPEAKING_STEP_DELAY_SEC) or MOTOR_SPEAKING_STEP_DELAY_SEC)
+        live_floor = 0.0 if getattr(self.args, "uart_dry_run", False) else 0.08
+        return max(live_floor, requested)
+
+    def motor_speaking_smooth_step_deg(self) -> int:
+        return max(
+            1,
+            min(
+                60,
+                int(getattr(self.args, "motor_speaking_smooth_step_deg", MOTOR_SPEAKING_SMOOTH_STEP_DEG) or MOTOR_SPEAKING_SMOOTH_STEP_DEG),
+            ),
+        )
+
+    def motor_stop_timeout(self) -> float:
+        return max(0.5, min(8.0, float(getattr(self.args, "motor_stop_timeout", MOTOR_STOP_TIMEOUT_SEC) or MOTOR_STOP_TIMEOUT_SEC)))
 
     def motor_reset_delay(self) -> float:
-        return max(0.02, float(getattr(self.args, "motor_reset_delay", MOTOR_RESET_DELAY_SEC) or MOTOR_RESET_DELAY_SEC))
+        requested = float(getattr(self.args, "motor_reset_delay", MOTOR_RESET_DELAY_SEC) or MOTOR_RESET_DELAY_SEC)
+        live_floor = 0.0 if getattr(self.args, "uart_dry_run", False) else MOTOR_LIVE_MIN_RESET_DELAY_SEC
+        return max(live_floor, requested)
 
     def motor_reset_repeats(self) -> int:
         return max(1, min(8, int(getattr(self.args, "motor_reset_repeats", MOTOR_RESET_REPEATS) or MOTOR_RESET_REPEATS)))
 
     def motor_read_ms(self) -> int:
         return max(0, min(120, int(getattr(self.args, "motor_read_ms", MOTOR_READ_MS) or MOTOR_READ_MS)))
+
+    def head_motor_enabled(self) -> bool:
+        if getattr(self.args, "uart_dry_run", False):
+            return True
+        if getattr(self.args, "disable_head_motor", False):
+            return False
+        return bool(getattr(self.args, "enable_head_motor", False))
+
+    def head_motor_disabled_reason(self) -> str:
+        if self.head_motor_enabled():
+            return ""
+        if getattr(self.args, "disable_head_motor", False):
+            return "--disable-head-motor is set"
+        return "--enable-head-motor not set"
 
     def _validate_command(self, command: str, v1: int = 0, v2: int = 0) -> tuple[str, int, int] | None:
         name = str(command or "").strip()
@@ -1589,11 +1985,11 @@ class RobotUartController:
             return None
 
         if name == "MotorPitch":
-            v1 = clamp_int(v1, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX)
-            v2 = clamp_int(v2, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX)
+            v1 = clamp_motor_value(name, v1)
+            v2 = 0
         elif name == "MotorYaw":
-            v1 = clamp_int(v1, MOTOR_YAW_MIN, MOTOR_YAW_MAX)
-            v2 = clamp_int(v2, MOTOR_YAW_MIN, MOTOR_YAW_MAX)
+            v1 = clamp_motor_value(name, v1)
+            v2 = 0
         elif name == "ShowNum":
             v1 = clamp_int(v1, 0, 999999)
             v2 = clamp_int(v2, 0, 999999)
@@ -1612,19 +2008,32 @@ class RobotUartController:
         reason: str = "",
         delay_sec: float = 0.0,
         read_ms: int | None = None,
-    ) -> bool:
+        stop_event: threading.Event | None = None,
+        ) -> bool:
         valid_steps: list[tuple[str, int, int, str]] = []
         invalid_count = 0
+        skipped_disabled_motor_count = 0
+        skipped_lockout_motor_count = 0
         for command, v1, v2 in steps:
             validated = self._validate_command(command, v1, v2)
             if validated is None:
                 invalid_count += 1
                 continue
             name, safe_v1, safe_v2 = validated
-            valid_steps.append((name, safe_v1, safe_v2, f"{name} {safe_v1} {safe_v2}"))
+            if name in MOTOR_COMMANDS and not self.head_motor_enabled():
+                skipped_disabled_motor_count += 1
+                wire = format_uart_wire_command(name, safe_v1, safe_v2)
+                print(f"FRDM UART motor skipped ({self.head_motor_disabled_reason()}): {wire}")
+                continue
+            if name in MOTOR_COMMANDS and self._motor_safety_lockout_reason:
+                skipped_lockout_motor_count += 1
+                wire = format_uart_wire_command(name, safe_v1, safe_v2)
+                print(f"FRDM UART motor skipped (safety lockout): {wire}; {self._motor_safety_lockout_reason}")
+                continue
+            valid_steps.append((name, safe_v1, safe_v2, format_uart_wire_command(name, safe_v1, safe_v2)))
 
         if not valid_steps:
-            return invalid_count == 0
+            return invalid_count == 0 and skipped_lockout_motor_count == 0
         if getattr(self.args, "no_uart", False):
             for _name, _v1, _v2, wire in valid_steps:
                 print(f"FRDM UART skipped (--no-uart): {wire}")
@@ -1638,9 +2047,11 @@ class RobotUartController:
             with self._lock:
                 if getattr(self.args, "uart_dry_run", False):
                     for _name, _v1, _v2, wire in valid_steps:
+                        if stop_event is not None and stop_event.is_set():
+                            break
                         print(f"FRDM UART dry-run TX: {wire}" + (f" ({reason})" if reason else ""))
-                        if delay_sec > 0:
-                            time.sleep(delay_sec)
+                        if delay_sec > 0 and not sleep_interruptible(delay_sec, stop_event):
+                            break
                     return True
 
                 try:
@@ -1661,6 +2072,8 @@ class RobotUartController:
                     except Exception:
                         pass
                     for _name, _v1, _v2, wire in valid_steps:
+                        if stop_event is not None and stop_event.is_set():
+                            break
                         ser.write(wire.encode("utf-8") + self._line_ending())
                         ser.flush()
                         print(f"FRDM UART TX: {wire}" + (f" ({reason})" if reason else ""))
@@ -1675,8 +2088,19 @@ class RobotUartController:
                         if getattr(self.args, "uart_debug", False):
                             for line in rx_lines:
                                 print(f"FRDM UART RX: {line}")
-                        if delay_sec > 0:
-                            time.sleep(delay_sec)
+                        problem = motor_ack_problem(_name, _v1, rx_lines)
+                        if problem:
+                            self._motor_safety_lockout_reason = problem
+                            print(f"ERROR: {problem}")
+                            print(
+                                "ERROR: Disabling further MotorPitch/MotorYaw commands in this process. "
+                                "Fix the FRDM MotorControlPitch/MotorControlYaw parser, then restart this bridge."
+                            )
+                            if stop_event is not None:
+                                stop_event.set()
+                            return False
+                        if delay_sec > 0 and not sleep_interruptible(delay_sec, stop_event):
+                            break
             return True
         except Exception as exc:
             print(f"WARNING: UART error while sending {reason or valid_steps[-1][3]}: {exc}")
@@ -1686,19 +2110,25 @@ class RobotUartController:
         return self.send_uart_sequence([(command, v1, v2)], reason=reason, read_ms=read_ms)
 
     def reset_head_position(self, *, reason: str = "head_motion reset") -> bool:
+        if not self.head_motor_enabled():
+            print(f"head motion reset skipped ({self.head_motor_disabled_reason()}): {reason}")
+            return True
         steps: list[tuple[str, int, int]] = []
         for _ in range(self.motor_reset_repeats()):
-            steps.extend([("MotorPitch", 0, 0), ("MotorYaw", 0, 0)])
+            steps.extend([("MotorPitch", MOTOR_PITCH_CENTER, 0), ("MotorYaw", MOTOR_YAW_CENTER, 0)])
         ok = self.send_uart_sequence(
             steps,
             reason=reason,
             delay_sec=self.motor_reset_delay(),
             read_ms=self.motor_read_ms(),
         )
-        print(
-            "head motion reset sent: "
-            f"repeats={self.motor_reset_repeats()}, delay={self.motor_reset_delay():.2f}s"
-        )
+        if ok:
+            print(
+                "head motion reset sent: "
+                f"repeats={self.motor_reset_repeats()}, delay={self.motor_reset_delay():.2f}s"
+            )
+        else:
+            print("WARNING: head motion reset was not sent.")
         return ok
 
     def set_screen_state(self, state: str) -> bool:
@@ -1748,15 +2178,23 @@ class RobotUartController:
 
     def run_head_motion(self, head_motion: str) -> bool:
         motion = head_motion if head_motion in HEAD_MOTION_SEQUENCES else "none"
-        sequence = list(HEAD_MOTION_SEQUENCES.get(motion, HEAD_MOTION_SEQUENCES["none"]))
+        if not self.head_motor_enabled():
+            print(f"head motion skipped ({self.head_motor_disabled_reason()}): {motion}")
+            return True
+        keyframes = list(HEAD_MOTION_SEQUENCES.get(motion, HEAD_MOTION_SEQUENCES["none"]))
+        sequence = smooth_motor_sequence(keyframes, self.motor_smooth_step_deg())
         ok = False
         reset_ok = False
         try:
             print(
                 f"head motion started: {motion} "
-                f"(steps={len(sequence)}, step_delay={self.motor_step_delay():.2f}s, "
+                f"(keyframes={len(keyframes)}, expanded_steps={len(sequence)}, "
+                f"smooth_step={self.motor_smooth_step_deg()}deg, step_delay={self.motor_step_delay():.2f}s, "
                 f"reset_repeats={self.motor_reset_repeats()})"
             )
+            if getattr(self.args, "uart_debug", False):
+                print(f"head motion keyframes: {format_motor_sequence(keyframes)}")
+                print(f"head motion expanded: {format_motor_sequence(sequence)}")
             ok = self.send_uart_sequence(
                 sequence,
                 reason=f"head_motion {motion}",
@@ -1773,9 +2211,255 @@ class RobotUartController:
         return ok and reset_ok
 
     def start_head_motion(self, head_motion: str) -> threading.Thread:
+        motion = head_motion if head_motion in HEAD_MOTION_SEQUENCES else "none"
+        if motion == "none":
+            print("head motion skipped: none")
+            thread = threading.Thread(target=lambda: None, name="head_motion_none_skipped", daemon=True)
+            thread.start()
+            return thread
         thread = threading.Thread(target=self.run_head_motion, args=(head_motion,), name=f"head_motion_{head_motion}", daemon=True)
         thread.start()
         return thread
+
+    def run_speaking_head_motion(self, head_motion: str, stop_event: threading.Event) -> bool:
+        motion = head_motion if head_motion in SPEAKING_HEAD_MOTION_LOOPS else "none"
+        if motion == "none":
+            print("speaking head motion skipped: none")
+            return True
+
+        keyframes = list(SPEAKING_HEAD_MOTION_LOOPS[motion])
+        sequence = smooth_motor_sequence(keyframes, self.motor_speaking_smooth_step_deg())
+        cycle_count = 0
+        all_ok = True
+        try:
+            print(
+                f"speaking head motion loop started: {motion} "
+                f"(keyframes={len(keyframes)}, expanded_steps={len(sequence)}, "
+                f"smooth_step={self.motor_speaking_smooth_step_deg()}deg, "
+                f"step_delay={self.motor_speaking_step_delay():.2f}s)"
+            )
+            if getattr(self.args, "uart_debug", False):
+                print(f"speaking head motion keyframes: {format_motor_sequence(keyframes)}")
+                print(f"speaking head motion expanded: {format_motor_sequence(sequence)}")
+
+            while not stop_event.is_set():
+                cycle_count += 1
+                if getattr(self.args, "uart_debug", False):
+                    print(f"speaking head motion cycle {cycle_count}: {motion}")
+                ok = self.send_uart_sequence(
+                    sequence,
+                    reason=f"speaking_head_motion {motion} cycle={cycle_count}",
+                    delay_sec=self.motor_speaking_step_delay(),
+                    read_ms=self.motor_read_ms(),
+                    stop_event=stop_event,
+                )
+                all_ok = ok and all_ok
+                if not ok and getattr(self.args, "require_uart", False):
+                    break
+                if not sleep_interruptible(0.02, stop_event):
+                    break
+        except Exception as exc:
+            print(f"WARNING: speaking head motion failed: {exc}")
+            all_ok = False
+        finally:
+            self.reset_head_position(reason="speaking_head_motion reset")
+            print(f"speaking head motion loop stopped: {motion} cycles={cycle_count}")
+        return all_ok
+
+    def start_speaking_head_motion(self, head_motion: str) -> tuple[threading.Thread | None, threading.Event | None]:
+        motion = head_motion if head_motion in SPEAKING_HEAD_MOTION_LOOPS else "none"
+        if motion == "none":
+            print("speaking head motion skipped: none")
+            return None, None
+        if not self.head_motor_enabled():
+            print(f"speaking head motion skipped ({self.head_motor_disabled_reason()}): {motion}")
+            return None, None
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self.run_speaking_head_motion,
+            args=(motion, stop_event),
+            name=f"speaking_head_motion_{motion}",
+            daemon=True,
+        )
+        thread.start()
+        return thread, stop_event
+
+    def stop_speaking_head_motion(
+        self,
+        thread: threading.Thread | None,
+        stop_event: threading.Event | None,
+        *,
+        reason: str = "speaking head motion stop",
+    ) -> None:
+        if thread is None or stop_event is None:
+            return
+        stop_event.set()
+        thread.join(timeout=self.motor_stop_timeout())
+        if thread.is_alive():
+            print(f"WARNING: speaking head motion still running after stop timeout; sending center reset ({reason}).")
+            self.reset_head_position(reason=reason)
+
+
+class FocusModeManager:
+    def __init__(self, args: argparse.Namespace, camera_manager: Any | None = None) -> None:
+        self.args = args
+        self.camera_manager = camera_manager
+        self.process: subprocess.Popen[Any] | None = None
+        self.camera_released_for_focus = False
+
+    def is_enabled(self) -> bool:
+        return not bool(getattr(self.args, "no_focus_mode", False))
+
+    def is_running(self) -> bool:
+        self.poll()
+        return self.process is not None and self.process.poll() is None
+
+    def poll(self) -> None:
+        if self.process is None:
+            return
+        code = self.process.poll()
+        if code is None:
+            return
+        print(f"Focus work mode exited with code {code}.")
+        self.process = None
+        self._restart_camera_after_focus()
+
+    def _terminate_process(self, *, graceful_timeout: float, kill_timeout: float) -> None:
+        process = self.process
+        if process is None:
+            self._restart_camera_after_focus()
+            return
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=max(0.1, graceful_timeout))
+            except subprocess.TimeoutExpired:
+                print("WARNING: focus work mode did not stop after terminate; killing it.")
+                process.kill()
+                try:
+                    process.wait(timeout=max(0.1, kill_timeout))
+                except subprocess.TimeoutExpired:
+                    print("WARNING: focus work mode did not exit after kill; continuing cleanup.")
+        self.process = None
+        self._restart_camera_after_focus()
+
+    def start(self, transcript: str) -> tuple[bool, str]:
+        if not self.is_enabled():
+            return False, "專心工作模式目前沒有啟用。"
+        if self.is_running():
+            return True, "我已經在專心工作模式了。要結束的話，再叫我結束工作。"
+
+        script = Path(str(getattr(self.args, "focus_script", "") or DEFAULT_FOCUS_SCRIPT)).expanduser()
+        if not script.exists():
+            return False, f"找不到專心工作模式腳本：{script}"
+
+        duration_min = parse_focus_duration_min(transcript)
+        if duration_min is None:
+            configured_duration = float(getattr(self.args, "focus_duration_min", 0.0) or 0.0)
+            duration_min = configured_duration if configured_duration > 0 else None
+        task = extract_focus_task(transcript) or str(getattr(self.args, "focus_task", "") or "").strip()
+
+        focus_server_url = str(getattr(self.args, "focus_server_url", "") or "").strip()
+        if not focus_server_url:
+            focus_server_url = voice_chat.endpoint_url(self.args.server_url, "/focus-check")
+
+        self._release_camera_for_focus()
+        command = [
+            sys.executable,
+            str(script),
+            "--server-url",
+            focus_server_url,
+            "--interval-sec",
+            str(getattr(self.args, "focus_interval_sec", 180)),
+            "--log-root",
+            str(getattr(self.args, "focus_log_root", THIS_DIR / "logs" / "focus_sessions")),
+            "--camera-id",
+            str(getattr(self.args, "camera_id", "auto")),
+            "--camera-width",
+            str(getattr(self.args, "camera_width", 640)),
+            "--camera-height",
+            str(getattr(self.args, "camera_height", 480)),
+            "--camera-max-side",
+            str(getattr(self.args, "camera_max_side", 640)),
+            "--camera-jpeg-quality",
+            str(getattr(self.args, "camera_jpeg_quality", 78)),
+            "--camera-warmup-frames",
+            str(getattr(self.args, "camera_warmup_frames", 3)),
+            "--uart-port",
+            str(getattr(self.args, "uart_port", "auto")),
+            "--uart-baudrate",
+            str(getattr(self.args, "uart_baudrate", 115200)),
+            "--uart-timeout",
+            str(getattr(self.args, "uart_timeout", 0.08)),
+            "--uart-line-ending",
+            str(getattr(self.args, "uart_line_ending", "crlf")),
+            "--alert-threshold",
+            str(getattr(self.args, "focus_alert_threshold", 2)),
+        ]
+        if task:
+            command.extend(["--task", task])
+        if duration_min is not None and duration_min > 0:
+            command.extend(["--duration-min", f"{duration_min:g}"])
+        if getattr(self.args, "no_uart", False):
+            command.append("--no-uart")
+        if getattr(self.args, "uart_dry_run", False):
+            command.append("--uart-dry-run")
+        if getattr(self.args, "uart_debug", False):
+            command.append("--uart-debug")
+        if getattr(self.args, "focus_save_images", False):
+            command.append("--save-images")
+
+        child_env = os.environ.copy()
+        child_env.setdefault("PYTHONUNBUFFERED", "1")
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=str(script.parent),
+                stdin=subprocess.DEVNULL,
+                env=child_env,
+            )
+        except Exception as exc:
+            self._restart_camera_after_focus()
+            return False, f"專心工作模式啟動失敗：{exc}"
+
+        duration_text = f"{duration_min:g} 分鐘" if duration_min else "直到你叫我結束"
+        task_text = f"這次目標是「{task}」。" if task else ""
+        return True, f"工作模式開始。我會安靜陪你專心，並定時記錄工作狀態，{duration_text}。{task_text}要結束時再叫我結束工作。"
+
+    def stop(self) -> tuple[bool, str]:
+        if not self.is_enabled():
+            return False, "專心工作模式目前沒有啟用。"
+        if not self.is_running():
+            self._restart_camera_after_focus()
+            return False, "目前沒有正在進行的專心工作模式。"
+        self._terminate_process(graceful_timeout=8.0, kill_timeout=3.0)
+        return True, "工作模式結束。我已經切回一般互動狀態，稍後可以查看這次的工作紀錄。"
+
+    def _release_camera_for_focus(self) -> None:
+        if self.camera_manager is None or self.camera_released_for_focus:
+            return
+        try:
+            self.camera_manager.release()
+            self.camera_released_for_focus = True
+            print("Focus mode: released normal camera manager.")
+        except Exception as exc:
+            print(f"WARNING: could not release normal camera for focus mode: {exc}")
+
+    def _restart_camera_after_focus(self) -> None:
+        if self.camera_manager is None or not self.camera_released_for_focus:
+            return
+        try:
+            self.camera_manager.start()
+            print("Focus mode: normal camera manager restarted.")
+        except Exception as exc:
+            print(f"WARNING: could not restart normal camera after focus mode: {exc}")
+        finally:
+            self.camera_released_for_focus = False
+
+    def shutdown(self) -> None:
+        if self.process is None:
+            return
+        self._terminate_process(graceful_timeout=3.0, kill_timeout=1.0)
 
 
 def parse_camera_id(raw: str) -> str | int:
@@ -1874,6 +2558,11 @@ class CameraManager:
     def start(self) -> None:
         if not self.enabled:
             return
+        if self.executor is not None:
+            print("Camera already started; keeping the existing camera worker.")
+            return
+        self._camera_stop.clear()
+        self._clear_latest_frame()
         candidates = self._camera_candidates()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wake_camera")
         mode = "continuous warm-reader mode" if self.continuous else "one-shot mode"
@@ -1889,14 +2578,22 @@ class CameraManager:
         if str(self.camera_id).lower() == "auto":
             print("  replug handling  : enabled; camera device numbers may change")
         if self.continuous:
-            self._camera_stop.clear()
             self._camera_thread = threading.Thread(target=self._continuous_capture_loop, name="wake_camera_warm_reader", daemon=True)
             self._camera_thread.start()
 
-    def capture_async(self) -> Future[bytes | None] | None:
+    def capture_async(self, *, delay_sec: float = 0.0) -> Future[bytes | None] | None:
         if not self.enabled or self.executor is None:
             return None
-        return self.executor.submit(capture_jpeg_bytes, self)
+
+        def capture_after_delay() -> bytes | None:
+            delay = max(0.0, float(delay_sec or 0.0))
+            if delay > 0.0:
+                time.sleep(delay)
+            if self.executor is None:
+                return None
+            return self.capture_jpeg_bytes()
+
+        return self.executor.submit(capture_after_delay)
 
     def capture_jpeg_bytes(self) -> bytes | None:
         if not self.enabled:
@@ -1949,11 +2646,20 @@ class CameraManager:
         thread = self._camera_thread
         self._camera_thread = None
         if thread is not None and thread.is_alive():
-            thread.join(timeout=0.5)
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                print("WARNING: camera warm reader did not exit quickly; continuing cleanup.")
         executor = self.executor
         self.executor = None
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+        self._clear_latest_frame()
+
+    def _clear_latest_frame(self) -> None:
+        with self._latest_lock:
+            self._latest_jpeg = None
+            self._latest_at = 0.0
+            self._latest_detail = ""
 
     def _camera_candidates(self) -> list[str | int]:
         if str(self.camera_id).lower() != "auto":
@@ -2106,10 +2812,20 @@ def wait_for_image_future(future: Future[bytes | None] | None, timeout_sec: floa
         return future.result(timeout=max(0.0, timeout_sec))
     except FutureTimeout:
         print("WARNING: camera capture did not finish before timeout; sending audio only.")
+        future.cancel()
         return None
     except Exception as exc:
         print(f"WARNING: camera capture task failed: {exc}")
         return None
+
+
+def image_wait_timeout_for_context(args: argparse.Namespace, wake_context: dict[str, Any]) -> float:
+    base_timeout = max(0.0, float(getattr(args, "camera_result_timeout", 1.0) or 0.0))
+    metadata = wake_context.get("metadata") if isinstance(wake_context.get("metadata"), dict) else {}
+    delay_sec = max(0.0, float(metadata.get("image_capture_delay_sec", 0.0) or 0.0))
+    if delay_sec <= 0.0:
+        return base_timeout
+    return delay_sec + base_timeout + 0.05
 
 
 def send_audio_and_optional_image_to_server(
@@ -2187,6 +2903,8 @@ class WakeVolumeRecorder:
         self.frames_per_chunk = max(256, int(round(sample_rate * args.wake_chunk_ms / 1000.0)))
         self.oww = None
         self.wake_hook = wake_hook
+        self.ambient_volumes: list[int] = []
+        self.ambient_max_chunks = max(5, int(round(5.0 * self.sample_rate / self.frames_per_chunk)))
 
     def refresh_input_device(self) -> None:
         """Re-resolve the USB mic before opening each PortAudio stream."""
@@ -2194,6 +2912,7 @@ class WakeVolumeRecorder:
         self.args.device = selected
         self.sample_rate = voice_chat.choose_input_sample_rate(selected, self.args.input_sample_rate)
         self.frames_per_chunk = max(256, int(round(self.sample_rate * self.args.wake_chunk_ms / 1000.0)))
+        self.ambient_max_chunks = max(5, int(round(5.0 * self.sample_rate / self.frames_per_chunk)))
 
     def load_wake_model(self) -> None:
         if self.args.no_wake_word:
@@ -2244,14 +2963,17 @@ class WakeVolumeRecorder:
         reason: str,
         wake_score: float,
         wake_context: dict[str, Any],
+        turn_source: str = "wake",
         noise_floor: int = 0,
         speech_start_threshold: int | None = None,
         silence_base_threshold: int | None = None,
         peak_volume: int = 0,
+        duration_sec: float | None = None,
     ) -> dict[str, Any]:
-        return {
+        meta: dict[str, Any] = {
             "wake_score": wake_score,
             "reason": reason,
+            "turn_source": turn_source,
             "wake_context": wake_context,
             "input_sample_rate": self.sample_rate,
             "noise_floor": noise_floor,
@@ -2259,6 +2981,14 @@ class WakeVolumeRecorder:
             "silence_base_threshold": silence_base_threshold,
             "peak_volume": peak_volume,
         }
+        if duration_sec is not None:
+            meta["duration_sec"] = duration_sec
+        return meta
+
+    def remember_ambient(self, volume: int) -> None:
+        self.ambient_volumes.append(int(volume))
+        if len(self.ambient_volumes) > self.ambient_max_chunks:
+            del self.ambient_volumes[: len(self.ambient_volumes) - self.ambient_max_chunks]
 
     def record_once(self) -> tuple[np.ndarray | None, dict[str, Any]]:
         import sounddevice as sd
@@ -2456,11 +3186,13 @@ class WakeVolumeRecorder:
                             except Exception as exc:
                                 print(f"WARNING: wake hook failed: {exc}")
                         drained_chunks = drain_audio_queue()
+                        wake_detected_at = time.monotonic()
                         if drained_chunks and self.args.listen_debug:
                             print(f"Drained {drained_chunks} pre-recording audio chunk(s) after wake hook.")
                         print("Recording. Speak now; I will stop after silence.")
                     else:
                         ambient_volumes.append(volume)
+                        self.remember_ambient(volume)
                         if len(ambient_volumes) > ambient_max_chunks:
                             del ambient_volumes[: len(ambient_volumes) - ambient_max_chunks]
                     continue
@@ -2571,6 +3303,7 @@ class WakeVolumeRecorder:
             return None, {
                 "wake_score": wake_score_at_start,
                 "reason": "empty_recording",
+                "turn_source": "wake",
                 "input_sample_rate": self.sample_rate,
             }
 
@@ -2582,6 +3315,7 @@ class WakeVolumeRecorder:
                 "wake_score": wake_score_at_start,
                 "duration_sec": duration,
                 "reason": "too_short",
+                "turn_source": "wake",
                 "wake_context": wake_context,
                 "input_sample_rate": self.sample_rate,
             }
@@ -2590,6 +3324,7 @@ class WakeVolumeRecorder:
             "wake_score": wake_score_at_start,
             "duration_sec": duration,
             "reason": "ok",
+            "turn_source": "wake",
             "wake_context": wake_context,
             "input_sample_rate": self.sample_rate,
             "noise_floor": noise_floor,
@@ -2597,6 +3332,279 @@ class WakeVolumeRecorder:
             "silence_base_threshold": silence_base_threshold,
             "peak_volume": peak_volume,
         }
+
+    def record_followup_turn(
+        self,
+        *,
+        listen_timeout: float | None = None,
+        turn_source: str = "conversation_followup",
+    ) -> tuple[np.ndarray | None, dict[str, Any]]:
+        """Record one already-awake conversation turn without running wake-word ASR upload."""
+        import sounddevice as sd
+
+        timeout = float(self.args.turn_listen_timeout if listen_timeout is None else listen_timeout)
+        self.refresh_input_device()
+        device_label = "default" if self.args.device is None else str(self.args.device)
+        print()
+        print(f"Conversation listening for follow-up speech (device={device_label}, timeout={timeout:.1f}s).")
+
+        record_chunks: list[np.ndarray] = []
+        pre_speech_chunks: list[np.ndarray] = []
+        pre_speech_max_chunks = max(1, int(round(self.args.pre_speech_seconds * self.sample_rate / self.frames_per_chunk)))
+        speech_started_at: float | None = None
+        silence_started_at: float | None = None
+        listen_started_at = time.monotonic()
+        wake_score_at_start = 1.0
+        noise_floor, speech_start_threshold, silence_base_threshold = adaptive_recording_thresholds(
+            self.args,
+            self.ambient_volumes,
+            fallback_volume=0,
+        )
+        peak_volume = 0
+        last_recording_progress_log_at = 0.0
+        last_audio_timeout_warn_at = 0.0
+        audio_status_warn_at = 0.0
+        max_queue_chunks = max(20, int(round(3.0 * self.sample_rate / self.frames_per_chunk)))
+        audio_read_timeout = max(0.1, float(getattr(self.args, "audio_read_timeout", 1.0) or 1.0))
+        progress_interval = max(0.25, float(getattr(self.args, "recording_progress_interval", 1.0) or 1.0))
+        audio_queue: queue.Queue = queue.Queue(maxsize=max_queue_chunks)
+        callback_state = {"dropped_chunks": 0}
+
+        print(
+            "Follow-up thresholds: "
+            f"noise_floor={noise_floor}, "
+            f"speech_start_threshold={speech_start_threshold}, "
+            f"silence_base_threshold={silence_base_threshold}, "
+            f"adaptive={'off' if self.args.no_adaptive_volume else 'on'}"
+        )
+
+        def audio_callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
+            del frames, time_info
+            chunk = np.asarray(indata, dtype=np.float32).reshape(-1).copy()
+            item = (chunk, status)
+            try:
+                audio_queue.put_nowait(item)
+            except queue.Full:
+                try:
+                    audio_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    audio_queue.put_nowait(item)
+                except queue.Full:
+                    pass
+                callback_state["dropped_chunks"] = int(callback_state.get("dropped_chunks", 0)) + 1
+
+        def drain_audio_queue() -> int:
+            drained = 0
+            while True:
+                try:
+                    audio_queue.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    return drained
+
+        with sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="float32",
+            device=self.args.device,
+            blocksize=self.frames_per_chunk,
+            callback=audio_callback,
+        ):
+            drain_audio_queue()
+            while True:
+                now = time.monotonic()
+                try:
+                    chunk, input_status = audio_queue.get(timeout=audio_read_timeout)
+                except queue.Empty:
+                    now = time.monotonic()
+                    elapsed = now - listen_started_at
+                    max_recording_seconds = float(getattr(self.args, "max_recording_seconds", 0.0) or 0.0)
+                    if max_recording_seconds > 0.0 and elapsed >= max_recording_seconds:
+                        if speech_started_at is not None and record_chunks:
+                            print(
+                                f"Max recording wall-clock reached ({max_recording_seconds:.1f}s); "
+                                "sending buffered follow-up audio."
+                            )
+                            break
+                        print("Max recording wall-clock reached before follow-up speech; returning to standby.")
+                        return None, self.recording_meta(
+                            reason="max_recording_before_followup_speech_audio_timeout",
+                            wake_score=wake_score_at_start,
+                            wake_context={},
+                            turn_source=turn_source,
+                            noise_floor=noise_floor,
+                            speech_start_threshold=speech_start_threshold,
+                            silence_base_threshold=silence_base_threshold,
+                            peak_volume=peak_volume,
+                        )
+                    if speech_started_at is None and elapsed >= timeout:
+                        print(f"No follow-up speech for {timeout:.1f}s; returning to standby.")
+                        return None, self.recording_meta(
+                            reason="no_followup_speech_audio_timeout",
+                            wake_score=wake_score_at_start,
+                            wake_context={},
+                            turn_source=turn_source,
+                            noise_floor=noise_floor,
+                            speech_start_threshold=speech_start_threshold,
+                            silence_base_threshold=silence_base_threshold,
+                            peak_volume=peak_volume,
+                        )
+                    if now - last_audio_timeout_warn_at >= 2.0:
+                        print(
+                            "WARNING: microphone input produced no audio chunk for "
+                            f"{audio_read_timeout:.1f}s while listening for follow-up."
+                        )
+                        last_audio_timeout_warn_at = now
+                    continue
+
+                audio_16k_int16 = self.chunk_to_16k_int16(chunk)
+                volume = int16_volume(audio_16k_int16)
+                now = time.monotonic()
+                elapsed = now - listen_started_at
+
+                if input_status and now - audio_status_warn_at >= 2.0:
+                    print(f"Audio input status: {input_status}; continuing.")
+                    audio_status_warn_at = now
+                dropped_chunks = int(callback_state.get("dropped_chunks", 0))
+                if dropped_chunks:
+                    callback_state["dropped_chunks"] = 0
+                    print(f"Audio input queue dropped {dropped_chunks} stale chunk(s); continuing.")
+
+                max_recording_seconds = float(getattr(self.args, "max_recording_seconds", 0.0) or 0.0)
+                if max_recording_seconds > 0.0 and elapsed >= max_recording_seconds:
+                    if speech_started_at is not None and record_chunks:
+                        print(f"Max recording wall-clock reached ({max_recording_seconds:.1f}s); sending.")
+                        break
+                    print("Max recording wall-clock reached before follow-up speech; returning to standby.")
+                    return None, self.recording_meta(
+                        reason="max_recording_before_followup_speech",
+                        wake_score=wake_score_at_start,
+                        wake_context={},
+                        turn_source=turn_source,
+                        noise_floor=noise_floor,
+                        speech_start_threshold=speech_start_threshold,
+                        silence_base_threshold=silence_base_threshold,
+                        peak_volume=peak_volume,
+                    )
+
+                is_voice_loud = volume >= speech_start_threshold
+                current_silence_threshold = adaptive_silence_threshold(self.args, silence_base_threshold, peak_volume)
+                if self.args.listen_debug:
+                    print(
+                        f"vol={volume:5d} | start>={speech_start_threshold} "
+                        f"| silence<={current_silence_threshold} | conversation",
+                        end="\r",
+                        file=sys.stderr,
+                    )
+                elif now - last_recording_progress_log_at >= progress_interval:
+                    phase = "speech" if speech_started_at is not None else "waiting_speech"
+                    wait_label = ""
+                    if speech_started_at is None:
+                        remaining = max(0.0, timeout - elapsed)
+                        wait_label = f", followup_timeout_in={remaining:.1f}s"
+                    print(
+                        f"Follow-up progress: phase={phase}, elapsed={elapsed:.1f}s, "
+                        f"volume={volume}, start_threshold={speech_start_threshold}, "
+                        f"silence_threshold={current_silence_threshold}, peak={peak_volume}{wait_label}"
+                    )
+                    last_recording_progress_log_at = now
+
+                if speech_started_at is None:
+                    pre_speech_chunks.append(chunk.copy())
+                    if len(pre_speech_chunks) > pre_speech_max_chunks:
+                        del pre_speech_chunks[: len(pre_speech_chunks) - pre_speech_max_chunks]
+                    if not is_voice_loud:
+                        self.remember_ambient(volume)
+
+                if speech_started_at is None and is_voice_loud:
+                    speech_started_at = now
+                    peak_volume = max(peak_volume, volume)
+                    record_chunks.extend(pre_speech_chunks)
+                    pre_speech_chunks = []
+                    print(
+                        f"Follow-up speech started. volume={volume}, "
+                        f"start_threshold={speech_start_threshold}, noise_floor={noise_floor}"
+                    )
+                    silence_started_at = None
+                elif speech_started_at is not None:
+                    peak_volume = max(peak_volume, volume)
+                    record_chunks.append(chunk.copy())
+                    silence_threshold = adaptive_silence_threshold(self.args, silence_base_threshold, peak_volume)
+                    is_silence = volume <= silence_threshold
+                    if is_silence:
+                        if silence_started_at is None:
+                            silence_started_at = now
+                            if self.args.listen_debug:
+                                print(
+                                    f"\nFollow-up silence candidate. volume={volume} <= "
+                                    f"silence_threshold={silence_threshold}, peak={peak_volume}"
+                                )
+                        elif now - silence_started_at >= self.args.silence_duration:
+                            print(
+                                f"Follow-up silence detected. volume={volume}, "
+                                f"silence_threshold={silence_threshold}, peak={peak_volume}"
+                            )
+                            break
+                    else:
+                        silence_started_at = None
+                elif elapsed >= timeout:
+                    print(f"No follow-up speech for {timeout:.1f}s; returning to standby.")
+                    return None, self.recording_meta(
+                        reason="no_followup_speech",
+                        wake_score=wake_score_at_start,
+                        wake_context={},
+                        turn_source=turn_source,
+                        noise_floor=noise_floor,
+                        speech_start_threshold=speech_start_threshold,
+                        silence_base_threshold=silence_base_threshold,
+                        peak_volume=peak_volume,
+                    )
+
+                if speech_started_at is not None and now - speech_started_at >= self.args.max_speech_seconds:
+                    print(f"Max follow-up speech length reached ({self.args.max_speech_seconds:.1f}s); sending.")
+                    break
+
+        if not record_chunks:
+            return None, self.recording_meta(
+                reason="empty_followup_recording",
+                wake_score=wake_score_at_start,
+                wake_context={},
+                turn_source=turn_source,
+                noise_floor=noise_floor,
+                speech_start_threshold=speech_start_threshold,
+                silence_base_threshold=silence_base_threshold,
+                peak_volume=peak_volume,
+            )
+
+        audio = np.concatenate(record_chunks).astype(np.float32)
+        duration = len(audio) / float(self.sample_rate)
+        if duration < self.args.min_speech_seconds:
+            print(f"Follow-up recording too short ({duration:.2f}s); dropping.")
+            return None, self.recording_meta(
+                reason="followup_too_short",
+                wake_score=wake_score_at_start,
+                wake_context={},
+                turn_source=turn_source,
+                noise_floor=noise_floor,
+                speech_start_threshold=speech_start_threshold,
+                silence_base_threshold=silence_base_threshold,
+                peak_volume=peak_volume,
+                duration_sec=duration,
+            )
+
+        return audio, self.recording_meta(
+            reason="ok",
+            wake_score=wake_score_at_start,
+            wake_context={},
+            turn_source=turn_source,
+            noise_floor=noise_floor,
+            speech_start_threshold=speech_start_threshold,
+            silence_base_threshold=silence_base_threshold,
+            peak_volume=peak_volume,
+            duration_sec=duration,
+        )
 
 
 def select_input_device(args: argparse.Namespace) -> int | None:
@@ -2694,6 +3702,37 @@ def select_beep_output_device(args: argparse.Namespace) -> int | None:
     return None
 
 
+def play_recording_cue(args: argparse.Namespace, *, label: str = "Recording") -> bool:
+    if args.no_beep:
+        print(f"{label} beep skipped.")
+        return True
+
+    args.beep_device = select_beep_output_device(args)
+    ok = play_recording_beep(
+        duration_ms=args.beep_duration_ms,
+        frequency_hz=args.beep_frequency,
+        volume=args.beep_volume,
+        device=args.beep_device,
+    )
+    if not ok and args.beep_device is not None and not getattr(args, "no_beep_default_retry", False):
+        retry_delay = max(0.0, float(getattr(args, "beep_retry_delay", 0.12) or 0.0))
+        if retry_delay > 0.0:
+            time.sleep(retry_delay)
+        print("Retrying recording beep on default output.")
+        ok = play_recording_beep(
+            duration_ms=args.beep_duration_ms,
+            frequency_hz=args.beep_frequency,
+            volume=args.beep_volume,
+            device=None,
+        )
+
+    if ok:
+        print(f"{label} beep played.")
+    else:
+        print(f"WARNING: {label.lower()} beep unavailable; continuing.")
+    return ok
+
+
 def build_wake_hook(
     args: argparse.Namespace,
     camera_manager: CameraManager | None,
@@ -2706,8 +3745,9 @@ def build_wake_hook(
         turn_state["timing"] = timing
         timing.mark("wake detected")
 
-        pause_music_for_wake(args)
+        pause_result = pause_music_for_wake(args)
         timing.mark("music paused for wake")
+        settle_after_music_wake_pause(args, pause_result)
 
         metadata: dict[str, Any] = {
             "capture_timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2725,25 +3765,9 @@ def build_wake_hook(
             "no_vision": args.no_vision,
         }
 
-        image_future = camera_manager.capture_async() if camera_manager is not None else None
-        metadata["image_capture_started"] = image_future is not None
-        if image_future is not None:
-            print("Image capture task started.")
-        else:
-            print("Image capture skipped or unavailable.")
-
-        if args.no_beep:
-            print("Recording beep skipped.")
-        else:
-            args.beep_device = select_beep_output_device(args)
-            play_recording_beep(
-                duration_ms=args.beep_duration_ms,
-                frequency_hz=args.beep_frequency,
-                volume=args.beep_volume,
-                device=args.beep_device,
-            )
-            print("beep played.")
+        play_recording_cue(args, label="Recording")
         timing.mark("beep done")
+
         if robot.set_screen_state("Thinking"):
             print("UART Thinking sent.")
         else:
@@ -2751,12 +3775,65 @@ def build_wake_hook(
         timing.mark("UART Thinking sent")
 
         return {
-            "image_future": image_future,
+            "image_future": None,
             "metadata": metadata,
             "timing": timing,
         }
 
     return on_wake
+
+
+def build_conversation_turn_context(
+    args: argparse.Namespace,
+    camera_manager: CameraManager | None,
+    robot: RobotUartController,
+    turn_state: dict[str, Any],
+    *,
+    session_id: str,
+    turn_index: int,
+    meta: dict[str, Any],
+    play_cue: bool = False,
+) -> dict[str, Any]:
+    timing = TimingLogger()
+    turn_state.clear()
+    turn_state["timing"] = timing
+    timing.mark("conversation follow-up cue started" if play_cue else "conversation follow-up context built")
+
+    metadata: dict[str, Any] = {
+        "capture_timestamp": datetime.now(timezone.utc).isoformat(),
+        "image_format": "jpeg",
+        "source": "jetson",
+        "client_version": CLIENT_VERSION,
+        "wake_score": meta.get("wake_score"),
+        "wake_word": "conversation_followup",
+        "conversation_mode": True,
+        "conversation_session_id": session_id,
+        "conversation_turn_index": turn_index,
+        "turn_source": meta.get("turn_source", "conversation_followup"),
+        "camera_id": args.camera_id,
+        "camera_width": args.camera_width,
+        "camera_height": args.camera_height,
+        "camera_jpeg_quality": args.camera_jpeg_quality,
+        "vision_mode": "off" if args.no_vision else ("force" if args.force_vision else "auto"),
+        "force_vision": args.force_vision,
+        "no_vision": args.no_vision,
+    }
+
+    if play_cue:
+        play_recording_cue(args, label="Follow-up recording")
+        timing.mark("follow-up beep done")
+
+    if robot.set_screen_state("Thinking"):
+        print("UART Thinking sent.")
+    else:
+        print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
+    timing.mark("UART Thinking sent")
+
+    return {
+        "image_future": None,
+        "metadata": metadata,
+        "timing": timing,
+    }
 
 
 def response_vision_summary(response: dict[str, Any]) -> None:
@@ -2809,7 +3886,7 @@ def wait_for_tts_job(job_id: str, args: argparse.Namespace, *, timeout_sec: floa
     deadline = time.monotonic() + timeout_sec
     last_error = ""
     saw_current_job = False
-    poll_interval = max(0.2, min(float(getattr(args, "tts_poll_interval", 0.75) or 0.75), 2.0))
+    poll_interval = max(0.1, min(float(getattr(args, "tts_poll_interval", 0.75) or 0.75), 2.0))
     while time.monotonic() < deadline:
         try:
             status = voice_chat.get_json(queue_url, timeout_sec=min(args.tts_timeout, 2.0))
@@ -2868,6 +3945,16 @@ def run_self_test() -> int:
         ),
         (
             {
+                "transcript": "講個開心的事情",
+                "reply": "好耶！",
+                "control": {"persistent_state": "unchanged", "emotion": "happy", "head_motion": "none"},
+            },
+            "unchanged",
+            "happy",
+            "nod",
+        ),
+        (
+            {
                 "transcript": "講個笑話",
                 "reply": "emotion 是 happy，所以我要送 Happy 0 0。",
             },
@@ -2897,11 +3984,23 @@ def run_self_test() -> int:
             if command not in MOTOR_COMMANDS:
                 raise AssertionError(f"head motion {motion} uses non-motor command {command}")
             if command == "MotorPitch":
-                in_range = clamp_int(v1, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX) == int(v1) and clamp_int(v2, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX) == int(v2)
+                in_range = clamp_int(v1, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX) == int(v1)
             else:
-                in_range = clamp_int(v1, MOTOR_YAW_MIN, MOTOR_YAW_MAX) == int(v1) and clamp_int(v2, MOTOR_YAW_MIN, MOTOR_YAW_MAX) == int(v2)
+                in_range = clamp_int(v1, MOTOR_YAW_MIN, MOTOR_YAW_MAX) == int(v1)
             if not in_range:
                 raise AssertionError(f"head motion {motion} value out of range: {command} {v1} {v2}")
+            if int(v2) != 0:
+                raise AssertionError(f"head motion {motion} should keep the internal compatibility value at 0: {command} {v1} {v2}")
+
+    expanded_look = smooth_motor_sequence(HEAD_MOTION_SEQUENCES["look_around"], MOTOR_SMOOTH_STEP_DEG)
+    if len(expanded_look) <= len(HEAD_MOTION_SEQUENCES["look_around"]):
+        raise AssertionError("look_around smoothing did not expand large yaw moves")
+    previous_by_command: dict[str, int] = {}
+    for command, value, _unused in expanded_look:
+        previous = previous_by_command.get(command)
+        if previous is not None and abs(value - previous) > MOTOR_SMOOTH_STEP_DEG:
+            raise AssertionError(f"smoothed {command} jump too large: {previous} -> {value}")
+        previous_by_command[command] = value
 
     dry_args = argparse.Namespace(
         no_uart=False,
@@ -2913,16 +4012,47 @@ def run_self_test() -> int:
         uart_read_ms=30,
         uart_line_ending="crlf",
         uart_debug=False,
+        motor_step_delay=0.02,
+        motor_smooth_step_deg=MOTOR_SMOOTH_STEP_DEG,
+        motor_reset_repeats=2,
+        motor_reset_delay=0.02,
     )
     robot = RobotUartController(dry_args)
+    safe_args = argparse.Namespace(uart_dry_run=False, enable_head_motor=False, disable_head_motor=False)
+    if RobotUartController(safe_args).head_motor_enabled():
+        raise AssertionError("head motor should be disabled by default")
+    safe_args.enable_head_motor = True
+    if not RobotUartController(safe_args).head_motor_enabled():
+        raise AssertionError("--enable-head-motor should enable head motor")
+    safe_args.disable_head_motor = True
+    if RobotUartController(safe_args).head_motor_enabled():
+        raise AssertionError("--disable-head-motor should override --enable-head-motor")
     if not robot.send_uart_command("Thinking", 0, 0, reason="self-test"):
         raise AssertionError("Thinking dry-run failed")
     if robot.send_uart_command("UnknownCommand", 0, 0, reason="self-test"):
         raise AssertionError("unknown UART command should be rejected")
-    if robot._validate_command("MotorPitch", 99, 0) != ("MotorPitch", MOTOR_PITCH_MAX, 0):
+    if robot._validate_command("MotorPitch", 999, 0) != ("MotorPitch", MOTOR_PITCH_MAX, 0):
         raise AssertionError("MotorPitch clamp failed")
     if robot._validate_command("MotorYaw", -99, 0) != ("MotorYaw", MOTOR_YAW_MIN, 0):
         raise AssertionError("MotorYaw clamp failed")
+    if robot._validate_command("MotorPitch", 90, -5) != ("MotorPitch", MOTOR_PITCH_CENTER, 0):
+        raise AssertionError("MotorPitch second value clamp failed")
+    if robot._validate_command("MotorYaw", MOTOR_YAW_CENTER, 123) != ("MotorYaw", MOTOR_YAW_CENTER, 0):
+        raise AssertionError("MotorYaw second value clamp failed")
+    if format_uart_wire_command("MotorPitch", MOTOR_PITCH_CENTER, 0) != "MotorPitch 90":
+        raise AssertionError("MotorPitch wire format should use one argument")
+    if format_uart_wire_command("MotorYaw", MOTOR_YAW_CENTER, 0) != "MotorYaw 90":
+        raise AssertionError("MotorYaw wire format should use one argument")
+    if format_uart_wire_command("Thinking", 0, 0) != "Thinking 0 0":
+        raise AssertionError("screen command wire format should keep two arguments")
+    if motor_ack_problem("MotorPitch", 90, ["Motor Pitch = 90"]):
+        raise AssertionError("valid MotorPitch ACK should not trip safety")
+    if not motor_ack_problem("MotorPitch", 90, ["Motor Pitch = 537190203"]):
+        raise AssertionError("pointer-like MotorPitch ACK should trip safety")
+    if motor_ack_problem("MotorYaw", 90, ["Motor Yaw = 90"]):
+        raise AssertionError("valid MotorYaw ACK should not trip safety")
+    if not motor_ack_problem("MotorYaw", 90, ["Motor Yaw = 537190201"]):
+        raise AssertionError("pointer-like MotorYaw ACK should trip safety")
     robot.send_emotion_screen("happy")
     robot.send_speaking_and_emotion("curious")
     head_thread = robot.start_head_motion("nod")
@@ -2935,6 +4065,39 @@ def run_self_test() -> int:
         raise AssertionError(f"bad TTS queue URL: {queue_url}")
     if estimate_tts_seconds("好，我先安靜陪你休息。") < 1.2:
         raise AssertionError("TTS estimate below minimum")
+
+    if detect_focus_mode_intent("開始專心工作 25 分鐘 寫 UART 報告") != "start":
+        raise AssertionError("focus start intent detection failed")
+    if detect_focus_mode_intent("結束工作，切回一般模式") != "stop":
+        raise AssertionError("focus stop intent detection failed")
+    conv_args = argparse.Namespace(conversation_mode=True)
+    if not should_end_conversation_after_focus_turn(
+        conv_args,
+        focus_intent="start",
+        focus_was_running=False,
+        focus_is_running=True,
+    ):
+        raise AssertionError("focus start should end conversation follow-up mode")
+    if not should_end_conversation_after_focus_turn(
+        conv_args,
+        focus_intent=None,
+        focus_was_running=True,
+        focus_is_running=True,
+    ):
+        raise AssertionError("active focus mode should end conversation follow-up mode")
+    if should_end_conversation_after_focus_turn(
+        argparse.Namespace(conversation_mode=False),
+        focus_intent="start",
+        focus_was_running=False,
+        focus_is_running=True,
+    ):
+        raise AssertionError("focus should not affect classic one-turn mode")
+    duration = parse_focus_duration_min("開始工作 1.5 小時")
+    if duration != 90.0:
+        raise AssertionError(f"focus duration parsing failed: {duration}")
+    task = extract_focus_task("開始專心工作 25 分鐘 寫 UART 報告")
+    if "UART" not in task:
+        raise AssertionError(f"focus task extraction failed: {task!r}")
 
     gate_args = argparse.Namespace(
         volume_min=700,
@@ -3050,6 +4213,51 @@ def print_control_summary(control: dict[str, str]) -> None:
     print(f"  reason           : {control.get('reason')}")
 
 
+def print_quiet_turn_summary(response: dict[str, Any]) -> None:
+    request_id = str(response.get("request_id", "") or "").strip()
+    timing = response.get("timing") if isinstance(response.get("timing"), dict) else {}
+    print()
+    print("Turn processed.")
+    if request_id:
+        print(f"request_id={request_id}")
+    if timing:
+        print(
+            "Timing: "
+            f"asr={timing.get('asr_ms', '?')} ms, "
+            f"llm={timing.get('llm_ms', '?')} ms, "
+            f"total={timing.get('total_ms', '?')} ms"
+        )
+
+
+def restore_after_conversation_end(
+    args: argparse.Namespace,
+    robot: RobotUartController,
+    timing: TimingLogger | None,
+) -> None:
+    if getattr(args, "no_sleep_on_conversation_end", False):
+        robot.restore_persistent_screen_state()
+        if timing is not None:
+            timing.mark("conversation ended; persistent state restored")
+        return
+
+    robot.set_persistent_state("sleep")
+    robot.restore_persistent_screen_state()
+    if timing is not None:
+        timing.mark("conversation ended; sleep restored")
+
+
+def conversation_music_end_action(response: dict[str, Any], args: argparse.Namespace) -> str:
+    if not getattr(args, "conversation_mode", False) or getattr(args, "keep_conversation_after_music_control", False):
+        return ""
+    music_route = response.get("music") if isinstance(response.get("music"), dict) else {}
+    action = str(music_route.get("action", "none") or "none").strip().lower()
+    if action not in {"play", "resume", "pause", "stop"}:
+        return ""
+    if not (music_route.get("intent") or music_route.get("should_call") or music_route.get("handled") or music_route.get("ok")):
+        return ""
+    return action
+
+
 def emotion_summary_from_control(control: dict[str, str]) -> dict[str, Any]:
     primary = control.get("emotion", "neutral")
     if primary not in VALID_EMOTIONS:
@@ -3074,12 +4282,84 @@ def emotion_summary_from_control(control: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def handle_focus_mode_response(
+    response: dict[str, Any],
+    args: argparse.Namespace,
+    robot: RobotUartController,
+    timing: TimingLogger | None,
+    focus_manager: FocusModeManager,
+) -> bool | None:
+    transcript = str(response.get("transcript", "") or "").strip()
+    focus_manager.poll()
+    intent = detect_focus_mode_intent(transcript)
+    if intent is None and not focus_manager.is_running():
+        return None
+
+    if intent == "start":
+        ok, reply = focus_manager.start(transcript)
+        emotion = "happy" if ok else "confused"
+        head_motion = "nod" if ok else "shake"
+    elif intent == "stop":
+        ok, reply = focus_manager.stop()
+        emotion = "happy" if ok else "confused"
+        head_motion = "nod" if ok else "shake"
+    else:
+        ok = True
+        reply = "我還在專心工作模式中。要結束的話，再叫我結束工作。"
+        emotion = "curious"
+        head_motion = "gentle_nod"
+
+    control = {
+        "persistent_state": "unchanged",
+        "emotion": emotion,
+        "head_motion": head_motion,
+        "reason": f"focus mode {intent or 'active'}",
+    }
+    response["reply"] = reply
+    response["control"] = control
+    response["emotion"] = emotion_summary_from_control(control)
+
+    if getattr(args, "quiet_dialog", False):
+        print_quiet_turn_summary(response)
+    else:
+        print_control_summary(control)
+        print(f"parsed reply: {reply}")
+        print(f"parsed control: {json.dumps(control, ensure_ascii=False)}")
+        voice_chat.print_result(response, verbose_debug=args.debug)
+
+    robot.send_speaking_and_emotion(emotion)
+    head_thread, head_stop = robot.start_speaking_head_motion(head_motion)
+    if timing is not None:
+        timing.mark("focus mode command handled")
+
+    try:
+        tts_ok = speak_reply_and_wait(response, args)
+    finally:
+        robot.stop_speaking_head_motion(head_thread, head_stop, reason="speaking_head_motion focus stop reset")
+    if timing is not None:
+        timing.mark("TTS finished or estimated finished")
+
+    if intent == "stop":
+        robot.restore_persistent_screen_state()
+    elif focus_manager.is_running():
+        robot.set_screen_state("Thinking")
+    else:
+        robot.restore_persistent_screen_state()
+    return tts_ok or not getattr(args, "require_tts", False)
+
+
 def handle_wake_chat_response(
     response: dict[str, Any],
     args: argparse.Namespace,
     robot: RobotUartController,
     timing: TimingLogger | None,
+    focus_manager: FocusModeManager | None = None,
 ) -> bool:
+    if focus_manager is not None:
+        handled = handle_focus_mode_response(response, args, robot, timing, focus_manager)
+        if handled is not None:
+            return handled
+
     weather_result = maybe_apply_weather_response(response, args)
     if weather_result is not None and timing is not None:
         timing.mark("weather tool handled" if weather_result.get("ok") else "weather tool failed")
@@ -3090,12 +4370,17 @@ def handle_wake_chat_response(
     emotion_obj = response.get("emotion") if isinstance(response.get("emotion"), dict) else {}
     if not emotion_obj or str(emotion_obj.get("primary", "")).strip().lower() != control["emotion"]:
         response["emotion"] = emotion_summary_from_control(control)
-    print_control_summary(control)
-    print(f"parsed reply: {reply}")
-    print(f"parsed control: {json.dumps(control, ensure_ascii=False)}")
+    quiet_dialog = bool(getattr(args, "quiet_dialog", False))
+    if quiet_dialog:
+        print_quiet_turn_summary(response)
+    else:
+        print_control_summary(control)
+        print(f"parsed reply: {reply}")
+        print(f"parsed control: {json.dumps(control, ensure_ascii=False)}")
 
-    voice_chat.print_result(response, verbose_debug=args.debug)
-    response_vision_summary(response)
+    if not quiet_dialog:
+        voice_chat.print_result(response, verbose_debug=args.debug)
+        response_vision_summary(response)
     music_route = detect_music_route(response, args)
     if music_route.get("action") in {"stop", "pause"}:
         execute_music_route(music_route, args, response, phase="before_tts")
@@ -3105,11 +4390,14 @@ def handle_wake_chat_response(
 
     robot.send_speaking_and_emotion(control["emotion"])
 
-    head_thread = robot.start_head_motion(control["head_motion"])
+    head_thread, head_stop = robot.start_speaking_head_motion(control["head_motion"])
     if timing is not None:
         timing.mark("UART Speaking/emotion sent")
 
-    tts_ok = speak_reply_and_wait(response, args)
+    try:
+        tts_ok = speak_reply_and_wait(response, args)
+    finally:
+        robot.stop_speaking_head_motion(head_thread, head_stop, reason="speaking_head_motion stop reset")
     if timing is not None:
         timing.mark("TTS finished or estimated finished")
 
@@ -3117,11 +4405,6 @@ def handle_wake_chat_response(
         execute_music_route(music_route, args, response, phase="after_tts")
         if timing is not None:
             timing.mark("music triggered")
-
-    head_thread.join(timeout=max(0.5, float(getattr(args, "motor_join_timeout", MOTOR_JOIN_TIMEOUT_SEC) or MOTOR_JOIN_TIMEOUT_SEC)))
-    if head_thread.is_alive():
-        print("WARNING: head motion thread still running after motor join timeout; sending one extra reset before restore.")
-        robot.reset_head_position(reason="head_motion late reset")
 
     robot.restore_persistent_screen_state()
     if timing is not None:
@@ -3137,41 +4420,89 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
 
     text_url = voice_chat.endpoint_url(args.server_url, "/text-chat")
     robot = RobotUartController(args)
+    focus_manager = FocusModeManager(args, None)
     timing = TimingLogger()
-    print(f"POST text to {text_url}")
-    if robot.set_screen_state("Thinking"):
-        print("UART Thinking sent.")
-    else:
-        print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
-    timing.mark("UART Thinking sent")
     try:
-        response = voice_chat.post_json(text_url, {"text": args.text}, timeout_sec=args.timeout)
-    except Exception as exc:
-        print(f"ERROR: text-chat failed: {exc}")
-        robot.restore_persistent_screen_state()
-        return 1
+        print(f"POST text to {text_url}")
+        if robot.set_screen_state("Thinking"):
+            print("UART Thinking sent.")
+        else:
+            print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
+        timing.mark("UART Thinking sent")
+        try:
+            response = voice_chat.post_json(text_url, {"text": args.text}, timeout_sec=args.timeout)
+        except Exception as exc:
+            print(f"ERROR: text-chat failed: {exc}")
+            robot.restore_persistent_screen_state()
+            return 1
 
-    timing.mark("AI reply received")
-    debug_obj = response.get("debug") if isinstance(response.get("debug"), dict) else {}
-    raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
-    if raw_preview:
-        print(f"AI raw response preview: {raw_preview}")
-    return 0 if handle_wake_chat_response(response, args, robot, timing) else 1
+        timing.mark("AI reply received")
+        debug_obj = response.get("debug") if isinstance(response.get("debug"), dict) else {}
+        raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
+        if raw_preview:
+            print(f"AI raw response preview: {raw_preview}")
+        return 0 if handle_wake_chat_response(response, args, robot, timing, focus_manager) else 1
+    finally:
+        focus_manager.shutdown()
 
 
 def run_head_motion_test(args: argparse.Namespace) -> int:
     """Exercise FRDM head motion directly without mic, camera, TTS, or AI."""
-    if not getattr(args, "uart_dry_run", False):
+    head_motor_requested = bool(getattr(args, "enable_head_motor", False) and not getattr(args, "disable_head_motor", False))
+    if not getattr(args, "uart_dry_run", False) and head_motor_requested:
         if not getattr(args, "no_uart", False):
             args.require_uart = True
         device_preflight(args)
 
     robot = RobotUartController(args)
-    requested = str(getattr(args, "test_head_motion", "") or "").strip()
-    if requested == "all":
-        motions = ["nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop", "none"]
+    requested_speaking_motion = str(getattr(args, "test_speaking_head_motion", "") or "").strip()
+    requested_emotion = str(getattr(args, "test_head_emotion", "") or "").strip().lower()
+    requested_motion = str(getattr(args, "test_head_motion", "") or "").strip()
+    if requested_speaking_motion:
+        motion = requested_speaking_motion if requested_speaking_motion in SPEAKING_HEAD_MOTION_LOOPS else "none"
+        if motion == "all":
+            motion = "shake"
+        duration_sec = max(0.5, min(30.0, float(getattr(args, "test_speaking_seconds", 6.0) or 6.0)))
+        print("Speaking head motion loop hardware test.")
+        print("This mode simulates TTS playback: it loops head motion, then stops and resets.")
+        print(
+            "Motor settings: "
+            f"enabled={robot.head_motor_enabled()}, "
+            f"pitch={MOTOR_PITCH_MIN}..{MOTOR_PITCH_CENTER}..{MOTOR_PITCH_MAX} "
+            "(down..center..up), "
+            f"yaw={MOTOR_YAW_MIN}..{MOTOR_YAW_CENTER}..{MOTOR_YAW_MAX} "
+            "(right..center..left), "
+            f"speaking_smooth_step={robot.motor_speaking_smooth_step_deg()}deg, "
+            f"speaking_step_delay={robot.motor_speaking_step_delay():.2f}s, "
+            f"reset_repeats={robot.motor_reset_repeats()}, "
+            f"reset_delay={robot.motor_reset_delay():.2f}s, "
+            f"read_ms={robot.motor_read_ms()}"
+        )
+        if getattr(args, "uart_dry_run", False):
+            print("UART mode: dry-run; commands will be printed but not sent.")
+        elif not robot.head_motor_enabled():
+            print("UART mode: head motor disabled; add --enable-head-motor only after FRDM ACK reports real angles.")
+        else:
+            print(f"UART mode: {args.uart_port} @ {args.uart_baudrate}")
+            bridge.print_uart_ports()
+        print(f"Testing speaking head motion loop: {motion} for {duration_sec:.1f}s")
+        thread, stop_event = robot.start_speaking_head_motion(motion)
+        try:
+            time.sleep(duration_sec)
+        finally:
+            robot.stop_speaking_head_motion(thread, stop_event, reason="speaking_head_motion test stop reset")
+        return 0
+
+    if requested_emotion:
+        if requested_emotion == "all":
+            emotions = ["neutral", "happy", "curious", "excited", "confused", "concerned", "sleepy"]
+        else:
+            emotions = [requested_emotion]
+        motion_plan = [(f"emotion:{emotion}", head_motion_for_emotion(emotion)) for emotion in emotions]
+    elif requested_motion == "all":
+        motion_plan = [(motion, motion) for motion in ["nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop", "none"]]
     else:
-        motions = [requested]
+        motion_plan = [(requested_motion, requested_motion)]
 
     repeats = max(1, min(10, int(getattr(args, "test_head_repeat", 1) or 1)))
     gap_sec = max(0.0, float(getattr(args, "test_head_gap", 0.7) or 0.0))
@@ -3180,8 +4511,12 @@ def run_head_motion_test(args: argparse.Namespace) -> int:
     print("This mode does not open microphone, camera, TTS, or Windows server.")
     print(
         "Motor settings: "
-        f"pitch_range={MOTOR_PITCH_MIN}..{MOTOR_PITCH_MAX}, "
-        f"yaw_range={MOTOR_YAW_MIN}..{MOTOR_YAW_MAX}, "
+        f"enabled={robot.head_motor_enabled()}, "
+        f"pitch={MOTOR_PITCH_MIN}..{MOTOR_PITCH_CENTER}..{MOTOR_PITCH_MAX} "
+        "(down..center..up), "
+        f"yaw={MOTOR_YAW_MIN}..{MOTOR_YAW_CENTER}..{MOTOR_YAW_MAX} "
+        "(right..center..left), "
+        f"smooth_step={robot.motor_smooth_step_deg()}deg, "
         f"step_delay={robot.motor_step_delay():.2f}s, "
         f"reset_repeats={robot.motor_reset_repeats()}, "
         f"reset_delay={robot.motor_reset_delay():.2f}s, "
@@ -3189,6 +4524,8 @@ def run_head_motion_test(args: argparse.Namespace) -> int:
     )
     if getattr(args, "uart_dry_run", False):
         print("UART mode: dry-run; commands will be printed but not sent.")
+    elif not robot.head_motor_enabled():
+        print("UART mode: head motor disabled; add --enable-head-motor only after FRDM ACK reports real angles.")
     else:
         print(f"UART mode: {args.uart_port} @ {args.uart_baudrate}")
         bridge.print_uart_ports()
@@ -3198,12 +4535,15 @@ def run_head_motion_test(args: argparse.Namespace) -> int:
         for repeat_index in range(repeats):
             if repeats > 1:
                 print(f"Head motion test pass {repeat_index + 1}/{repeats}.")
-            for motion in motions:
+            for label, motion in motion_plan:
                 if motion not in HEAD_MOTION_SEQUENCES:
                     print(f"ERROR: unknown head motion {motion!r}.")
                     return 2
                 print()
-                print(f"Testing head motion: {motion}")
+                if label.startswith("emotion:"):
+                    print(f"Testing head emotion mapping: {label.removeprefix('emotion:')} -> {motion}")
+                else:
+                    print(f"Testing head motion: {motion}")
                 all_ok = robot.run_head_motion(motion) and all_ok
                 if gap_sec > 0:
                     time.sleep(gap_sec)
@@ -3215,6 +4555,224 @@ def run_head_motion_test(args: argparse.Namespace) -> int:
         print("Head motion test interrupted; sending reset.")
         robot.reset_head_position(reason="head_motion test interrupt reset")
         return 130
+
+
+def cue_and_capture_speech_end_image(
+    args: argparse.Namespace,
+    camera_manager: CameraManager | None,
+    wake_context: dict[str, Any],
+    timing: TimingLogger | None,
+) -> Future[bytes | None] | None:
+    play_recording_cue(args, label="Speech-end capture")
+    if timing is not None:
+        timing.mark("speech-end beep done")
+
+    metadata = wake_context.get("metadata") if isinstance(wake_context.get("metadata"), dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    wake_context["metadata"] = metadata
+    metadata["capture_timestamp"] = datetime.now(timezone.utc).isoformat()
+    metadata["image_capture_phase"] = "speech_end"
+
+    image_delay_sec = max(0.0, float(getattr(args, "speech_end_image_delay", 0.0) or 0.0))
+    image_future = camera_manager.capture_async(delay_sec=image_delay_sec) if camera_manager is not None else None
+    wake_context["image_future"] = image_future
+    metadata["image_capture_started"] = image_future is not None
+    metadata["image_capture_delay_sec"] = image_delay_sec if image_future is not None else 0.0
+    if image_future is not None:
+        if image_delay_sec > 0.0:
+            print(f"Speech-end image capture scheduled {image_delay_sec:.1f}s after end-of-speech cue.")
+        else:
+            print("Speech-end image capture started.")
+    else:
+        print("Speech-end image capture skipped or unavailable.")
+    if timing is not None:
+        timing.mark("speech-end image capture queued" if image_future is not None else "speech-end image unavailable")
+    return image_future
+
+
+def build_turn_upload_metadata(
+    args: argparse.Namespace,
+    *,
+    recorder: WakeVolumeRecorder,
+    meta: dict[str, Any],
+    wake_context: dict[str, Any],
+    image_bytes: bytes | None,
+    input_sample_rate: int,
+    conversation_session_id: str = "",
+    conversation_turn_index: int = 1,
+) -> dict[str, Any]:
+    metadata = wake_context.get("metadata") if isinstance(wake_context.get("metadata"), dict) else {}
+    metadata = dict(metadata)
+    metadata["image_available"] = image_bytes is not None
+    metadata["image_size_bytes"] = len(image_bytes) if image_bytes else 0
+    metadata["vision_mode"] = "off" if args.no_vision else ("force" if args.force_vision else "auto")
+    metadata["force_vision"] = args.force_vision
+    metadata["no_vision"] = args.no_vision
+    metadata["audio_duration_sec"] = meta.get("duration_sec")
+    metadata["audio_rms"] = meta.get("audio_rms")
+    metadata["input_sample_rate"] = int(meta.get("input_sample_rate") or recorder.sample_rate or input_sample_rate)
+    metadata["turn_source"] = meta.get("turn_source", metadata.get("turn_source", "wake"))
+    latency_profile = "ultra" if getattr(args, "ultra_response", False) else ("turbo" if getattr(args, "turbo_response", False) else "normal")
+    fast_reply = bool(getattr(args, "fast_reply", False) or getattr(args, "turbo_response", False) or getattr(args, "ultra_response", False))
+    metadata["latency_profile"] = latency_profile
+    metadata["fast_reply"] = fast_reply
+    reply_num_predict = int(getattr(args, "fast_reply_num_predict", 0) or 0)
+    if fast_reply and reply_num_predict > 0:
+        metadata["reply_num_predict"] = reply_num_predict
+    if conversation_session_id:
+        metadata["conversation_mode"] = bool(getattr(args, "conversation_mode", False))
+        metadata["conversation_session_id"] = conversation_session_id
+        metadata["conversation_turn_index"] = conversation_turn_index
+    return metadata
+
+
+def send_and_handle_audio_turn(
+    args: argparse.Namespace,
+    *,
+    recorder: WakeVolumeRecorder,
+    camera_manager: CameraManager | None,
+    robot: RobotUartController,
+    focus_manager: FocusModeManager | None,
+    turn_state: dict[str, Any],
+    audio: np.ndarray,
+    meta: dict[str, Any],
+    input_sample_rate: int,
+    conversation_session_id: str = "",
+    conversation_turn_index: int = 1,
+) -> tuple[bool, bool]:
+    """Send one recorded turn through the existing AI/tool/TTS/UART path.
+
+    Returns (ok, end_conversation_session).
+    """
+    wav_path: Path | None = None
+    try:
+        wake_context = meta.get("wake_context") if isinstance(meta.get("wake_context"), dict) else {}
+        if not wake_context:
+            wake_context = build_conversation_turn_context(
+                args,
+                camera_manager,
+                robot,
+                turn_state,
+                session_id=conversation_session_id or "single_turn",
+                turn_index=conversation_turn_index,
+                meta=meta,
+            )
+            meta["wake_context"] = wake_context
+
+        timing = wake_context.get("timing") if isinstance(wake_context.get("timing"), TimingLogger) else turn_state.get("timing")
+        if not isinstance(timing, TimingLogger):
+            timing = None
+
+        if timing is not None:
+            timing.mark("audio recording finished")
+
+        rms = voice_chat.rms_level(audio)
+        print(f"Recorded {meta.get('duration_sec', 0.0):.2f}s; RMS={rms:.5f}")
+        if "speech_start_threshold" in meta:
+            print(
+                "Recording gate: "
+                f"noise_floor={meta.get('noise_floor')}, "
+                f"start_threshold={meta.get('speech_start_threshold')}, "
+                f"silence_base={meta.get('silence_base_threshold')}, "
+                f"peak={meta.get('peak_volume')}"
+            )
+        if rms < args.rms_threshold:
+            print("SKIP: audio RMS too low; not sending.")
+            robot.restore_persistent_screen_state()
+            return True, False
+        meta["audio_rms"] = rms
+
+        image_future = cue_and_capture_speech_end_image(args, camera_manager, wake_context, timing)
+        image_bytes = wait_for_image_future(image_future, image_wait_timeout_for_context(args, wake_context))
+        if timing is not None:
+            timing.mark("image captured" if image_bytes else "image unavailable")
+
+        metadata = build_turn_upload_metadata(
+            args,
+            recorder=recorder,
+            meta=meta,
+            wake_context=wake_context,
+            image_bytes=image_bytes,
+            input_sample_rate=input_sample_rate,
+            conversation_session_id=conversation_session_id,
+            conversation_turn_index=conversation_turn_index,
+        )
+
+        record_sample_rate = int(metadata["input_sample_rate"])
+        wav_path = voice_chat.write_temp_wav_16k(audio, record_sample_rate)
+        upload_label = "audio+image" if image_bytes else "audio only"
+        print(
+            f"POST {upload_label} to {args.server_url} "
+            f"(vision_mode={metadata['vision_mode']}, image_size_bytes={metadata['image_size_bytes']})"
+        )
+        started = time.monotonic()
+        response = send_audio_and_optional_image_to_server(
+            args.server_url,
+            wav_path,
+            image_bytes=image_bytes,
+            metadata=metadata,
+            timeout_sec=args.timeout,
+        )
+        print(f"Round trip: {int((time.monotonic() - started) * 1000)} ms")
+        if timing is not None:
+            timing.mark("uploaded to server")
+            timing.mark("transcript received")
+            timing.mark("AI reply received")
+        debug_obj = response.get("debug") if isinstance(response.get("debug"), dict) else {}
+        raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
+        if raw_preview and not getattr(args, "quiet_dialog", False):
+            print(f"AI raw response preview: {raw_preview}")
+
+        transcript = str(response.get("transcript", "") or "")
+        focus_intent = detect_focus_mode_intent(transcript) if focus_manager is not None else None
+        focus_was_running = focus_manager.is_running() if focus_manager is not None else False
+        end_keyword = end_session_keyword(transcript)
+        if getattr(args, "conversation_mode", False) and end_keyword and focus_intent is None:
+            if getattr(args, "quiet_dialog", False):
+                print_quiet_turn_summary(response)
+            else:
+                voice_chat.print_result(response, verbose_debug=args.debug)
+                response_vision_summary(response)
+            print(f"Conversation end keyword detected ({end_keyword}); entering sleep and returning to wake-only standby.")
+            if getattr(args, "speak_end_reply", False):
+                ok = handle_wake_chat_response(response, args, robot, timing, focus_manager)
+                restore_after_conversation_end(args, robot, timing)
+                recorder.reset_wake()
+                return ok, True
+            print("TTS skipped for end command.")
+            restore_after_conversation_end(args, robot, timing)
+            recorder.reset_wake()
+            return True, True
+
+        ok = handle_wake_chat_response(response, args, robot, timing, focus_manager)
+        if focus_manager is not None and should_end_conversation_after_focus_turn(
+            args,
+            focus_intent=focus_intent,
+            focus_was_running=focus_was_running,
+            focus_is_running=focus_manager.is_running(),
+        ):
+            print("Focus mode turn handled; returning to wake-only standby so the next command requires Hey Jarvis.")
+            recorder.reset_wake()
+            return ok, True
+        music_end_action = conversation_music_end_action(response, args)
+        if music_end_action:
+            print(
+                f"Music control action ({music_end_action}) handled; "
+                "returning to wake-only standby so the next music command requires Hey Jarvis."
+            )
+            if music_end_action in {"play", "resume"}:
+                restore_after_conversation_end(args, robot, timing)
+            recorder.reset_wake()
+            post_music_standby_cooldown(args, music_end_action)
+            return ok, True
+        return ok, False
+    finally:
+        if wav_path is not None:
+            try:
+                wav_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def run_wake_voice_loop(args: argparse.Namespace) -> int:
@@ -3231,6 +4789,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, request_stop)
 
+    focus_manager: FocusModeManager | None = None
     try:
         if not voice_chat.preflight_server(args):
             signal.signal(signal.SIGINT, previous_sigint)
@@ -3278,6 +4837,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         print("Camera disabled by --no-camera.")
 
     robot = RobotUartController(args)
+    focus_manager = FocusModeManager(args, camera_manager)
     turn_state: dict[str, Any] = {}
     recorder = WakeVolumeRecorder(
         args,
@@ -3295,6 +4855,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         return 1
 
     print("Wake voice chat + FRDM UART bridge ready.")
+    print(f"Client version: {CLIENT_VERSION}")
     print("AI path: Jetson wake/record locally -> Windows desktop local /voice-chat -> local ASR/Ollama.")
     print("No Gemini/OpenAI cloud API is used by this bridge.")
     print(f"Server URL: {args.server_url}")
@@ -3318,18 +4879,37 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         f"Audio read watchdog: callback queue, timeout={args.audio_read_timeout:g}s, "
         f"progress_interval={args.recording_progress_interval:g}s"
     )
+    if args.conversation_mode:
+        print(
+            "Conversation mode: enabled, "
+            f"turn_timeout={args.turn_listen_timeout:g}s, "
+            f"idle_timeout={args.session_idle_timeout:g}s, "
+            f"max_turns={args.max_session_turns}, "
+            f"quiet_dialog={args.quiet_dialog}"
+        )
+        print("After an end phrase, wake-only standby is restored and normal speech is ignored until Hey Jarvis.")
+    else:
+        print("Conversation mode: disabled (classic one wake per turn).")
     beep_desc = "disabled" if args.no_beep else f"{args.beep_frequency:g} Hz, {args.beep_duration_ms} ms, device={args.beep_device if args.beep_device is not None else 'default'}"
     print(f"Recording beep: {beep_desc}")
     vision_mode = "off" if args.no_vision else ("force" if args.force_vision else "auto")
     print(f"Vision mode: {vision_mode}")
     print(f"Camera: {'disabled' if args.no_camera or args.no_vision else f'{args.camera_id}, {args.camera_width}x{args.camera_height}, jpeg_quality={args.camera_jpeg_quality}'}")
+    focus_desc = "disabled" if args.no_focus_mode else f"enabled, script={args.focus_script}, interval={args.focus_interval_sec:g}s, duration_default={args.focus_duration_min:g}min"
+    print(f"Focus work mode: {focus_desc}")
+    print(
+        "Recording cues: start beep before each turn; "
+        f"speech-end beep + image capture before upload (delay={args.speech_end_image_delay:g}s)"
+    )
     if args.no_music:
         music_desc = "disabled"
     else:
         music_desc = (
             f"{args.music_url}, backend={args.music_backend}->{resolve_music_backend(args)}, "
             f"autostart={not args.no_music_autostart}, "
-            f"pause_on_wake={not args.no_music_pause_on_wake}"
+            f"pause_on_wake={not args.no_music_pause_on_wake}, "
+            f"beep_settle={args.music_wake_beep_settle:g}s, "
+            f"post_music_cooldown={args.post_music_standby_cooldown:g}s"
         )
     print(f"Music tool: {music_desc}")
     if args.no_weather:
@@ -3339,10 +4919,15 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     print(f"Weather tool: {weather_desc}")
     print(
         "Head motor motion: "
-        f"step_delay={args.motor_step_delay:g}s, "
-        f"reset_repeats={args.motor_reset_repeats}, "
-        f"reset_delay={args.motor_reset_delay:g}s, "
-        f"read_ms={args.motor_read_ms}, "
+        f"enabled={robot.head_motor_enabled()}, "
+        f"smooth_step={robot.motor_smooth_step_deg()}deg, "
+        f"step_delay={robot.motor_step_delay():g}s, "
+        f"speaking_step_delay={robot.motor_speaking_step_delay():g}s, "
+        f"speaking_smooth_step={robot.motor_speaking_smooth_step_deg()}deg, "
+        f"reset_repeats={robot.motor_reset_repeats()}, "
+        f"reset_delay={robot.motor_reset_delay():g}s, "
+        f"read_ms={robot.motor_read_ms()}, "
+        f"stop_timeout={robot.motor_stop_timeout():g}s, "
         f"join_timeout={args.motor_join_timeout:g}s"
     )
     print(f"TTS queue polling: every {args.tts_poll_interval:g}s, playback_timeout={args.tts_playback_timeout:g}s")
@@ -3361,7 +4946,6 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
 
     try:
         while True:
-            wav_path: Path | None = None
             try:
                 audio, meta = recorder.record_once()
                 if audio is None:
@@ -3371,86 +4955,103 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                         robot.restore_persistent_screen_state()
                     continue
 
-                wake_context = meta.get("wake_context") if isinstance(meta.get("wake_context"), dict) else {}
-                timing = wake_context.get("timing") if isinstance(wake_context.get("timing"), TimingLogger) else turn_state.get("timing")
-                if not isinstance(timing, TimingLogger):
-                    timing = None
+                session_id = uuid.uuid4().hex[:10] if args.conversation_mode else ""
+                if args.conversation_mode:
+                    print()
+                    print(f"Conversation session started: session_id={session_id}")
 
-                if timing is not None:
-                    timing.mark("audio recording finished")
-
-                rms = voice_chat.rms_level(audio)
-                print(f"Recorded {meta.get('duration_sec', 0.0):.2f}s; RMS={rms:.5f}")
-                if "speech_start_threshold" in meta:
-                    print(
-                        "Recording gate: "
-                        f"noise_floor={meta.get('noise_floor')}, "
-                        f"start_threshold={meta.get('speech_start_threshold')}, "
-                        f"silence_base={meta.get('silence_base_threshold')}, "
-                        f"peak={meta.get('peak_volume')}"
-                    )
-                if rms < args.rms_threshold:
-                    print("SKIP: audio RMS too low; not sending.")
-                    robot.restore_persistent_screen_state()
+                ok, end_session = send_and_handle_audio_turn(
+                    args,
+                    recorder=recorder,
+                    camera_manager=camera_manager,
+                    robot=robot,
+                    focus_manager=focus_manager,
+                    turn_state=turn_state,
+                    audio=audio,
+                    meta=meta,
+                    input_sample_rate=input_sample_rate,
+                    conversation_session_id=session_id,
+                    conversation_turn_index=1,
+                )
+                if not ok:
+                    return 1
+                if not args.conversation_mode or end_session:
+                    if args.conversation_mode:
+                        print("Wake-only standby restored. Say Hey Jarvis before speaking again.")
                     continue
 
-                image_future = wake_context.get("image_future")
-                if not isinstance(image_future, Future):
-                    image_future = None
-                image_bytes = wait_for_image_future(image_future, args.camera_result_timeout)
-                if timing is not None:
-                    timing.mark("image captured" if image_bytes else "image unavailable")
+                last_activity_at = time.monotonic()
+                max_session_turns = max(1, int(args.max_session_turns or 1))
+                if max_session_turns <= 1:
+                    print("Max conversation turns reached (1); returning to wake-only standby.")
+                    print("Wake-only standby restored. Say Hey Jarvis before speaking again.")
+                    continue
 
-                metadata = wake_context.get("metadata") if isinstance(wake_context.get("metadata"), dict) else {}
-                metadata = dict(metadata)
-                metadata["image_available"] = image_bytes is not None
-                metadata["image_size_bytes"] = len(image_bytes) if image_bytes else 0
-                metadata["vision_mode"] = "off" if args.no_vision else ("force" if args.force_vision else "auto")
-                metadata["force_vision"] = args.force_vision
-                metadata["no_vision"] = args.no_vision
-                metadata["audio_duration_sec"] = meta.get("duration_sec")
-                metadata["audio_rms"] = rms
-                metadata["input_sample_rate"] = int(meta.get("input_sample_rate") or recorder.sample_rate or input_sample_rate)
+                for turn_index in range(2, max_session_turns + 1):
+                    idle_sec = time.monotonic() - last_activity_at
+                    remaining_idle = max(0.0, float(args.session_idle_timeout or 0.0) - idle_sec)
+                    followup_timeout = args.turn_listen_timeout
+                    if args.session_idle_timeout > 0:
+                        followup_timeout = min(float(args.turn_listen_timeout), remaining_idle)
+                    if followup_timeout <= 0:
+                        print("Conversation idle timeout reached; returning to wake-only standby.")
+                        break
 
-                record_sample_rate = int(metadata["input_sample_rate"])
-                wav_path = voice_chat.write_temp_wav_16k(audio, record_sample_rate)
-                upload_label = "audio+image" if image_bytes else "audio only"
-                print(
-                    f"POST {upload_label} to {args.server_url} "
-                    f"(vision_mode={metadata['vision_mode']}, image_size_bytes={metadata['image_size_bytes']})"
-                )
-                started = time.monotonic()
-                response = send_audio_and_optional_image_to_server(
-                    args.server_url,
-                    wav_path,
-                    image_bytes=image_bytes,
-                    metadata=metadata,
-                    timeout_sec=args.timeout,
-                )
-                print(f"Round trip: {int((time.monotonic() - started) * 1000)} ms")
-                if timing is not None:
-                    timing.mark("uploaded to server")
-                    timing.mark("transcript received")
-                    timing.mark("AI reply received")
-                debug_obj = response.get("debug") if isinstance(response.get("debug"), dict) else {}
-                raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
-                if raw_preview:
-                    print(f"AI raw response preview: {raw_preview}")
-                if not handle_wake_chat_response(response, args, robot, timing):
-                    return 1
+                    followup_context = build_conversation_turn_context(
+                        args,
+                        camera_manager,
+                        robot,
+                        turn_state,
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        meta={
+                            "wake_score": 1.0,
+                            "turn_source": "conversation_followup",
+                        },
+                        play_cue=True,
+                    )
+
+                    followup_audio, followup_meta = recorder.record_followup_turn(
+                        listen_timeout=followup_timeout,
+                        turn_source="conversation_followup",
+                    )
+                    if followup_audio is None:
+                        print(f"No follow-up send: {followup_meta.get('reason', 'unknown')}.")
+                        robot.restore_persistent_screen_state()
+                        break
+                    followup_meta["wake_context"] = followup_context
+
+                    ok, end_session = send_and_handle_audio_turn(
+                        args,
+                        recorder=recorder,
+                        camera_manager=camera_manager,
+                        robot=robot,
+                        focus_manager=focus_manager,
+                        turn_state=turn_state,
+                        audio=followup_audio,
+                        meta=followup_meta,
+                        input_sample_rate=input_sample_rate,
+                        conversation_session_id=session_id,
+                        conversation_turn_index=turn_index,
+                    )
+                    if not ok:
+                        return 1
+                    last_activity_at = time.monotonic()
+                    if end_session:
+                        break
+                else:
+                    print(f"Max conversation turns reached ({args.max_session_turns}); returning to wake-only standby.")
+
+                print("Wake-only standby restored. Say Hey Jarvis before speaking again.")
             except KeyboardInterrupt:
                 print()
                 return 0
             except Exception as exc:
                 print(f"ERROR: {exc}")
                 robot.restore_persistent_screen_state()
-            finally:
-                if wav_path is not None:
-                    try:
-                        wav_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
     finally:
+        if focus_manager is not None:
+            focus_manager.shutdown()
         if camera_manager is not None:
             camera_manager.release()
         signal.signal(signal.SIGINT, previous_sigint)
@@ -3527,6 +5128,57 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--silence-peak-ratio", type=float, default=_env_float("SILENCE_PEAK_RATIO", 0.35))
     group.add_argument("--pre-speech-seconds", type=float, default=_env_float("PRE_SPEECH_SECONDS", 0.35))
 
+    conversation_group = parser.add_argument_group("one-wake conversation mode")
+    conversation_group.add_argument(
+        "--conversation-mode",
+        action="store_true",
+        help="After one Hey Jarvis wake, keep listening for follow-up turns until an end phrase or timeout.",
+    )
+    conversation_group.add_argument("--turn-listen-timeout", type=float, default=_env_float("TURN_LISTEN_TIMEOUT", 6.0))
+    conversation_group.add_argument("--session-idle-timeout", type=float, default=_env_float("SESSION_IDLE_TIMEOUT", 24.0))
+    conversation_group.add_argument("--max-session-turns", type=int, default=_env_int("MAX_SESSION_TURNS", 20))
+    conversation_group.add_argument(
+        "--quiet-dialog",
+        action="store_true",
+        help="Do not print transcript/reply text in the terminal; keep request id, timing, and device/tool logs.",
+    )
+    conversation_group.add_argument(
+        "--speak-end-reply",
+        action="store_true",
+        help="In conversation mode, speak the AI farewell reply before entering sleep and returning to wake-only standby.",
+    )
+    conversation_group.add_argument(
+        "--no-sleep-on-conversation-end",
+        action="store_true",
+        help="Do not send Sleep when an end phrase closes conversation mode; restore the existing persistent screen state instead.",
+    )
+    conversation_group.add_argument(
+        "--keep-conversation-after-music-control",
+        action="store_true",
+        help="Do not auto-end conversation mode after play/pause/stop/resume music commands.",
+    )
+    conversation_group.add_argument(
+        "--turbo-response",
+        action="store_true",
+        help="Apply more aggressive low-latency defaults for silence, follow-up timeout, TTS polling, and TTS speed.",
+    )
+    conversation_group.add_argument(
+        "--ultra-response",
+        action="store_true",
+        help="Apply the fastest demo defaults. Shorter waits and shorter model replies; may cut long pauses sooner.",
+    )
+    conversation_group.add_argument(
+        "--fast-reply",
+        action="store_true",
+        help="Ask the desktop server for shorter LLM replies via client metadata.",
+    )
+    conversation_group.add_argument(
+        "--fast-reply-num-predict",
+        type=int,
+        default=_env_int("FAST_REPLY_NUM_PREDICT", 0),
+        help="Ollama num_predict hint sent to the desktop server when fast replies are enabled.",
+    )
+
     beep_group = parser.add_argument_group("recording cue beep")
     beep_group.add_argument("--no-beep", action="store_true", help="Disable the short beep after wake detection.")
     beep_group.add_argument("--beep-duration-ms", type=int, default=_env_int("BEEP_DURATION_MS", 120))
@@ -3534,6 +5186,8 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     beep_group.add_argument("--beep-volume", type=float, default=_env_float("BEEP_VOLUME", 0.14))
     beep_group.add_argument("--beep-device", type=int, default=None, help="Optional sounddevice output device index for the beep.")
     beep_group.add_argument("--beep-keyword", default=os.getenv("BEEP_KEYWORD", "UACDemo"), help="Output-device keyword used when --beep-device is omitted.")
+    beep_group.add_argument("--beep-retry-delay", type=float, default=_env_float("BEEP_RETRY_DELAY", 0.12))
+    beep_group.add_argument("--no-beep-default-retry", action="store_true", help="Do not retry the beep on the default output device if the keyword output is busy.")
 
     camera_group = parser.add_argument_group("wake camera capture")
     camera_group.add_argument("--no-camera", action="store_true", help="Disable wake-time camera capture.")
@@ -3548,9 +5202,33 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     camera_group.add_argument("--camera-frame-max-age", type=float, default=_env_float("WAKE_CAMERA_FRAME_MAX_AGE", 2.0))
     camera_group.add_argument("--camera-warmup-frames", type=int, default=_env_int("WAKE_CAMERA_WARMUP_FRAMES", 3))
     camera_group.add_argument("--camera-one-shot", action="store_true", help="Disable the continuous warm reader and open the camera only at wake time.")
+    camera_group.add_argument(
+        "--pre-record-image-delay",
+        type=float,
+        default=_env_float("PRE_RECORD_IMAGE_DELAY", 0.0),
+        help="Deprecated compatibility option. Images are now captured after speech ends; use --speech-end-image-delay.",
+    )
+    camera_group.add_argument(
+        "--speech-end-image-delay",
+        type=float,
+        default=_env_float("SPEECH_END_IMAGE_DELAY", 0.0),
+        help="Seconds after the end-of-speech beep to capture the image uploaded with that voice turn.",
+    )
     vision_group = parser.add_argument_group("vision routing")
     vision_group.add_argument("--force-vision", action="store_true", help="Force Windows server to use the uploaded image when one is available.")
     vision_group.add_argument("--no-vision", action="store_true", help="Disable camera capture and Windows vision analysis for this client.")
+
+    focus_group = parser.add_argument_group("focus work mode")
+    focus_group.add_argument("--no-focus-mode", action="store_true", help="Disable voice-triggered focus work mode start/stop.")
+    focus_group.add_argument("--focus-script", default=str(DEFAULT_FOCUS_SCRIPT), help="Path to focus_work_mode.py.")
+    focus_group.add_argument("--focus-server-url", default=os.getenv("FOCUS_SERVER_URL", ""), help="Optional /focus-check URL. Defaults to the current server base.")
+    focus_group.add_argument("--focus-interval-sec", type=float, default=_env_float("FOCUS_INTERVAL_SEC", 180.0))
+    focus_group.add_argument("--focus-duration-min", type=float, default=_env_float("FOCUS_DURATION_MIN", 0.0), help="Default auto-stop duration. 0 means wait for voice stop.")
+    focus_group.add_argument("--focus-log-root", default=os.getenv("FOCUS_LOG_ROOT", str(THIS_DIR / "logs" / "focus_sessions")))
+    focus_group.add_argument("--focus-task", default=os.getenv("FOCUS_TASK", ""), help="Default focus task if the start command does not include one.")
+    focus_group.add_argument("--focus-alert-threshold", type=int, default=_env_int("FOCUS_ALERT_THRESHOLD", 2))
+    focus_group.add_argument("--focus-save-images", action="store_true", help="Debug only: let focus_work_mode.py save sampled images.")
+
     music_group = parser.add_argument_group("music tool routing")
     music_group.add_argument("--no-music", action="store_true", help="Disable local Music Web Player sidecar routing.")
     music_group.add_argument("--music-url", default=os.getenv("MUSIC_TOOL_URL", DEFAULT_MUSIC_TOOL_URL), help="Music Web Player /music endpoint.")
@@ -3561,6 +5239,18 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=_env_float("MUSIC_WAKE_PAUSE_TIMEOUT", 0.6),
         help="Short local HTTP timeout for pausing music immediately after wake detection.",
+    )
+    music_group.add_argument(
+        "--music-wake-beep-settle",
+        type=float,
+        default=_env_float("MUSIC_WAKE_BEEP_SETTLE", 0.18),
+        help="Seconds to let mpv/music pause settle before playing the wake recording beep.",
+    )
+    music_group.add_argument(
+        "--post-music-standby-cooldown",
+        type=float,
+        default=_env_float("POST_MUSIC_STANDBY_COOLDOWN", 0.8),
+        help="After play/resume auto-ends conversation mode, wait briefly before accepting the next wake to avoid music false wakes.",
     )
     music_group.add_argument("--music-dry-run", action="store_true", help="Ask music sidecar to detect but not open/play.")
     music_group.add_argument("--music-always-call", action="store_true", help="POST every transcript to the music sidecar, even if local intent detection is false.")
@@ -3577,22 +5267,56 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     weather_group.add_argument("--weather-debug", action="store_true", help="Print weather routing details even when no weather intent was detected.")
     motor_group = parser.add_argument_group("head motor motion")
     motor_group.add_argument(
+        "--enable-head-motor",
+        action="store_true",
+        help="Actually send MotorPitch/MotorYaw. Leave off until FRDM ACK reports real angles, not pointer-like values.",
+    )
+    motor_group.add_argument(
+        "--disable-head-motor",
+        action="store_true",
+        help="Force MotorPitch/MotorYaw off even if --enable-head-motor is also present. Useful while FRDM parser is unsafe.",
+    )
+    motor_group.add_argument(
         "--motor-step-delay",
         type=float,
         default=_env_float("MOTOR_STEP_DELAY_SEC", MOTOR_STEP_DELAY_SEC),
-        help="Seconds to hold each MotorPitch/MotorYaw step. Increase if motion looks like one tiny jerk.",
+        help="Seconds to hold each expanded MotorPitch/MotorYaw step. Increase if motion looks like one tiny jerk.",
+    )
+    motor_group.add_argument(
+        "--motor-smooth-step-deg",
+        type=int,
+        default=_env_int("MOTOR_SMOOTH_STEP_DEG", MOTOR_SMOOTH_STEP_DEG),
+        help="Maximum degrees per interpolated motor UART step. Smaller values create smoother, longer motions.",
+    )
+    motor_group.add_argument(
+        "--motor-speaking-step-delay",
+        type=float,
+        default=_env_float("MOTOR_SPEAKING_STEP_DELAY_SEC", MOTOR_SPEAKING_STEP_DELAY_SEC),
+        help="Seconds to hold each head-motion step while TTS is speaking. Larger values make visible slower movements.",
+    )
+    motor_group.add_argument(
+        "--motor-speaking-smooth-step-deg",
+        type=int,
+        default=_env_int("MOTOR_SPEAKING_SMOOTH_STEP_DEG", MOTOR_SPEAKING_SMOOTH_STEP_DEG),
+        help="Maximum degrees per interpolated motor step during TTS speaking loops. Larger values mean clearer target-to-target moves.",
+    )
+    motor_group.add_argument(
+        "--motor-stop-timeout",
+        type=float,
+        default=_env_float("MOTOR_STOP_TIMEOUT_SEC", MOTOR_STOP_TIMEOUT_SEC),
+        help="Maximum seconds to wait for the speaking head-motion loop to stop and reset after TTS finishes.",
     )
     motor_group.add_argument(
         "--motor-reset-repeats",
         type=int,
         default=_env_int("MOTOR_RESET_REPEATS", MOTOR_RESET_REPEATS),
-        help="How many times to resend MotorPitch/MotorYaw zero at the end of each motion.",
+        help="How many times to resend MotorPitch/MotorYaw center angles at the end of each motion.",
     )
     motor_group.add_argument(
         "--motor-reset-delay",
         type=float,
         default=_env_float("MOTOR_RESET_DELAY_SEC", MOTOR_RESET_DELAY_SEC),
-        help="Seconds between repeated zero reset motor commands.",
+        help="Seconds between repeated center-angle reset motor commands.",
     )
     motor_group.add_argument(
         "--motor-read-ms",
@@ -3611,6 +5335,24 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=sorted(VALID_HEAD_MOTIONS | {"all"}),
         default="",
         help="Run a direct FRDM head-motion test and exit. Does not open mic/camera/TTS/Windows server.",
+    )
+    motor_group.add_argument(
+        "--test-head-emotion",
+        choices=sorted(VALID_EMOTIONS | {"all"}),
+        default="",
+        help="Run the emotion-to-head-motion mapping test and exit. Does not open mic/camera/TTS/Windows server.",
+    )
+    motor_group.add_argument(
+        "--test-speaking-head-motion",
+        choices=sorted(VALID_HEAD_MOTIONS - {"none"}),
+        default="",
+        help="Loop one head motion as if TTS is speaking, then stop and reset. Does not open mic/camera/TTS/Windows server.",
+    )
+    motor_group.add_argument(
+        "--test-speaking-seconds",
+        type=float,
+        default=6.0,
+        help="Duration for --test-speaking-head-motion.",
     )
     motor_group.add_argument(
         "--test-head-repeat",
@@ -3640,6 +5382,106 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
+def apply_conversation_latency_preset(args: argparse.Namespace) -> None:
+    if getattr(args, "ultra_response", False):
+        args.silence_duration = 0.38
+        args.min_speech_seconds = 0.25
+        args.max_speech_seconds = 4.0
+        args.max_recording_seconds = 5.2
+        args.wake_listen_timeout = min(float(args.wake_listen_timeout), 3.5)
+        args.turn_listen_timeout = 3.0
+        args.session_idle_timeout = 10.0
+        args.audio_read_timeout = 0.2
+        args.recording_progress_interval = 1.5
+        args.tts_poll_interval = 0.1
+        args.tts_playback_timeout = min(float(args.tts_playback_timeout), 18.0)
+        args.music_wake_pause_timeout = min(float(args.music_wake_pause_timeout), 0.15)
+        args.camera_result_timeout = min(float(args.camera_result_timeout), 0.45 if args.force_vision else 0.18)
+        args.motor_step_delay = min(float(args.motor_step_delay), 0.12)
+        args.motor_smooth_step_deg = max(int(getattr(args, "motor_smooth_step_deg", MOTOR_SMOOTH_STEP_DEG) or MOTOR_SMOOTH_STEP_DEG), 16)
+        args.motor_reset_repeats = min(int(args.motor_reset_repeats), 2)
+        args.motor_reset_delay = min(float(args.motor_reset_delay), 0.08)
+        args.motor_join_timeout = min(float(args.motor_join_timeout), 2.0)
+        args.motor_read_ms = min(int(args.motor_read_ms), 15)
+        args.fast_reply = True
+        if int(getattr(args, "fast_reply_num_predict", 0) or 0) <= 0:
+            args.fast_reply_num_predict = 70
+        if getattr(args, "tts_length_scale", None) is None:
+            args.tts_length_scale = 0.74
+        print(
+            "Ultra response preset enabled: "
+            "silence=0.38s, max_speech=4s, max_recording=5.2s, "
+            "turn_timeout=3s, camera_wait<=0.18s, tts_poll=0.1s, "
+            "tts_length_scale=0.74, reply_num_predict=70."
+        )
+        return
+
+    if not getattr(args, "turbo_response", False):
+        return
+    args.silence_duration = 0.55
+    args.max_speech_seconds = 5.0
+    args.max_recording_seconds = 7.0
+    args.turn_listen_timeout = 4.0
+    args.session_idle_timeout = 18.0
+    args.audio_read_timeout = 0.35
+    args.recording_progress_interval = 0.75
+    args.tts_poll_interval = 0.2
+    args.tts_playback_timeout = min(float(args.tts_playback_timeout), 25.0)
+    args.music_wake_pause_timeout = min(float(args.music_wake_pause_timeout), 0.25)
+    args.camera_result_timeout = min(float(args.camera_result_timeout), 0.7 if args.force_vision else 0.35)
+    args.motor_step_delay = min(float(args.motor_step_delay), 0.2)
+    args.motor_smooth_step_deg = max(int(getattr(args, "motor_smooth_step_deg", MOTOR_SMOOTH_STEP_DEG) or MOTOR_SMOOTH_STEP_DEG), 12)
+    args.motor_reset_repeats = min(int(args.motor_reset_repeats), 3)
+    args.motor_reset_delay = min(float(args.motor_reset_delay), 0.12)
+    args.fast_reply = True
+    if int(getattr(args, "fast_reply_num_predict", 0) or 0) <= 0:
+        args.fast_reply_num_predict = 110
+    if getattr(args, "tts_length_scale", None) is None:
+        args.tts_length_scale = 0.86
+    print(
+        "Turbo response preset enabled: "
+        "silence=0.55s, max_speech=5s, max_recording=7s, "
+        "turn_timeout=4s, camera_wait<=0.35s, tts_poll=0.2s, "
+        "tts_length_scale=0.86, reply_num_predict=110."
+    )
+
+
+def validate_runtime_args(args: argparse.Namespace) -> bool:
+    if getattr(args, "conversation_mode", False) and getattr(args, "no_wake_word", False):
+        print("ERROR: --conversation-mode requires wake word standby. Remove --no-wake-word.")
+        return False
+    if getattr(args, "conversation_mode", False):
+        if float(getattr(args, "turn_listen_timeout", 0.0) or 0.0) <= 0:
+            print("ERROR: --turn-listen-timeout must be > 0 in --conversation-mode.")
+            return False
+        if int(getattr(args, "max_session_turns", 0) or 0) <= 0:
+            print("ERROR: --max-session-turns must be > 0 in --conversation-mode.")
+            return False
+    if float(getattr(args, "pre_record_image_delay", 0.0) or 0.0) < 0.0:
+        print("ERROR: --pre-record-image-delay must be >= 0.")
+        return False
+    if float(getattr(args, "speech_end_image_delay", 0.0) or 0.0) < 0.0:
+        print("ERROR: --speech-end-image-delay must be >= 0.")
+        return False
+    if float(getattr(args, "beep_retry_delay", 0.0) or 0.0) < 0.0:
+        print("ERROR: --beep-retry-delay must be >= 0.")
+        return False
+    if float(getattr(args, "music_wake_beep_settle", 0.0) or 0.0) < 0.0:
+        print("ERROR: --music-wake-beep-settle must be >= 0.")
+        return False
+    if float(getattr(args, "post_music_standby_cooldown", 0.0) or 0.0) < 0.0:
+        print("ERROR: --post-music-standby-cooldown must be >= 0.")
+        return False
+    if not getattr(args, "no_focus_mode", False):
+        if float(getattr(args, "focus_interval_sec", 0.0) or 0.0) <= 0.0:
+            print("ERROR: --focus-interval-sec must be > 0.")
+            return False
+        if int(getattr(args, "focus_alert_threshold", 0) or 0) < 1:
+            print("ERROR: --focus-alert-threshold must be >= 1.")
+            return False
+    return True
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     return add_wake_args(bridge.build_arg_parser())
 
@@ -3666,7 +5508,7 @@ def main() -> int:
         return 0
     if args.self_test:
         return run_self_test()
-    if args.test_head_motion:
+    if args.test_head_motion or args.test_head_emotion or args.test_speaking_head_motion:
         return run_head_motion_test(args)
     if args.device_preflight_only:
         device_preflight(args)
@@ -3675,6 +5517,9 @@ def main() -> int:
         return bridge.run_check_server(args)
     if args.text:
         return run_wake_text_mode(args)
+    apply_conversation_latency_preset(args)
+    if not validate_runtime_args(args):
+        return 2
     return run_wake_voice_loop(args)
 
 

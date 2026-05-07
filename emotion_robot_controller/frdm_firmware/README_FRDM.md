@@ -39,8 +39,8 @@ SMONITORCOMMAND sMonitorFuncList[] = {
     { "Sleep",      "<var 1> <var 2>", "switch to SLEEP",       SLEEPGui },
     { "Normal",     "<var 1> <var 2>", "switch to NORMAL",      NORMALGui },
     { "ShowNum",    "<var 1> <var 2>", "Print the input numbers", ShowNumber },
-    { "MotorPitch", "<var 1> <var 2>", "control motor P",       MotorControlPitch },
-    { "MotorYaw",   "<var 1> <var 2>", "control motor Y",       MotorControlYaw },
+    { "MotorPitch", "<angle>",         "control motor P",       MotorControlPitch },
+    { "MotorYaw",   "<angle>",         "control motor Y",       MotorControlYaw },
     { 0, 0, 0, 0 }
 };
 ```
@@ -54,8 +54,8 @@ SMONITORCOMMAND sMonitorFuncList[] = {
     { "Sleep",      "<var 1> <var 2>", "switch to SLEEP",       SLEEPGui },
     { "Normal",     "<var 1> <var 2>", "switch to NORMAL",      NORMALGui },
     { "ShowNum",    "<var 1> <var 2>", "Print the input numbers", ShowNumber },
-    { "MotorPitch", "<var 1> <var 2>", "control motor P",       MotorControlPitch },
-    { "MotorYaw",   "<var 1> <var 2>", "control motor Y",       MotorControlYaw },
+    { "MotorPitch", "<angle>",         "control motor P",       MotorControlPitch },
+    { "MotorYaw",   "<angle>",         "control motor Y",       MotorControlYaw },
     { "ERobot",     "<packet>",        "emotion robot packet",  EmotionRobotCommand },
     { 0, 0, 0, 0 }
 };
@@ -128,6 +128,61 @@ ServoRoll_GotoAngle(value);
 ```
 
 或讓 `Servo_GotoAngle(channel, value)` 支援不同 channel。
+
+目前 Jetson demo 送出的馬達指令是單一角度參數，例如 `MotorPitch 90` / `MotorYaw 90`。FRDM handler 必須把 `char *pValue` 轉成 int，不能直接把 `pValue` 當角度使用；否則 console 會印出像 `Motor Pitch = 537190203` 這種 SRAM 指標位址，馬達也會被錯誤值推到極限。
+
+```c
+#include <stdbool.h>
+
+static bool ParseMotorAngle(const char *pValue, int *out_angle)
+{
+    int angle = 0;
+
+    if (pValue == NULL || out_angle == NULL) {
+        return false;
+    }
+
+    /*
+     * Some SMONITORCOMMAND ports pass only the argument string ("90"),
+     * while others pass the whole line ("MotorPitch 90"). Support both.
+     */
+    if (sscanf(pValue, " %d", &angle) == 1 ||
+        sscanf(pValue, " %*s %d", &angle) == 1) {
+        *out_angle = angle;
+        return true;
+    }
+
+    return false;
+}
+
+void MotorControlPitch(char *pValue)
+{
+    int angle = 90;
+    PRINTF("Motor Pitch raw pValue = [%s]\r\n", pValue ? pValue : "(null)");
+    if (!ParseMotorAngle(pValue, &angle)) {
+        PRINTF("Motor Pitch parse failed: %s\r\n", pValue ? pValue : "(null)");
+        return;
+    }
+    if (angle < 65) angle = 65;
+    if (angle > 115) angle = 115;
+    PRINTF("Motor Pitch = %d\r\n", angle);
+    ServoPitch_GotoAngle(angle);
+}
+
+void MotorControlYaw(char *pValue)
+{
+    int angle = 90;
+    PRINTF("Motor Yaw raw pValue = [%s]\r\n", pValue ? pValue : "(null)");
+    if (!ParseMotorAngle(pValue, &angle)) {
+        PRINTF("Motor Yaw parse failed: %s\r\n", pValue ? pValue : "(null)");
+        return;
+    }
+    if (angle < 0) angle = 0;
+    if (angle > 180) angle = 180;
+    PRINTF("Motor Yaw = %d\r\n", angle);
+    ServoRoll_GotoAngle(angle);
+}
+```
 
 ## MCUXpresso 匯入方式
 

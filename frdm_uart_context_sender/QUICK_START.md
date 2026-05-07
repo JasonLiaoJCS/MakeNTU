@@ -1,4 +1,4 @@
-# Quick Start: Wake Voice Chat + Vision + FRDM UART + Music + Weather
+# Quick Start: Wake Bridge Full Demo + Vision + FRDM UART + Focus + Music + Weather
 
 這份文件是現場 demo 操作手冊。每次要從零啟動，先看 **0. 一頁照貼版**，照順序貼 Terminal 1/2/4/3 即可。Terminal 4 是 Jetson 本地工具視窗，負責音樂 `/music` 與天氣 `/weather`；Wake Bridge 也能自動啟動它，但正式 demo 建議開著。
 
@@ -36,21 +36,29 @@ Weather source    : Open-Meteo, default location=Taipei
 
 如果 Tailscale IP 變了，所有指令裡的 IP 要一起改。
 
-目前穩定版參數：
+目前完整功能穩定版參數：
 
 ```text
 wake_threshold=0.75
 wake_volume_min=350
-volume_min=700
+volume_min=900
+speech_start_margin=550
 silence_margin=650
 max_speech_seconds=5
 max_recording_seconds=7
 audio_read_timeout=0.75
 camera=auto 320x240 jpeg_quality=70
+image_capture=speech_end
+conversation_mode=on
+focus_work_mode=on, interval=180s, manual stop
 tts_poll_interval=0.75
 music_backend=mpv
 music_wake_pause_timeout=0.6
 weather_default_location=Taipei
+head_pitch=65..90..115 (down..center..up)
+head_yaw=0..90..180 (right..center..left)
+head_motor=enabled in Terminal 3 full demo, disable only for FRDM parser debugging
+head_motion=smooth interpolation, max 10deg per UART step
 ```
 
 這組偏向 demo 穩定與低延遲：現場吵也不會一輪卡太久，USB mic 停吐 audio chunk 時也會自動退出當輪。
@@ -89,6 +97,9 @@ Hey Jarvis，換成七里香
 Hey Jarvis，所在地天氣如何
 Hey Jarvis，明天下午三點台北天氣如何
 Hey Jarvis，今天會下雨嗎
+Hey Jarvis，開始專心工作
+Hey Jarvis，開始工作 25 分鐘 寫報告
+Hey Jarvis，結束工作
 ```
 
 音樂播放中只要偵測到 `Hey Jarvis`，Wake Bridge 會先暫停音樂，再開始錄你的下一句。
@@ -250,38 +261,58 @@ curl -X POST http://127.0.0.1:8788/weather \
 這個最後啟動。請整段複製，不要手打最後幾行。
 
 ```bash
-cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+cd /home/asrlab-yian/MakeNTU
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 
-python3 wake_voice_chat_frdm_bridge.py \
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
+  --beep-keyword UACDemo \
   --uart-port auto \
+  --uart-baudrate 115200 \
+  --enable-head-motor \
   --wake-threshold 0.75 \
   --wake-volume-min 350 \
-  --volume-min 700 \
+  --volume-min 900 \
+  --speech-start-margin 550 \
   --silence-duration 1.2 \
   --silence-margin 650 \
   --max-speech-seconds 5 \
   --max-recording-seconds 7 \
   --audio-read-timeout 0.75 \
   --recording-progress-interval 1.0 \
+  --conversation-mode \
+  --turn-listen-timeout 8 \
+  --session-idle-timeout 30 \
+  --max-session-turns 20 \
   --camera-id auto \
   --camera-width 320 \
   --camera-height 240 \
   --camera-jpeg-quality 70 \
   --camera-latest-timeout 1.0 \
   --camera-frame-max-age 2.0 \
+  --focus-script /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py \
+  --focus-server-url http://100.108.141.26:8766/focus-check \
+  --focus-interval-sec 180 \
+  --focus-duration-min 0 \
+  --focus-log-root /tmp/focus_voice_test \
+  --focus-alert-threshold 2 \
   --music-backend mpv \
   --music-timeout 5 \
   --music-wake-pause-timeout 0.6 \
+  --music-wake-beep-settle 0.18 \
+  --post-music-standby-cooldown 0.8 \
   --music-debug \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
-  --motor-step-delay 0.35 \
+  --motor-step-delay 0.80 \
+  --motor-smooth-step-deg 10 \
+  --motor-speaking-step-delay 0.75 \
+  --motor-speaking-smooth-step-deg 60 \
   --motor-reset-repeats 4 \
-  --motor-reset-delay 0.22 \
+  --motor-reset-delay 0.35 \
+  --motor-stop-timeout 6 \
   --motor-join-timeout 6 \
   --device-preflight-verbose \
   --tts-poll-interval 0.75 \
@@ -289,64 +320,197 @@ python3 wake_voice_chat_frdm_bridge.py \
   --uart-debug
 ```
 
+這是 Wake Bridge 完整功能版：wake word、連續對話、speech-end 拍照、FRDM UART、Piper TTS、Music、Weather、Focus Work Mode 都會開。第一次說 `Hey Jarvis` 後會進入 conversation mode，後續 follow-up 不用重複喚醒詞；說 `byebye / 掰掰 / 拜拜 / 再見`、音樂控制結束、或 focus mode 指令處理完後，會回到只聽喚醒詞的 standby。
+
+Terminal 3 預設就是完整功能版，包含頭部馬達；啟動指令內已經有 `--enable-head-motor`，所以 TTS 說話期間會依 `head_motion` 送 `MotorPitch` / `MotorYaw`。
+
+如果 FRDM parser 還在 debug、暫時不想讓馬達動，把指令中的 `--enable-head-motor \` 改成：
+
+```bash
+--disable-head-motor \
+```
+
+啟動成功時要看到：
+
+```text
+Head motor motion: enabled=True
+```
+
+如果只想一問一答、每次都要重新說 `Hey Jarvis`，把 `--conversation-mode`、`--turn-listen-timeout`、`--session-idle-timeout`、`--max-session-turns` 這四行拿掉。
+
+如果想要更激進低延遲，可以額外加 `--ultra-response`；如果講話中間常停頓被太早切句，改用比較保守的 `--turbo-response`。`fast_reply / num_predict` 需要 Windows Terminal 1 也使用最新版 `desktop_fast_chat_server.py` 並重啟；如果 Windows 還是舊 server，只會套用 Jetson 端的錄音/TTS/camera 加速。
+
+每次準備收音前都會先 beep；程式判定你講完時會再 beep 一聲，並在那一刻抓照片，跟該輪語音一起送到 Windows server。播音樂後下一次 `Hey Jarvis` 會先 pause 音樂、等 0.18 秒讓音訊裝置穩定，再播開始收音 beep；如果 UACDemo output 被 mpv 暫時佔住，會自動用 default output 重試 beep。說 `byebye / 掰掰 / 拜拜 / 再見` 後會送 `Sleep 0 0` 進入睡覺模式，並回到只聽喚醒詞的 standby；這之後你講一般話不會送 ASR/Ollama，下一次必須重新說 `Hey Jarvis`。
+
+音樂控制也會自動結束 conversation mode：播音樂或繼續播放後會進入 Sleep 並回到 wake-only standby；暫停或停止處理完也會回到 wake-only standby。所以下次要暫停、停止或換歌，都必須先說 `Hey Jarvis`。
+
+Focus Work Mode 指令也會自動結束 conversation mode，避免進入工作模式後還一直收 follow-up。開始後會立刻拍第一張工作狀態照片，之後每 `--focus-interval-sec 180` 秒取樣一次；照片預設只存在記憶體，判斷完就丟掉。`--focus-duration-min 0` 代表不自動結束，要再說「結束工作 / 停止專心 / 下班」才會停。
+
+不要把 `--conversation-mode` 和 `--no-wake-word` 一起用；程式會拒絕啟動，避免結束後仍然不用喚醒詞就錄音。
+
 ### 0.7 啟動成功最小判斷
 
 Terminal 3 看到這些就可以開始說 `Hey Jarvis`：
 
 ```text
-Server health: debug_version=10, chat_ready=True, asr_loaded=True
+Client version: wake_voice_chat_frdm_bridge_vision_conversation_motor_safe_v4
+Server health: debug_version=11, chat_ready=True, asr_loaded=True
 TTS health: ready=True
 Selected input device ... by keyword 'UACDemo'
 Selected beep output device ... by keyword 'UACDemo'
 Camera ready in continuous warm-reader mode
 Camera warm reader opened camera 0
-Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True
+Focus work mode: enabled, script=/home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py, interval=180s, duration_default=0min
+Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True, beep_settle=0.18s, post_music_cooldown=0.8s
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
-Head motor motion: step_delay=0.35s, reset_repeats=4, reset_delay=0.22s, read_ms=35, join_timeout=6s
+Head motor motion: enabled=True, smooth_step=10deg, step_delay=0.8s, speaking_step_delay=0.75s, speaking_smooth_step=60deg, reset_repeats=4, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
 Listening for wake word 'hey_jarvis'
 ```
 
-目前 Pitch 已縮小保護，`MotorPitch` 會被 clamp 在 `-4..4`，Yaw 維持原本 `-15..15`。如果 pitch 仍會卡死，先把程式常數 `MOTOR_PITCH_MIN/MAX` 再縮到 `-3..3`。
+目前馬達 UART 是絕對角度，不是相對位移：
+
+```text
+MotorPitch 65   -> 低頭極限
+MotorPitch 90   -> 中間
+MotorPitch 115  -> 抬頭極限
+
+MotorYaw 0      -> 右轉極限
+MotorYaw 90     -> 中間
+MotorYaw 180    -> 左轉極限
+```
+
+所有 head motion 結束都會多次回 `Pitch 90 / Yaw 90`。馬達 UART 只能送一個角度參數：`MotorPitch 90`、`MotorYaw 90`，不要送第二個數值。
+
+如果 TX 是正確的 `MotorPitch 90`，但 RX 變成：
+
+```text
+FRDM UART RX: Motor Pitch = 537190203
+FRDM UART RX: Motor Yaw = 537190201
+```
+
+這不是角度，是 FRDM 端沒有成功把 `char *pValue` 轉成 `90`，或 `sscanf` 失敗後用了未初始化的 `value`。先停馬達測試，修 FRDM firmware：`MotorControlPitch(char *pValue)` / `MotorControlYaw(char *pValue)` 裡要把 `value` 初始化、檢查 `sscanf` 回傳值，再 clamp 到 Pitch `65..115`、Yaw `0..180`。Terminal 3 預設會送頭部馬達；如果啟用後仍看到超出範圍的 ACK，當次程序會停送後續馬達指令，避免頭被錯誤值推到極限。需要暫時關閉馬達時，把 `--enable-head-motor` 改成 `--disable-head-motor`。
 
 ### 0.8 直接測 FRDM 頭部馬達
 
-如果頭沒有連續動作、沒有回正，先不要跑完整 Hey Jarvis 流程，直接測 UART 馬達：
+如果頭沒有連續動作、角度不對、或沒有回正，先不要跑完整 Hey Jarvis 流程，直接測 UART 馬達。這個模式不會開麥克風、相機、TTS、Windows server，只會碰 FRDM UART。
+
+如果 FRDM echo 有收到 `MotorYaw 90`，但 handler 印 `Motor Yaw = 0`，代表 UART 本身有送到，問題在 FRDM 端 handler 沒有從 `pValue` parse 到角度。先在 FRDM 裡印：
+
+```c
+PRINTF("Motor Yaw raw pValue = [%s]\r\n", pValue ? pValue : "(null)");
+```
+
+如果 raw pValue 是 `[MotorYaw 90]`，handler 不能只用 `sscanf(pValue, "%d", &value)`，要改成同時支援「純參數」和「整行命令」的 parser。
+
+先 dry-run 看全部 motion 會送什麼：
 
 ```bash
-cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+cd /home/asrlab-yian/MakeNTU
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 
-python3 wake_voice_chat_frdm_bridge.py \
-  --uart-port auto \
-  --uart-debug \
-  --test-head-motion nod
-```
-
-測全部動作：
-
-```bash
-python3 wake_voice_chat_frdm_bridge.py \
-  --uart-port auto \
-  --uart-debug \
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --test-head-motion all \
-  --motor-step-delay 0.35 \
-  --motor-reset-repeats 4 \
-  --motor-reset-delay 0.22
-```
-
-只看會送什麼、不真的動馬達：
-
-```bash
-python3 wake_voice_chat_frdm_bridge.py \
   --uart-dry-run \
-  --test-head-motion all
+  --uart-debug \
+  --motor-step-delay 0.02 \
+  --motor-smooth-step-deg 10 \
+  --motor-reset-delay 0.02 \
+  --test-head-gap 0
 ```
 
-這個模式不會開麥克風、相機、TTS、Windows server，只會碰 FRDM UART。若看到 `No UART serial device is visible`，代表 FRDM 沒接上或 `/dev/ttyACM0` 消失，先跑：
+你應該會看到類似：
+
+```text
+Motor settings: pitch=65..90..115 (down..center..up), yaw=0..90..180 (right..center..left), smooth_step=10deg
+Testing head motion: nod
+head motion keyframes: MotorPitch:90 -> MotorPitch:106 -> MotorPitch:106 -> MotorPitch:74 -> MotorPitch:74 -> MotorPitch:90
+head motion expanded: MotorPitch:90 -> MotorPitch:98 -> MotorPitch:106 -> MotorPitch:106 -> MotorPitch:98 -> MotorPitch:90 -> MotorPitch:82 -> MotorPitch:74 -> MotorPitch:74 -> MotorPitch:82 -> MotorPitch:90
+FRDM UART dry-run TX: MotorPitch 90
+FRDM UART dry-run TX: MotorPitch 98
+FRDM UART dry-run TX: MotorPitch 106
+FRDM UART dry-run TX: MotorPitch 106
+FRDM UART dry-run TX: MotorPitch 98
+FRDM UART dry-run TX: MotorPitch 90
+FRDM UART dry-run TX: MotorPitch 82
+FRDM UART dry-run TX: MotorPitch 74
+FRDM UART dry-run TX: MotorPitch 74
+FRDM UART dry-run TX: MotorPitch 82
+FRDM UART dry-run TX: MotorPitch 90
+FRDM UART dry-run TX: MotorYaw 90
+```
+
+再測「情緒會不會自動對應頭部動作」：
 
 ```bash
-python3 wake_voice_chat_frdm_bridge.py --list-uarts
-./recover_demo_usb.sh
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
+  --test-head-emotion all \
+  --uart-dry-run \
+  --uart-debug \
+  --motor-step-delay 0.02 \
+  --motor-smooth-step-deg 10 \
+  --motor-reset-delay 0.02 \
+  --test-head-gap 0
+```
+
+情緒 fallback 對應表：
+
+```text
+neutral   -> none
+happy     -> nod
+curious   -> look_around
+excited   -> double_nod
+confused  -> shake
+concerned -> gentle_nod
+sleepy    -> sleepy_drop
+```
+
+FRDM firmware 修好、手動確認 `MotorPitch 90` 會回 `Motor Pitch = 90` 之後，才實機測「講話期間循環動作」：
+
+```bash
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
+  --uart-port auto \
+  --uart-debug \
+  --enable-head-motor \
+  --test-speaking-head-motion shake \
+  --test-speaking-seconds 6 \
+  --motor-speaking-step-delay 0.75 \
+  --motor-speaking-smooth-step-deg 60 \
+  --motor-reset-repeats 4 \
+  --motor-reset-delay 0.35
+```
+
+FRDM ACK 正常後，再實機測一次性 motion table：
+
+```bash
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
+  --uart-port auto \
+  --uart-debug \
+  --enable-head-motor \
+  --test-head-motion all \
+  --motor-step-delay 0.80 \
+  --motor-smooth-step-deg 10 \
+  --motor-reset-repeats 4 \
+  --motor-reset-delay 0.35
+```
+
+現場調參：
+
+```text
+看起來只轉一次、不連續      -> --motor-smooth-step-deg 6 或 8
+講話時動作太快              -> --motor-speaking-step-delay 0.9 或 1.0
+講話時動作太少              -> --motor-speaking-step-delay 0.55
+一次性測試動作太快          -> --motor-step-delay 1.0
+一次性測試太慢              -> --motor-step-delay 0.6
+偶爾沒有回正                -> --motor-reset-repeats 5
+回正指令太密或 FRDM 吃不穩   -> --motor-reset-delay 0.45
+TTS 結束後太早切 Normal/Sleep -> --motor-join-timeout 8
+```
+
+若看到 `No UART serial device is visible`，代表 FRDM 沒接上或 `/dev/ttyACM0` 消失，先跑：
+
+```bash
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --list-uarts
+./frdm_uart_context_sender/recover_demo_usb.sh
 ```
 
 ### 0.9 一輪互動正常 log
@@ -354,7 +518,7 @@ python3 wake_voice_chat_frdm_bridge.py --list-uarts
 ```text
 Wake detected
 Music wake pause: ok=True action=pause ...
-beep played
+Recording beep played.
 FRDM UART TX: Thinking 0 0
 Recording progress: phase=speech ...
 POST audio+image ...
@@ -436,7 +600,7 @@ cd "$env:USERPROFILE\Desktop\windows_desktop_server_bundle"
 python desktop_fast_chat_server.py --self-test
 ```
 
-同步後一定要重啟 Windows server，health 要看到 `debug_version: 10`。
+同步後一定要重啟 Windows server，health 要看到 `debug_version: 11`。
 
 ### 1.3 軟體 Self-Test
 
@@ -445,9 +609,10 @@ python desktop_fast_chat_server.py --self-test
 Jetson：
 
 ```bash
-cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+cd /home/asrlab-yian/MakeNTU
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-python3 wake_voice_chat_frdm_bridge.py --self-test
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --self-test
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --test-head-emotion all --uart-dry-run --uart-debug --motor-step-delay 0.02 --motor-smooth-step-deg 10 --motor-reset-delay 0.02 --test-head-gap 0
 ```
 
 Windows PowerShell：
@@ -545,38 +710,58 @@ python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv 
 請整段複製貼上，尤其最後三行不要手打錯。
 
 ```bash
-cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+cd /home/asrlab-yian/MakeNTU
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 
-python3 wake_voice_chat_frdm_bridge.py \
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
+  --beep-keyword UACDemo \
   --uart-port auto \
+  --uart-baudrate 115200 \
+  --enable-head-motor \
   --wake-threshold 0.75 \
   --wake-volume-min 350 \
-  --volume-min 700 \
+  --volume-min 900 \
+  --speech-start-margin 550 \
   --silence-duration 1.2 \
   --silence-margin 650 \
   --max-speech-seconds 5 \
   --max-recording-seconds 7 \
   --audio-read-timeout 0.75 \
   --recording-progress-interval 1.0 \
+  --conversation-mode \
+  --turn-listen-timeout 8 \
+  --session-idle-timeout 30 \
+  --max-session-turns 20 \
   --camera-id auto \
   --camera-width 320 \
   --camera-height 240 \
   --camera-jpeg-quality 70 \
   --camera-latest-timeout 1.0 \
   --camera-frame-max-age 2.0 \
+  --focus-script /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py \
+  --focus-server-url http://100.108.141.26:8766/focus-check \
+  --focus-interval-sec 180 \
+  --focus-duration-min 0 \
+  --focus-log-root /tmp/focus_voice_test \
+  --focus-alert-threshold 2 \
   --music-backend mpv \
   --music-timeout 5 \
   --music-wake-pause-timeout 0.6 \
+  --music-wake-beep-settle 0.18 \
+  --post-music-standby-cooldown 0.8 \
   --music-debug \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
-  --motor-step-delay 0.35 \
+  --motor-step-delay 0.80 \
+  --motor-smooth-step-deg 10 \
+  --motor-speaking-step-delay 0.75 \
+  --motor-speaking-smooth-step-deg 60 \
   --motor-reset-repeats 4 \
-  --motor-reset-delay 0.22 \
+  --motor-reset-delay 0.35 \
+  --motor-stop-timeout 6 \
   --motor-join-timeout 6 \
   --device-preflight-verbose \
   --tts-poll-interval 0.75 \
@@ -610,7 +795,7 @@ speech_start_threshold = max(volume_min, noise_floor + speech_start_margin)
 silence_threshold      = max(volume_min, noise_floor + silence_margin, peak_volume * silence_peak_ratio)
 ```
 
-所以吵的環境不會只因背景音量高於 `--volume-min 700` 就一路錄到最長秒數。
+所以吵的環境不會只因背景音量高於 `--volume-min 900` 就一路錄到最長秒數。
 正式預設 `max_speech_seconds=5`，避免真的開始說話後錄太久；`max_recording_seconds=7` 是從 wake 被接受開始算的硬上限，就算現場太吵、speech start 判斷怪掉，也會退出回 standby；`audio_read_timeout=0.75` 是 USB mic watchdog，若 mic stream 停止吐 audio chunk，Python 不會卡在 blocking read；`recording_progress_interval=1.0` 會每秒印一行錄音狀態；`tts_poll_interval=0.75` 會降低 TTS `/queue` 查詢頻率，避免 Terminal 2 被 log 洗版。
 
 錄音 log 快速判讀：
@@ -627,7 +812,7 @@ audio chunk warning  -> USB mic 暫時沒吐資料，watchdog 會讓當輪退出
 Windows server health：
 
 ```text
-debug_version: 10
+debug_version: 11
 chat_ready   : True
 asr_loaded   : True
 ollama_model : qwen35-fast:latest
@@ -646,15 +831,16 @@ Jetson bridge：
 ```text
 Device preflight: releasing stale demo device owners.
 Device preflight: target devices look free.
+Client version: wake_voice_chat_frdm_bridge_vision_conversation_motor_safe_v4
 Selected input device ... by keyword 'UACDemo'.
 Selected beep output device ... by keyword 'UACDemo'.
 Camera ready in continuous warm-reader mode.
 Camera warm reader opened camera 0.
-Adaptive recording gate: on, noise_p75, speech_margin=350, silence_margin=650, peak_ratio=0.35
+Adaptive recording gate: on, noise_p75, speech_margin=550, silence_margin=650, peak_ratio=0.35
 Audio read watchdog: callback queue, timeout=0.75s, progress_interval=1s
-Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True
+Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True, beep_settle=0.18s, post_music_cooldown=0.8s
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
-Head motor motion: step_delay=0.35s, reset_repeats=4, reset_delay=0.22s, read_ms=35, join_timeout=6s
+Head motor motion: enabled=True, smooth_step=10deg, step_delay=0.8s, speaking_step_delay=0.75s, speaking_smooth_step=60deg, reset_repeats=4, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
 TTS queue polling: every 0.75s, playback_timeout=45s
 USB auto-discovery: mic=keyword 'UACDemo'; beep=keyword 'UACDemo'; camera=auto; FRDM UART=auto
 Listening for wake word 'hey_jarvis'
@@ -666,7 +852,7 @@ Listening for wake word 'hey_jarvis'
 Wake detected
 Music wake pause: ok=True action=pause stopped=True post_ms=...
 Recording thresholds: noise_floor=..., speech_start_threshold=..., silence_base_threshold=..., adaptive=on
-beep played
+Recording beep played.
 FRDM UART TX: Thinking 0 0
 Recording. Speak now
 Recording progress: phase=...
@@ -814,7 +1000,7 @@ Hey Jarvis，停止音樂。
 暫停音樂       -> Music tool action=pause paused=True
 繼續播放音樂   -> TTS 結束後 Music tool action=resume resumed=True
 停止音樂       -> Music tool action=stop stopped=True
-Hey Jarvis wake -> 先 Music wake pause，再 beep/recording
+Hey Jarvis wake -> 先 Music wake pause，等 0.18s，再 beep 並開始 recording；講完時再 beep + 抓圖
 ```
 
 手動測 Music Player 本身：
@@ -891,10 +1077,10 @@ curl http://127.0.0.1:8777/health
 curl http://127.0.0.1:8788/health
 curl -X POST http://127.0.0.1:8788/weather -H "Content-Type: application/json" -d '{"text":"所在地天氣如何","default_location":"Taipei"}'
 
-cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+cd /home/asrlab-yian/MakeNTU
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-python3 wake_voice_chat_frdm_bridge.py --list-mics
-python3 wake_voice_chat_frdm_bridge.py --list-uarts
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --list-mics
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --list-uarts
 lsusb
 ls -l /dev/video* /dev/ttyACM* 2>/dev/null
 ```
@@ -961,10 +1147,10 @@ python -m jetson_piper_tts.server --host 0.0.0.0 --port 8777 --no-warmup
 如果 camera 不穩，先用這個確認 wake / ASR / TTS / UART：
 
 ```bash
-cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
+cd /home/asrlab-yian/MakeNTU
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 
-python3 wake_voice_chat_frdm_bridge.py \
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
   --uart-port auto \
@@ -972,7 +1158,8 @@ python3 wake_voice_chat_frdm_bridge.py \
   --no-beep \
   --wake-threshold 0.75 \
   --wake-volume-min 350 \
-  --volume-min 700 \
+  --volume-min 900 \
+  --speech-start-margin 550 \
   --silence-duration 1.2 \
   --silence-margin 650 \
   --max-speech-seconds 5 \
@@ -989,14 +1176,15 @@ python3 wake_voice_chat_frdm_bridge.py \
 強制每次有圖就看圖，用來測 camera -> server -> qwen35-fast vision：
 
 ```bash
-python3 wake_voice_chat_frdm_bridge.py \
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
   --uart-port auto \
   --force-vision \
   --wake-threshold 0.75 \
   --wake-volume-min 350 \
-  --volume-min 700 \
+  --volume-min 900 \
+  --speech-start-margin 550 \
   --silence-duration 1.2 \
   --silence-margin 650 \
   --max-speech-seconds 5 \
@@ -1015,14 +1203,15 @@ python3 wake_voice_chat_frdm_bridge.py \
 完全關閉 camera 和 vision：
 
 ```bash
-python3 wake_voice_chat_frdm_bridge.py \
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
   --uart-port auto \
   --no-vision \
   --wake-threshold 0.75 \
   --wake-volume-min 350 \
-  --volume-min 700 \
+  --volume-min 900 \
+  --speech-start-margin 550 \
   --silence-duration 1.2 \
   --silence-margin 650 \
   --max-speech-seconds 5 \
@@ -1048,7 +1237,7 @@ python3 wake_voice_chat_frdm_bridge.py \
 
 ```bash
 lsusb
-python3 wake_voice_chat_frdm_bridge.py --list-mics
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --list-mics
 ```
 
 如果 `lsusb` 看不到 UACDemo，跑：
@@ -1065,7 +1254,7 @@ cd /home/asrlab-yian/MakeNTU/frdm_uart_context_sender
 正式 bridge 預設會清掉舊 wake bridge、camera 測試、`aplay` / `mpv` 等占用 demo 裝置的 process。如果想先確認清單，不真的 kill：
 
 ```bash
-python3 wake_voice_chat_frdm_bridge.py \
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --mic-keyword UACDemo \
   --uart-port auto \
   --device-preflight-only \
@@ -1128,16 +1317,16 @@ Recording progress: phase=waiting_speech, elapsed=..., volume=..., start_thresho
 現場很吵時可以直接用這組覆蓋值：
 
 ```text
---speech-start-margin 450 --silence-margin 650 --max-speech-seconds 5 --max-recording-seconds 7 --audio-read-timeout 0.75 --recording-progress-interval 1.0
+--speech-start-margin 550 --silence-margin 650 --max-speech-seconds 5 --max-recording-seconds 7 --audio-read-timeout 0.75 --recording-progress-interval 1.0
 ```
 
-如果變成「叫醒後你說話也不開始錄」，把 `--speech-start-margin` 從 450 降回 300 或 250。
+如果變成「叫醒後你說話也不開始錄」，把 `--speech-start-margin` 從 550 降回 300 或 250。
 
 錄音調參表：
 
 ```text
 漏收你的聲音              -> --speech-start-margin 250
-背景音太容易觸發 speech   -> --speech-start-margin 450
+背景音太容易觸發 speech   -> --speech-start-margin 650
 speech 後一直停不下來     -> --silence-margin 800
 想更快送出                -> --max-speech-seconds 4
 整輪 wake 後不想等太久    -> --max-recording-seconds 6
@@ -1220,7 +1409,7 @@ ollama pull qwen35-fast:latest
 
 再重啟 Terminal 1。
 
-### debug_version 不是 10
+### debug_version 不是 11
 
 重新 scp 同步，關掉舊 server，重開 Terminal 1。
 
@@ -1312,7 +1501,7 @@ Ollama error          -> Windows qwen35-fast / Ollama 有問題
 ### FRDM 沒反應
 
 ```bash
-python3 wake_voice_chat_frdm_bridge.py --list-uarts
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --list-uarts
 lsusb
 ls -l /dev/ttyACM* /dev/serial/by-id/* 2>/dev/null
 ```
@@ -1343,7 +1532,7 @@ Windows：
 ```text
 [ ] 已同步 desktop_fast_chat_server.py
 [ ] ollama list 有 qwen35-fast:latest
-[ ] server health debug_version=10
+[ ] server health debug_version=11
 [ ] vision_model=qwen35-fast:latest
 ```
 

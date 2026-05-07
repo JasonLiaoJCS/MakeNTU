@@ -210,13 +210,17 @@ JSON schema:
 分類規則：
 - focused：使用者人在座位上，姿勢像在工作、看螢幕、打字、寫字或閱讀工作內容。
 - away：座位附近沒有清楚看到使用者。
-- phone：明顯拿著或低頭看手機，且不像是工作用設備。
+- phone：明顯拿著手持手機，或低頭看一個小型手持手機，且不像是工作用設備。
 - sleeping：趴在桌上、閉眼、頭部明顯垂落，或像是在睡覺。
 - distracted：人在座位上，但明顯在做與工作無關的事、長時間看向別處或互動對象不在工作區。
 - uncertain：畫面模糊、遮擋、角度不足、臉或身體太少，或無法可靠判斷。
 
 判斷原則：
 - 只根據可見行為，不要猜測身分、年齡、健康狀況或敏感屬性。
+- 使用者看電腦螢幕、筆電、外接螢幕、鍵盤、滑鼠、文件、平板或工作桌面時，通常判為 focused，不要判為 phone。
+- 若看起來像是在操作筆電/桌機，或手放在鍵盤滑鼠附近，即使頭稍微低下也優先判為 focused。
+- 只有在能清楚看到「小型手持手機」且使用者注意力集中在手機上時，才選 phone。
+- 如果無法分辨是手機、平板、筆電螢幕或桌面設備，選 uncertain 或 focused，不要硬判 phone。
 - 不確定就選 uncertain，不要硬判斷。
 - confidence 是你對 state 的信心，0 到 1。
 - attention_score 是看起來專心工作的程度，0 到 1；away/sleeping/phone 通常偏低。
@@ -812,6 +816,51 @@ class FastChatEmotionEngine:
             },
         }
 
+    def focus_user_content(self, metadata: dict[str, Any], use_no_think: bool) -> str:
+        task = str(metadata.get("task", "") or "").strip()
+        interval_sec = str(metadata.get("interval_sec", "") or "").strip()
+        session_id = str(metadata.get("session_id", "") or "").strip()
+        parts = ["請根據這張相機畫面判斷使用者此刻的工作狀態，依照 system schema 只輸出 JSON object。"]
+        if task:
+            parts.append(f"本次工作目標：{task}")
+        if interval_sec:
+            parts.append(f"取樣間隔秒數：{interval_sec}")
+        if session_id:
+            parts.append(f"session_id：{session_id}")
+        content = "\n".join(parts)
+        if use_no_think:
+            content = "/no_think\n" + content
+        return content
+
+    def build_focus_payload(
+        self,
+        image_bytes: bytes,
+        *,
+        metadata: dict[str, Any],
+        model: str,
+        use_no_think: bool,
+    ) -> dict[str, Any]:
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        return {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": FOCUS_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": self.focus_user_content(metadata, use_no_think),
+                    "images": [image_b64],
+                },
+            ],
+            "stream": False,
+            "think": False,
+            "keep_alive": "30m",
+            "options": {
+                "temperature": 0.1,
+                "num_ctx": 4096,
+                "num_predict": 180,
+            },
+        }
+
     def warm_up(self) -> None:
         print(f"Ollama warm-up: model={self.model}, no_think={self.no_think}")
         result = self.analyze("你好，聽得到我說話嗎？")
@@ -1067,6 +1116,107 @@ class FastChatEmotionEngine:
             set_last_debug(text_debug)
             return text_result
 
+    def analyze_focus_image(
+        self,
+        image_bytes: bytes,
+        *,
+        metadata: dict[str, Any] | None = None,
+        request_id: str = "",
+        model: str = DEFAULT_VISION_MODEL,
+        timeout_sec: float = 180.0,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        request_id = request_id or uuid.uuid4().hex[:8]
+        metadata = metadata if isinstance(metadata, dict) else {}
+        debug: dict[str, Any] = {
+            "request_id": request_id,
+            "timestamp": now_stamp(),
+            "ollama_url": self.url,
+            "ollama_model": model,
+            "text_ollama_model": self.model,
+            "focus_requested": True,
+            "image_bytes": len(image_bytes),
+            "no_think": self.no_think,
+            "think": False,
+            "stage": "focus_ollama_request",
+            "session_id": metadata.get("session_id"),
+            "task_preview": short_text(str(metadata.get("task", "") or ""), 120),
+        }
+        payload = self.build_focus_payload(
+            image_bytes,
+            metadata=metadata,
+            model=model,
+            use_no_think=self.no_think,
+        )
+        try:
+            print(f"focus-check {request_id}: calling vision model={model} image_bytes={len(image_bytes)}")
+            response = post_json_with_debug(self.url, payload, timeout_sec=timeout_sec)
+            debug["stage"] = "focus_ollama_response"
+            if "error" in response:
+                raise RuntimeError(f"Ollama focus error: {short_text(str(response.get('error', 'unknown error')))}")
+
+            debug.update(summarize_ollama_response(response))
+            content = extract_ollama_text(response)
+            if not content.strip() and self.no_think:
+                debug["retry_reason"] = "empty focus content with /no_think; retrying without /no_think"
+                retry_payload = self.build_focus_payload(
+                    image_bytes,
+                    metadata=metadata,
+                    model=model,
+                    use_no_think=False,
+                )
+                response = post_json_with_debug(self.url, retry_payload, timeout_sec=timeout_sec)
+                debug["retried_without_no_think"] = True
+                if "error" in response:
+                    raise RuntimeError(f"Ollama focus retry error: {short_text(str(response.get('error', 'unknown error')))}")
+                debug.update({f"retry_{key}": value for key, value in summarize_ollama_response(response).items()})
+                content = extract_ollama_text(response)
+
+            parsed = extract_json_object(content)
+            result = normalize_focus_result(parsed, reason="focus vision")
+            debug.update(
+                {
+                    "ok": True,
+                    "ollama_done": response.get("done"),
+                    "ollama_content_chars": len(content),
+                    "ollama_content_preview": short_text(strip_thinking_text(content), 500),
+                    "focus_state": result["state"],
+                    "focus_confidence": result["confidence"],
+                    "focus_attention_score": result["attention_score"],
+                }
+            )
+            result.update(
+                {
+                    "request_id": request_id,
+                    "timing": {"focus_ms": elapsed_ms(started), "llm_ms": elapsed_ms(started)},
+                    "debug": debug,
+                }
+            )
+            set_last_debug(debug)
+            return result
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
+            reason = f"Focus vision failed: {short_error(exc)}"
+            print(f"WARN: {reason}")
+            debug.update(
+                {
+                    "ok": False,
+                    "stage": "focus_exception",
+                    "fallback_reason": reason,
+                    "exception_type": exc.__class__.__name__,
+                }
+            )
+            result = normalize_focus_result({"state": "error", "summary": reason}, reason=reason)
+            result.update(
+                {
+                    "request_id": request_id,
+                    "timing": {"focus_ms": elapsed_ms(started), "llm_ms": elapsed_ms(started)},
+                    "debug": debug,
+                    "fallback_reason": reason,
+                }
+            )
+            set_last_debug(debug)
+            return result
+
 
 def strip_reply(content: str) -> str:
     text = strip_thinking_text(content)
@@ -1124,6 +1274,63 @@ def clamp_float(value: Any, default: float, minimum: float, maximum: float) -> f
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, number))
+
+
+def normalize_focus_result(raw: Any, *, reason: str = "focus fallback") -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    state = str(source.get("state", "uncertain")).strip().lower()
+    if state not in FOCUS_STATES:
+        state = "uncertain"
+
+    default_attention = {
+        "focused": 0.9,
+        "away": 0.0,
+        "phone": 0.2,
+        "sleeping": 0.05,
+        "distracted": 0.35,
+        "uncertain": 0.4,
+        "error": 0.0,
+    }.get(state, 0.4)
+    evidence_raw = source.get("evidence")
+    evidence: list[str] = []
+    if isinstance(evidence_raw, list):
+        evidence = [str(item).strip() for item in evidence_raw if str(item).strip()][:5]
+    elif isinstance(evidence_raw, str) and evidence_raw.strip():
+        evidence = [evidence_raw.strip()]
+
+    person_present_raw = source.get("person_present")
+    person_present = person_present_raw if isinstance(person_present_raw, bool) else state not in {"away", "error"}
+    summary = str(source.get("summary", "")).strip()
+    if not summary:
+        summary = {
+            "focused": "看起來正在專心工作。",
+            "away": "座位附近沒有清楚看到使用者。",
+            "phone": "畫面顯示使用者可能正在看手機。",
+            "sleeping": "畫面顯示使用者可能在休息或睡著。",
+            "distracted": "使用者在座位上，但看起來沒有專注在工作。",
+            "uncertain": "畫面不足以可靠判斷工作狀態。",
+            "error": reason,
+        }.get(state, "畫面不足以可靠判斷工作狀態。")
+
+    recommended_robot = {
+        "focused": "Thinking",
+        "away": "Sleep",
+        "phone": "Concerned",
+        "sleeping": "Sleepy",
+        "distracted": "Concerned",
+        "uncertain": "Confused",
+        "error": "Confused",
+    }.get(state, "Confused")
+
+    return {
+        "state": state,
+        "confidence": clamp_float(source.get("confidence"), 0.35 if state == "uncertain" else 0.5, 0.0, 1.0),
+        "attention_score": clamp_float(source.get("attention_score"), default_attention, 0.0, 1.0),
+        "person_present": person_present,
+        "evidence": evidence,
+        "summary": summary,
+        "recommended_robot": recommended_robot,
+    }
 
 
 def parse_metadata(raw: str | None) -> dict[str, Any]:
@@ -1244,6 +1451,21 @@ def run_self_test() -> int:
     if unavailable["control"]["emotion"] != "confused" or unavailable["control"]["head_motion"] != "shake":
         raise AssertionError(f"vision unavailable control should be confused/shake: {unavailable['control']}")
 
+    focus = normalize_focus_result(
+        {
+            "state": "phone",
+            "confidence": 1.2,
+            "attention_score": -1,
+            "person_present": True,
+            "evidence": ["低頭看手持裝置", "視線不在螢幕"],
+        },
+        reason="self-test",
+    )
+    if focus["state"] != "phone" or focus["confidence"] != 1.0 or focus["attention_score"] != 0.0:
+        raise AssertionError(f"bad focus normalization: {focus}")
+    if focus["recommended_robot"] != "Concerned":
+        raise AssertionError(f"bad focus robot command: {focus}")
+
     print("desktop_fast_chat_server self-test OK")
     print(f"debug_version={DEBUG_VERSION}, model={DEFAULT_FAST_MODEL}, vision_model={DEFAULT_VISION_MODEL}")
     return 0
@@ -1265,7 +1487,7 @@ def health() -> Any:
             "vision_model": vision_model,
             "force_vision": server_force_vision,
             "max_image_bytes": max_image_bytes,
-            "routes": ["/health", "/debug", "/text-chat", "/voice-chat"],
+            "routes": ["/health", "/debug", "/text-chat", "/voice-chat", "/focus-check"],
             "last_debug": last_debug,
             "debug_log": str(debug_log_path) if debug_log_path is not None else None,
         }
@@ -1302,6 +1524,41 @@ def text_chat() -> Any:
     timing = result.setdefault("timing", {})
     timing["total_ms"] = elapsed_ms(started)
     return jsonify({"ok": True, "transcript": transcript, **result, "elapsed_ms": elapsed_ms(started)})
+
+
+@app.post("/focus-check")
+def focus_check() -> Any:
+    started = time.monotonic()
+    request_id = uuid.uuid4().hex[:8]
+    if chat_engine is None:
+        return jsonify({"ok": False, "request_id": request_id, "error": "server not ready"}), 503
+    if not vision_enabled:
+        return jsonify({"ok": False, "request_id": request_id, "error": "vision disabled"}), 503
+
+    image_upload = request.files.get("image")
+    metadata = parse_metadata(request.form.get("metadata"))
+    image_bytes, image_error = read_optional_image_bytes(image_upload)
+    if not image_bytes:
+        return jsonify({"ok": False, "request_id": request_id, "error": image_error or "image unavailable"}), 400
+
+    result = chat_engine.analyze_focus_image(
+        image_bytes,
+        metadata=metadata,
+        request_id=request_id,
+        model=vision_model,
+        timeout_sec=vision_timeout_sec,
+    )
+    timing = result.setdefault("timing", {})
+    timing["total_ms"] = elapsed_ms(started)
+    result["image_received"] = True
+    result["image_size_bytes"] = len(image_bytes)
+    result["vision_model"] = vision_model
+    result["metadata"] = {
+        "session_id": metadata.get("session_id"),
+        "task": metadata.get("task"),
+        "interval_sec": metadata.get("interval_sec"),
+    }
+    return jsonify({"ok": result.get("state") != "error", **result, "elapsed_ms": elapsed_ms(started)})
 
 
 @app.post("/voice-chat")

@@ -76,11 +76,12 @@ DEFAULT_FAST_MODEL = "qwen35-fast:latest"
 DEFAULT_VISION_MODEL = "qwen35-fast:latest"
 VISION_FALLBACK_MODELS: tuple[str, ...] = ()
 DEFAULT_MAX_IMAGE_BYTES = 2_000_000
-DEBUG_VERSION = 10
+DEBUG_VERSION = 11
 
 CONTROL_PERSISTENT_STATES = {"normal", "sleep", "unchanged"}
 CONTROL_EMOTIONS = {"neutral", "happy", "curious", "excited", "confused", "concerned", "sleepy"}
 CONTROL_HEAD_MOTIONS = {"none", "nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop"}
+FOCUS_STATES = {"focused", "away", "phone", "sleeping", "distracted", "uncertain", "error"}
 
 EMOTIONS = sorted(CONTROL_EMOTIONS)
 
@@ -189,6 +190,41 @@ control 規則：
 - 使用者問自己是否疲憊、表情是否不好、狀態是否低落時，若畫面合理可用 emotion="concerned", head_motion="gentle_nod"。
 - 看不清楚、無法判斷時 emotion="confused", head_motion="shake"。
 - 睡覺/起床意圖仍依照 persistent_state 規則處理。
+""".strip()
+
+FOCUS_SYSTEM_PROMPT = """
+你是桌上寵物機器人的「專心工作模式」視覺狀態分類器。輸入是一張使用者工作區的相機畫面。
+
+你必須只輸出一個 JSON object，不要 markdown，不要 code fence，不要額外文字。
+
+JSON schema:
+{
+  "state": "focused | away | phone | sleeping | distracted | uncertain",
+  "confidence": 0.0,
+  "attention_score": 0.0,
+  "person_present": true,
+  "evidence": ["簡短可見線索"],
+  "summary": "一句繁體中文摘要"
+}
+
+分類規則：
+- focused：使用者人在座位上，姿勢像在工作、看螢幕、打字、寫字或閱讀工作內容。
+- away：座位附近沒有清楚看到使用者。
+- phone：明顯拿著手持手機，或低頭看一個小型手持手機，且不像是工作用設備。
+- sleeping：趴在桌上、閉眼、頭部明顯垂落，或像是在睡覺。
+- distracted：人在座位上，但明顯在做與工作無關的事、長時間看向別處或互動對象不在工作區。
+- uncertain：畫面模糊、遮擋、角度不足、臉或身體太少，或無法可靠判斷。
+
+判斷原則：
+- 只根據可見行為，不要猜測身分、年齡、健康狀況或敏感屬性。
+- 使用者看電腦螢幕、筆電、外接螢幕、鍵盤、滑鼠、文件、平板或工作桌面時，通常判為 focused，不要判為 phone。
+- 若看起來像是在操作筆電/桌機，或手放在鍵盤滑鼠附近，即使頭稍微低下也優先判為 focused。
+- 只有在能清楚看到「小型手持手機」且使用者注意力集中在手機上時，才選 phone。
+- 如果無法分辨是手機、平板、筆電螢幕或桌面設備，選 uncertain 或 focused，不要硬判 phone。
+- 不確定就選 uncertain，不要硬判斷。
+- confidence 是你對 state 的信心，0 到 1。
+- attention_score 是看起來專心工作的程度，0 到 1；away/sleeping/phone 通常偏低。
+- evidence 最多 5 個短句，只描述可見線索。
 """.strip()
 
 VISION_INTENT_KEYWORDS = (
@@ -702,20 +738,29 @@ class FastChatEmotionEngine:
         self.model = model
         self.no_think = no_think
 
-    def user_content(self, transcript: str, use_no_think: bool) -> str:
+    def user_content(self, transcript: str, use_no_think: bool, *, fast_reply: bool = False) -> str:
         content = f"""使用者原話：{transcript}
 
 請依照 system schema，只輸出 JSON object。reply 欄位必須是自然語言，不可混入控制資訊。"""
+        if fast_reply:
+            content += "\n請讓 reply 儘量短，優先用繁體中文一句話回答，除非使用者明確要求詳細說明。"
         if use_no_think:
             content = "/no_think\n" + content
         return content
 
-    def build_payload(self, transcript: str, use_no_think: bool) -> dict[str, Any]:
+    def build_payload(
+        self,
+        transcript: str,
+        use_no_think: bool,
+        *,
+        num_predict: int = 220,
+        fast_reply: bool = False,
+    ) -> dict[str, Any]:
         return {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": self.user_content(transcript, use_no_think)},
+                {"role": "user", "content": self.user_content(transcript, use_no_think, fast_reply=fast_reply)},
             ],
             "stream": False,
             "think": False,
@@ -723,12 +768,19 @@ class FastChatEmotionEngine:
             "options": {
                 "temperature": 0.65,
                 "num_ctx": 4096,
-                "num_predict": 220,
+                "num_predict": clamp_int(num_predict, 220, 32, 220),
             },
         }
 
-    def build_generate_payload(self, transcript: str, use_no_think: bool) -> dict[str, Any]:
-        prompt = self.user_content(transcript, use_no_think)
+    def build_generate_payload(
+        self,
+        transcript: str,
+        use_no_think: bool,
+        *,
+        num_predict: int = 220,
+        fast_reply: bool = False,
+    ) -> dict[str, Any]:
+        prompt = self.user_content(transcript, use_no_think, fast_reply=fast_reply)
         return {
             "model": self.model,
             "system": SYSTEM_PROMPT,
@@ -739,14 +791,16 @@ class FastChatEmotionEngine:
             "options": {
                 "temperature": 0.65,
                 "num_ctx": 4096,
-                "num_predict": 220,
+                "num_predict": clamp_int(num_predict, 220, 32, 220),
             },
         }
 
-    def vision_user_content(self, transcript: str, use_no_think: bool) -> str:
+    def vision_user_content(self, transcript: str, use_no_think: bool, *, fast_reply: bool = False) -> str:
         content = f"""使用者原話：{transcript}
 
 請根據使用者原話和這張相機畫面，依照 system schema 只輸出 JSON object。reply 欄位必須是自然語言，不可混入控制資訊。"""
+        if fast_reply:
+            content += "\n請讓 reply 儘量短，優先用繁體中文一句話回答，除非使用者明確要求詳細描述畫面。"
         if use_no_think:
             content = "/no_think\n" + content
         return content
@@ -758,6 +812,8 @@ class FastChatEmotionEngine:
         *,
         model: str,
         use_no_think: bool,
+        num_predict: int = 220,
+        fast_reply: bool = False,
     ) -> dict[str, Any]:
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
         return {
@@ -766,7 +822,7 @@ class FastChatEmotionEngine:
                 {"role": "system", "content": VISION_SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": self.vision_user_content(transcript, use_no_think),
+                    "content": self.vision_user_content(transcript, use_no_think, fast_reply=fast_reply),
                     "images": [image_b64],
                 },
             ],
@@ -776,7 +832,52 @@ class FastChatEmotionEngine:
             "options": {
                 "temperature": 0.2,
                 "num_ctx": 4096,
-                "num_predict": 220,
+                "num_predict": clamp_int(num_predict, 220, 32, 220),
+            },
+        }
+
+    def focus_user_content(self, metadata: dict[str, Any], use_no_think: bool) -> str:
+        task = str(metadata.get("task", "") or "").strip()
+        interval_sec = str(metadata.get("interval_sec", "") or "").strip()
+        session_id = str(metadata.get("session_id", "") or "").strip()
+        parts = ["請根據這張相機畫面判斷使用者此刻的工作狀態，依照 system schema 只輸出 JSON object。"]
+        if task:
+            parts.append(f"本次工作目標：{task}")
+        if interval_sec:
+            parts.append(f"取樣間隔秒數：{interval_sec}")
+        if session_id:
+            parts.append(f"session_id：{session_id}")
+        content = "\n".join(parts)
+        if use_no_think:
+            content = "/no_think\n" + content
+        return content
+
+    def build_focus_payload(
+        self,
+        image_bytes: bytes,
+        *,
+        metadata: dict[str, Any],
+        model: str,
+        use_no_think: bool,
+    ) -> dict[str, Any]:
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        return {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": FOCUS_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": self.focus_user_content(metadata, use_no_think),
+                    "images": [image_b64],
+                },
+            ],
+            "stream": False,
+            "think": False,
+            "keep_alive": "30m",
+            "options": {
+                "temperature": 0.1,
+                "num_ctx": 4096,
+                "num_predict": 180,
             },
         }
 
@@ -785,7 +886,14 @@ class FastChatEmotionEngine:
         result = self.analyze("你好，聽得到我說話嗎？")
         print("Ollama warm-up done:", result["emotion"]["primary"])
 
-    def analyze(self, transcript: str, request_id: str = "") -> dict[str, Any]:
+    def analyze(
+        self,
+        transcript: str,
+        request_id: str = "",
+        *,
+        num_predict: int = 220,
+        fast_reply: bool = False,
+    ) -> dict[str, Any]:
         reply_started = time.monotonic()
         request_id = request_id or uuid.uuid4().hex[:8]
         debug: dict[str, Any] = {
@@ -795,11 +903,18 @@ class FastChatEmotionEngine:
             "ollama_model": self.model,
             "no_think": self.no_think,
             "think": False,
+            "fast_reply": fast_reply,
+            "num_predict": clamp_int(num_predict, 220, 32, 220),
             "transcript_chars": len(transcript),
             "transcript_preview": short_text(transcript, 120),
             "stage": "ollama_request",
         }
-        payload = self.build_payload(transcript, use_no_think=self.no_think)
+        payload = self.build_payload(
+            transcript,
+            use_no_think=self.no_think,
+            num_predict=num_predict,
+            fast_reply=fast_reply,
+        )
         try:
             response = post_json_with_debug(self.url, payload, timeout_sec=120)
             debug["stage"] = "ollama_response"
@@ -815,7 +930,12 @@ class FastChatEmotionEngine:
             content = extract_ollama_text(response)
             if not content.strip() and self.no_think:
                 debug["retry_reason"] = "empty content with /no_think; retrying without /no_think"
-                retry_payload = self.build_payload(transcript, use_no_think=False)
+                retry_payload = self.build_payload(
+                    transcript,
+                    use_no_think=False,
+                    num_predict=num_predict,
+                    fast_reply=fast_reply,
+                )
                 retry_response = post_json_with_debug(self.url, retry_payload, timeout_sec=120)
                 debug["retried_without_no_think"] = True
                 debug["retry_done"] = retry_response.get("done")
@@ -829,7 +949,12 @@ class FastChatEmotionEngine:
                 generate_url = ollama_generate_url(self.url)
                 debug["generate_retry_reason"] = "chat returned empty content; trying /api/generate"
                 debug["generate_url"] = generate_url
-                generate_payload = self.build_generate_payload(transcript, use_no_think=False)
+                generate_payload = self.build_generate_payload(
+                    transcript,
+                    use_no_think=False,
+                    num_predict=num_predict,
+                    fast_reply=fast_reply,
+                )
                 generate_response = post_json_with_debug(generate_url, generate_payload, timeout_sec=120)
                 debug["generate_done"] = generate_response.get("done")
                 if "error" in generate_response:
@@ -889,6 +1014,8 @@ class FastChatEmotionEngine:
         request_id: str = "",
         model: str = DEFAULT_VISION_MODEL,
         timeout_sec: float = 180.0,
+        num_predict: int = 220,
+        fast_reply: bool = False,
     ) -> dict[str, Any]:
         reply_started = time.monotonic()
         request_id = request_id or uuid.uuid4().hex[:8]
@@ -903,6 +1030,8 @@ class FastChatEmotionEngine:
             "image_bytes": len(image_bytes),
             "no_think": self.no_think,
             "think": False,
+            "fast_reply": fast_reply,
+            "num_predict": clamp_int(num_predict, 220, 32, 220),
             "transcript_chars": len(transcript),
             "transcript_preview": short_text(transcript, 120),
             "stage": "vision_ollama_request",
@@ -912,6 +1041,8 @@ class FastChatEmotionEngine:
             image_bytes,
             model=model,
             use_no_think=self.no_think,
+            num_predict=num_predict,
+            fast_reply=fast_reply,
         )
         try:
             print(f"voice-chat {request_id}: calling vision model={model} image_bytes={len(image_bytes)}")
@@ -929,6 +1060,8 @@ class FastChatEmotionEngine:
                     image_bytes,
                     model=model,
                     use_no_think=False,
+                    num_predict=num_predict,
+                    fast_reply=fast_reply,
                 )
                 response = post_json_with_debug(self.url, retry_payload, timeout_sec=timeout_sec)
                 debug["retried_without_no_think"] = True
@@ -994,6 +1127,8 @@ class FastChatEmotionEngine:
                     request_id=request_id,
                     model=fallback_model,
                     timeout_sec=timeout_sec,
+                    num_predict=num_predict,
+                    fast_reply=fast_reply,
                 )
                 if retry_result.get("used_vision"):
                     retry_result["vision_attempted_model"] = model
@@ -1013,7 +1148,12 @@ class FastChatEmotionEngine:
                     "used_vision": False,
                 }
             )
-            text_result = self.analyze(transcript, request_id=request_id)
+            text_result = self.analyze(
+                transcript,
+                request_id=request_id,
+                num_predict=num_predict,
+                fast_reply=fast_reply,
+            )
             text_result = prefix_vision_unavailable(text_result, reason, transcript)
             text_result["vision_requested"] = True
             text_result["used_vision"] = False
@@ -1034,6 +1174,107 @@ class FastChatEmotionEngine:
             text_result["debug"] = text_debug
             set_last_debug(text_debug)
             return text_result
+
+    def analyze_focus_image(
+        self,
+        image_bytes: bytes,
+        *,
+        metadata: dict[str, Any] | None = None,
+        request_id: str = "",
+        model: str = DEFAULT_VISION_MODEL,
+        timeout_sec: float = 180.0,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        request_id = request_id or uuid.uuid4().hex[:8]
+        metadata = metadata if isinstance(metadata, dict) else {}
+        debug: dict[str, Any] = {
+            "request_id": request_id,
+            "timestamp": now_stamp(),
+            "ollama_url": self.url,
+            "ollama_model": model,
+            "text_ollama_model": self.model,
+            "focus_requested": True,
+            "image_bytes": len(image_bytes),
+            "no_think": self.no_think,
+            "think": False,
+            "stage": "focus_ollama_request",
+            "session_id": metadata.get("session_id"),
+            "task_preview": short_text(str(metadata.get("task", "") or ""), 120),
+        }
+        payload = self.build_focus_payload(
+            image_bytes,
+            metadata=metadata,
+            model=model,
+            use_no_think=self.no_think,
+        )
+        try:
+            print(f"focus-check {request_id}: calling vision model={model} image_bytes={len(image_bytes)}")
+            response = post_json_with_debug(self.url, payload, timeout_sec=timeout_sec)
+            debug["stage"] = "focus_ollama_response"
+            if "error" in response:
+                raise RuntimeError(f"Ollama focus error: {short_text(str(response.get('error', 'unknown error')))}")
+
+            debug.update(summarize_ollama_response(response))
+            content = extract_ollama_text(response)
+            if not content.strip() and self.no_think:
+                debug["retry_reason"] = "empty focus content with /no_think; retrying without /no_think"
+                retry_payload = self.build_focus_payload(
+                    image_bytes,
+                    metadata=metadata,
+                    model=model,
+                    use_no_think=False,
+                )
+                response = post_json_with_debug(self.url, retry_payload, timeout_sec=timeout_sec)
+                debug["retried_without_no_think"] = True
+                if "error" in response:
+                    raise RuntimeError(f"Ollama focus retry error: {short_text(str(response.get('error', 'unknown error')))}")
+                debug.update({f"retry_{key}": value for key, value in summarize_ollama_response(response).items()})
+                content = extract_ollama_text(response)
+
+            parsed = extract_json_object(content)
+            result = normalize_focus_result(parsed, reason="focus vision")
+            debug.update(
+                {
+                    "ok": True,
+                    "ollama_done": response.get("done"),
+                    "ollama_content_chars": len(content),
+                    "ollama_content_preview": short_text(strip_thinking_text(content), 500),
+                    "focus_state": result["state"],
+                    "focus_confidence": result["confidence"],
+                    "focus_attention_score": result["attention_score"],
+                }
+            )
+            result.update(
+                {
+                    "request_id": request_id,
+                    "timing": {"focus_ms": elapsed_ms(started), "llm_ms": elapsed_ms(started)},
+                    "debug": debug,
+                }
+            )
+            set_last_debug(debug)
+            return result
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
+            reason = f"Focus vision failed: {short_error(exc)}"
+            print(f"WARN: {reason}")
+            debug.update(
+                {
+                    "ok": False,
+                    "stage": "focus_exception",
+                    "fallback_reason": reason,
+                    "exception_type": exc.__class__.__name__,
+                }
+            )
+            result = normalize_focus_result({"state": "error", "summary": reason}, reason=reason)
+            result.update(
+                {
+                    "request_id": request_id,
+                    "timing": {"focus_ms": elapsed_ms(started), "llm_ms": elapsed_ms(started)},
+                    "debug": debug,
+                    "fallback_reason": reason,
+                }
+            )
+            set_last_debug(debug)
+            return result
 
 
 def strip_reply(content: str) -> str:
@@ -1092,6 +1333,71 @@ def clamp_float(value: Any, default: float, minimum: float, maximum: float) -> f
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, number))
+
+
+def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def normalize_focus_result(raw: Any, *, reason: str = "focus fallback") -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    state = str(source.get("state", "uncertain")).strip().lower()
+    if state not in FOCUS_STATES:
+        state = "uncertain"
+
+    default_attention = {
+        "focused": 0.9,
+        "away": 0.0,
+        "phone": 0.2,
+        "sleeping": 0.05,
+        "distracted": 0.35,
+        "uncertain": 0.4,
+        "error": 0.0,
+    }.get(state, 0.4)
+    evidence_raw = source.get("evidence")
+    evidence: list[str] = []
+    if isinstance(evidence_raw, list):
+        evidence = [str(item).strip() for item in evidence_raw if str(item).strip()][:5]
+    elif isinstance(evidence_raw, str) and evidence_raw.strip():
+        evidence = [evidence_raw.strip()]
+
+    person_present_raw = source.get("person_present")
+    person_present = person_present_raw if isinstance(person_present_raw, bool) else state not in {"away", "error"}
+    summary = str(source.get("summary", "")).strip()
+    if not summary:
+        summary = {
+            "focused": "看起來正在專心工作。",
+            "away": "座位附近沒有清楚看到使用者。",
+            "phone": "畫面顯示使用者可能正在看手機。",
+            "sleeping": "畫面顯示使用者可能在休息或睡著。",
+            "distracted": "使用者在座位上，但看起來沒有專注在工作。",
+            "uncertain": "畫面不足以可靠判斷工作狀態。",
+            "error": reason,
+        }.get(state, "畫面不足以可靠判斷工作狀態。")
+
+    recommended_robot = {
+        "focused": "Thinking",
+        "away": "Sleep",
+        "phone": "Concerned",
+        "sleeping": "Sleepy",
+        "distracted": "Concerned",
+        "uncertain": "Confused",
+        "error": "Confused",
+    }.get(state, "Confused")
+
+    return {
+        "state": state,
+        "confidence": clamp_float(source.get("confidence"), 0.35 if state == "uncertain" else 0.5, 0.0, 1.0),
+        "attention_score": clamp_float(source.get("attention_score"), default_attention, 0.0, 1.0),
+        "person_present": person_present,
+        "evidence": evidence,
+        "summary": summary,
+        "recommended_robot": recommended_robot,
+    }
 
 
 def parse_metadata(raw: str | None) -> dict[str, Any]:
@@ -1212,6 +1518,21 @@ def run_self_test() -> int:
     if unavailable["control"]["emotion"] != "confused" or unavailable["control"]["head_motion"] != "shake":
         raise AssertionError(f"vision unavailable control should be confused/shake: {unavailable['control']}")
 
+    focus = normalize_focus_result(
+        {
+            "state": "phone",
+            "confidence": 1.2,
+            "attention_score": -1,
+            "person_present": True,
+            "evidence": ["低頭看手持裝置", "視線不在螢幕"],
+        },
+        reason="self-test",
+    )
+    if focus["state"] != "phone" or focus["confidence"] != 1.0 or focus["attention_score"] != 0.0:
+        raise AssertionError(f"bad focus normalization: {focus}")
+    if focus["recommended_robot"] != "Concerned":
+        raise AssertionError(f"bad focus robot command: {focus}")
+
     print("desktop_fast_chat_server self-test OK")
     print(f"debug_version={DEBUG_VERSION}, model={DEFAULT_FAST_MODEL}, vision_model={DEFAULT_VISION_MODEL}")
     return 0
@@ -1233,7 +1554,7 @@ def health() -> Any:
             "vision_model": vision_model,
             "force_vision": server_force_vision,
             "max_image_bytes": max_image_bytes,
-            "routes": ["/health", "/debug", "/text-chat", "/voice-chat"],
+            "routes": ["/health", "/debug", "/text-chat", "/voice-chat", "/focus-check"],
             "last_debug": last_debug,
             "debug_log": str(debug_log_path) if debug_log_path is not None else None,
         }
@@ -1272,6 +1593,41 @@ def text_chat() -> Any:
     return jsonify({"ok": True, "transcript": transcript, **result, "elapsed_ms": elapsed_ms(started)})
 
 
+@app.post("/focus-check")
+def focus_check() -> Any:
+    started = time.monotonic()
+    request_id = uuid.uuid4().hex[:8]
+    if chat_engine is None:
+        return jsonify({"ok": False, "request_id": request_id, "error": "server not ready"}), 503
+    if not vision_enabled:
+        return jsonify({"ok": False, "request_id": request_id, "error": "vision disabled"}), 503
+
+    image_upload = request.files.get("image")
+    metadata = parse_metadata(request.form.get("metadata"))
+    image_bytes, image_error = read_optional_image_bytes(image_upload)
+    if not image_bytes:
+        return jsonify({"ok": False, "request_id": request_id, "error": image_error or "image unavailable"}), 400
+
+    result = chat_engine.analyze_focus_image(
+        image_bytes,
+        metadata=metadata,
+        request_id=request_id,
+        model=vision_model,
+        timeout_sec=vision_timeout_sec,
+    )
+    timing = result.setdefault("timing", {})
+    timing["total_ms"] = elapsed_ms(started)
+    result["image_received"] = True
+    result["image_size_bytes"] = len(image_bytes)
+    result["vision_model"] = vision_model
+    result["metadata"] = {
+        "session_id": metadata.get("session_id"),
+        "task": metadata.get("task"),
+        "interval_sec": metadata.get("interval_sec"),
+    }
+    return jsonify({"ok": result.get("state") != "error", **result, "elapsed_ms": elapsed_ms(started)})
+
+
 @app.post("/voice-chat")
 def voice_chat() -> Any:
     started = time.monotonic()
@@ -1306,6 +1662,10 @@ def voice_chat() -> Any:
         metadata_mode = str(metadata.get("vision_mode", "")).strip().lower()
         client_no_vision = truthy(metadata.get("no_vision")) or metadata_mode in {"off", "disabled", "disable", "no_vision", "none"}
         client_force_vision = truthy(metadata.get("force_vision")) or metadata_mode in {"force", "forced", "always"}
+        latency_profile = str(metadata.get("latency_profile", "") or "").strip().lower()
+        fast_reply = truthy(metadata.get("fast_reply")) or latency_profile in {"turbo", "ultra", "fast"}
+        default_num_predict = 70 if latency_profile == "ultra" else (110 if fast_reply else 220)
+        reply_num_predict = clamp_int(metadata.get("reply_num_predict"), default_num_predict, 32, 220)
 
         if client_no_vision:
             vision_requested = False
@@ -1328,7 +1688,8 @@ def voice_chat() -> Any:
         print(
             f"voice-chat {request_id}: vision_intent={vision_requested} "
             f"reason={vision_reason} auto={auto_vision_intent}:{auto_vision_reason} "
-            f"image_received={image_received} image_size_bytes={image_size_bytes}"
+            f"image_received={image_received} image_size_bytes={image_size_bytes} "
+            f"fast_reply={fast_reply} num_predict={reply_num_predict}"
         )
 
         if vision_requested and vision_enabled:
@@ -1339,17 +1700,29 @@ def voice_chat() -> Any:
                     request_id=request_id,
                     model=vision_model,
                     timeout_sec=vision_timeout_sec,
+                    num_predict=reply_num_predict,
+                    fast_reply=fast_reply,
                 )
             else:
                 reason = image_error or "image unavailable"
                 print(f"ERROR: voice-chat {request_id}: vision_intent=True but image unavailable: {reason}")
-                result = chat_engine.analyze(transcript, request_id=request_id)
+                result = chat_engine.analyze(
+                    transcript,
+                    request_id=request_id,
+                    num_predict=reply_num_predict,
+                    fast_reply=fast_reply,
+                )
                 result = prefix_vision_unavailable(result, reason, transcript)
                 result["vision_requested"] = True
                 result["used_vision"] = False
                 result["vision_model"] = vision_model
         else:
-            result = chat_engine.analyze(transcript, request_id=request_id)
+            result = chat_engine.analyze(
+                transcript,
+                request_id=request_id,
+                num_predict=reply_num_predict,
+                fast_reply=fast_reply,
+            )
             result["vision_requested"] = vision_requested
             result["used_vision"] = False
             result["vision_model"] = vision_model
@@ -1363,6 +1736,9 @@ def voice_chat() -> Any:
         result["vision_intent"] = vision_requested
         result["vision_requested"] = vision_requested
         result["vision_reason"] = vision_reason
+        result["latency_profile"] = latency_profile or "normal"
+        result["fast_reply"] = fast_reply
+        result["reply_num_predict"] = reply_num_predict
         result["auto_vision_intent"] = auto_vision_intent
         result["auto_vision_reason"] = auto_vision_reason
         result["normalized_transcript"] = normalized_transcript
