@@ -76,11 +76,12 @@ DEFAULT_FAST_MODEL = "qwen35-fast:latest"
 DEFAULT_VISION_MODEL = "qwen35-fast:latest"
 VISION_FALLBACK_MODELS: tuple[str, ...] = ()
 DEFAULT_MAX_IMAGE_BYTES = 2_000_000
-DEBUG_VERSION = 10
+DEBUG_VERSION = 11
 
 CONTROL_PERSISTENT_STATES = {"normal", "sleep", "unchanged"}
 CONTROL_EMOTIONS = {"neutral", "happy", "curious", "excited", "confused", "concerned", "sleepy"}
 CONTROL_HEAD_MOTIONS = {"none", "nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop"}
+FOCUS_STATES = {"focused", "away", "phone", "sleeping", "distracted", "uncertain", "error"}
 
 EMOTIONS = sorted(CONTROL_EMOTIONS)
 
@@ -189,6 +190,37 @@ control 規則：
 - 使用者問自己是否疲憊、表情是否不好、狀態是否低落時，若畫面合理可用 emotion="concerned", head_motion="gentle_nod"。
 - 看不清楚、無法判斷時 emotion="confused", head_motion="shake"。
 - 睡覺/起床意圖仍依照 persistent_state 規則處理。
+""".strip()
+
+FOCUS_SYSTEM_PROMPT = """
+你是桌上寵物機器人的「專心工作模式」視覺狀態分類器。輸入是一張使用者工作區的相機畫面。
+
+你必須只輸出一個 JSON object，不要 markdown，不要 code fence，不要額外文字。
+
+JSON schema:
+{
+  "state": "focused | away | phone | sleeping | distracted | uncertain",
+  "confidence": 0.0,
+  "attention_score": 0.0,
+  "person_present": true,
+  "evidence": ["簡短可見線索"],
+  "summary": "一句繁體中文摘要"
+}
+
+分類規則：
+- focused：使用者人在座位上，姿勢像在工作、看螢幕、打字、寫字或閱讀工作內容。
+- away：座位附近沒有清楚看到使用者。
+- phone：明顯拿著或低頭看手機，且不像是工作用設備。
+- sleeping：趴在桌上、閉眼、頭部明顯垂落，或像是在睡覺。
+- distracted：人在座位上，但明顯在做與工作無關的事、長時間看向別處或互動對象不在工作區。
+- uncertain：畫面模糊、遮擋、角度不足、臉或身體太少，或無法可靠判斷。
+
+判斷原則：
+- 只根據可見行為，不要猜測身分、年齡、健康狀況或敏感屬性。
+- 不確定就選 uncertain，不要硬判斷。
+- confidence 是你對 state 的信心，0 到 1。
+- attention_score 是看起來專心工作的程度，0 到 1；away/sleeping/phone 通常偏低。
+- evidence 最多 5 個短句，只描述可見線索。
 """.strip()
 
 VISION_INTENT_KEYWORDS = (

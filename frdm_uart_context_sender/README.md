@@ -5,7 +5,7 @@
 ## Read This First
 
 ```text
-只想啟動 demo        -> 看 QUICK_START.md 的「0. 必跑指令總覽」
+只想啟動 demo        -> 看 QUICK_START.md 的「0. 一頁照貼版」
 要理解架構          -> 看本 README 的 What This Does / Data Flow
 要改 prompt/control  -> 看 Structured Reply And Control
 要修 FRDM 行為       -> 看 FRDM UART Timing / Emotion And Head Motion
@@ -26,6 +26,7 @@ audio_read_timeout    : 0.75
 camera                : auto, 320x240, JPEG quality 70, memory-only
 uart                  : auto, 115200, CRLF
 tts                   : local Piper /speak_async, AUDIO_DEVICE=auto:UACDemo
+music/weather         : local tool server on 127.0.0.1:8788, mpv + Open-Meteo
 ```
 
 不要固定 USB 數字 index。重插 USB 後 `--device 25`、`--beep-device 24`、`--camera-id 0` 都可能失效；正式 demo 用 keyword 和 auto。
@@ -39,6 +40,7 @@ Hey Jarvis wake word
 -> record speech until silence
 -> POST audio + optional image to Windows /voice-chat
 -> Windows ASR transcript
+-> Jetson local tool routing for music/weather if transcript asks for it
 -> rule-based vision intent routing
 -> qwen35-fast:latest text or vision response
 -> Jetson parses reply/control
@@ -47,12 +49,15 @@ Hey Jarvis wake word
 ```
 
 不使用 Gemini、OpenAI 或雲端 API。ASR 與 Ollama 在 Windows 桌機本機；wake word、camera、TTS、UART 在 Jetson 本機。
+天氣查詢使用 Jetson 本地 tool server 呼叫 Open-Meteo；這不是 LLM 猜測，也不需要 API key。音樂串流使用 Jetson 本地 `mpv`/`yt-dlp`，不經 Windows 桌機。
 
 ## Table Of Contents
 
 ```text
 Files
 Standard Startup
+Music Routing And Playback
+Weather Routing
 Windows Server
 Structured Reply And Control
 FRDM UART Timing
@@ -88,7 +93,7 @@ Windows 桌面實際執行的是 bundle 版本，所以 server 有改時需要 s
 
 ## Standard Startup
 
-完整可複製三個 terminal 指令在 [QUICK_START.md](QUICK_START.md) 最前面。核心參數如下：
+完整可複製 Terminal 1/2/4/3 指令在 [QUICK_START.md](QUICK_START.md) 最前面。核心參數如下：
 
 請不要手打最後幾個參數，最常見錯誤是把 `--tts-poll-interval 0.75` 打成 `--uart-debug\terval 0.75`。正確尾端是：
 
@@ -118,6 +123,13 @@ python3 wake_voice_chat_frdm_bridge.py \
   --camera-jpeg-quality 70 \
   --camera-latest-timeout 1.0 \
   --camera-frame-max-age 2.0 \
+  --music-backend mpv \
+  --music-timeout 5 \
+  --music-wake-pause-timeout 0.6 \
+  --music-debug \
+  --weather-default-location Taipei \
+  --weather-timeout 6 \
+  --weather-debug \
   --device-preflight-verbose \
   --tts-poll-interval 0.75 \
   --tts-debug \
@@ -141,7 +153,30 @@ beep      : --beep-keyword UACDemo
 TTS audio : AUDIO_DEVICE=auto:UACDemo
 camera    : --camera-id auto
 FRDM      : --uart-port auto
+music     : --music-backend mpv
+weather   : --weather-default-location Taipei
 ```
+
+音樂功能是 sidecar，不會接管主流程：
+
+```text
+一般聊天 / vision / FRDM 控制 -> 不呼叫 Music Player
+點歌 / 換歌                 -> TTS 確認後呼叫 Music Player play
+暫停 / 停止音樂             -> 直接呼叫 Music Player pause/stop
+繼續播放音樂                -> TTS 確認後呼叫 Music Player resume
+任何 Hey Jarvis wake         -> 先 pause 音樂，再開始 beep/錄音
+```
+
+天氣功能也在同一個 sidecar：
+
+```text
+一般聊天 / vision / FRDM 控制 -> 不呼叫 Weather Tool
+所在地、今天、明天、特定時間天氣 -> 呼叫 http://127.0.0.1:8788/weather
+天氣來源                         -> Open-Meteo forecast + geocoding
+回答方式                         -> 覆蓋桌機 AI 泛用回答，直接 TTS 念天氣摘要
+```
+
+`--music-backend mpv` 會真的播放；`browser` 只開搜尋頁。若要關掉 wake 時自動暫停音樂，可加 `--no-music-pause-on-wake`，但正式 demo 建議保持開啟，避免音樂被錄進 mic。
 
 每次啟動會先做 device preflight：
 
@@ -216,15 +251,208 @@ Max recording...     -> 硬上限保護，避免整輪卡住
 no audio chunk       -> USB mic stream 停吐，callback watchdog 會退出當輪
 ```
 
-## Windows Server
+## Music Routing And Playback
 
-同步最新版 server 到 Windows：
+音樂播放是 local sidecar，不是主 AI 流程本身。Wake Bridge 仍然每輪照原本方式錄音、送 Windows server、TTS、UART；只有 transcript 被 rule-based music intent 判斷成點歌、換歌、暫停、繼續或停止時，才會呼叫 `music_web_player.py`。
 
-```powershell
-scp asrlab-yian@100.110.90.72:/home/asrlab-yian/MakeNTU/emotion_robot_controller/voice_stt_remote/windows_desktop_server_bundle/desktop_fast_chat_server.py "$env:USERPROFILE\Desktop\windows_desktop_server_bundle\desktop_fast_chat_server.py"
+完整時序：
+
+```text
+Music is playing
+-> user says Hey Jarvis
+-> Wake Bridge immediately POSTs {"action": "pause"} to http://127.0.0.1:8788/music
+-> beep / Thinking / recording starts
+-> transcript returns from Windows ASR
+-> detect_music_intent(transcript)
+-> no music intent: do nothing with Music Player; music stays paused until the user says resume
+-> play/change/resume music: TTS speaks confirmation first, then POST play/query or resume
+-> pause/stop music: POST pause/stop before TTS
+-> bridge returns to standby and keeps listening for Hey Jarvis
 ```
 
-啟動：
+常用語句：
+
+```text
+Hey Jarvis，我想要聽告白氣球       -> action=play, query=告白氣球
+Hey Jarvis，幫我波 稻香            -> action=play, query=稻香
+Hey Jarvis，換成 七里香            -> action=play, query=七里香
+Hey Jarvis，暫停音樂               -> action=pause
+Hey Jarvis，繼續播放音樂           -> action=resume
+Hey Jarvis，停止音樂               -> action=stop
+Hey Jarvis，講個笑話               -> no music call
+Hey Jarvis，我現在是什麼表情       -> no music call, may use vision
+```
+
+正式 demo 建議讓 Terminal 4 手動開著：
+
+```bash
+cd /home/asrlab-yian/MakeNTU/music_web_player
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --weather-default-location Taipei
+```
+
+如果 Terminal 4 沒開，Wake Bridge 在 `action=play` 時會嘗試自動啟動。Wake 當下的 `pause` 和使用者要求 `resume` 都不會自動啟動 sidecar，因為這兩個動作只對已經存在的 mpv process 有意義。
+
+重要參數：
+
+```text
+--music-backend mpv              # 真的播放，auto 也會優先選 mpv
+--music-timeout 5                # play/change music request timeout
+--music-wake-pause-timeout 0.6   # wake 一偵測到先 pause 的短 timeout
+--music-debug                    # 印 Music routing / Music tool log
+--no-music                       # 完全關閉 music sidecar routing
+--no-music-autostart             # 點歌時也不要自動啟動 sidecar
+--no-music-pause-on-wake         # wake 時不要先 pause 音樂，不建議正式 demo 使用
+```
+
+`mpv` backend 用 `ytsearch1:<query>` 串流第一個搜尋結果，不會把音樂存到專案資料夾。`pause` / `resume` 透過 mpv IPC socket 控制，所以會保留播放位置；`stop` 才會結束 mpv process。`browser` backend 只開搜尋頁，不保證自動播放，也無法可靠 pause/resume。
+
+Action 對照：
+
+```text
+action=play
+  input : query，例如 告白氣球
+  timing: TTS 確認句結束後呼叫
+  effect: stop old mpv if any, start mpv ytdl://ytsearch1:<query>
+  log   : action=play query=... ipc_ready=True
+
+action=pause
+  input : none
+  timing: wake detected 立即呼叫；使用者說暫停音樂時也會呼叫
+  effect: mpv IPC set_property pause true
+  log   : action=pause paused=True
+
+action=resume
+  input : none
+  timing: TTS 確認句結束後呼叫
+  effect: mpv IPC set_property pause false
+  log   : action=resume resumed=True
+
+action=stop
+  input : none
+  timing: 使用者說停止音樂時立即呼叫
+  effect: terminate mpv process
+  log   : action=stop stopped=True
+```
+
+`curl http://127.0.0.1:8788/health` 的重要欄位：
+
+```text
+backend       : mpv 才是正式播放模式
+mpv_available : Jetson 找得到 mpv
+yt_dlp_available : Jetson 找得到 yt-dlp 或 youtube-dl
+active        : 目前有 mpv process
+paused        : 目前是否暫停中
+last_query    : 最近一次播放 query
+ipc_path      : mpv IPC socket；pause/resume 依賴它
+weather_available : /weather endpoint 已載入
+weather_source    : open-meteo
+weather_default_location : 所在地天氣預設城市
+```
+
+## Weather Routing
+
+天氣查詢跟音樂共用 Terminal 4 `music_web_player.py`，但走不同 endpoint：
+
+```text
+music   -> http://127.0.0.1:8788/music
+weather -> http://127.0.0.1:8788/weather
+health  -> http://127.0.0.1:8788/health
+```
+
+Wake Bridge 每輪收到 Windows ASR transcript 後，會先做本地 rule-based weather intent。只有明確在問天氣時才查 Open-Meteo，一般聊天、FRDM 控制、vision 問題不會多一段網路查詢。
+
+```text
+transcript='明天下午三點台北天氣如何'
+-> detect_weather_intent=True
+-> POST /weather {"text": transcript, "default_location": "Taipei"}
+-> Jetson calls Open-Meteo geocoding + forecast API
+-> response.reply='台北市、台湾明天約15:00預報約 ...'
+-> replace desktop AI generic reply
+-> TTS speaks weather answer
+-> FRDM uses emotion=curious, head_motion=gentle_nod
+```
+
+支援語句：
+
+```text
+Hey Jarvis，所在地天氣如何
+Hey Jarvis，這裡現在幾度
+Hey Jarvis，明天天氣如何
+Hey Jarvis，明天下午三點台北天氣如何
+Hey Jarvis，今天會下雨嗎
+Hey Jarvis，明天要帶傘嗎
+Hey Jarvis，新竹明天早上天氣
+Hey Jarvis，weather in Tokyo tomorrow
+```
+
+通常不會觸發：
+
+```text
+Hey Jarvis，今天幾號
+Hey Jarvis，講個笑話
+Hey Jarvis，幫我開電風扇
+Hey Jarvis，我現在是什麼表情
+```
+
+Wake Bridge 相關參數：
+
+```text
+--weather-url http://127.0.0.1:8788/weather
+--weather-default-location Taipei
+--weather-timeout 6
+--weather-api-timeout 5
+--weather-debug
+--no-weather
+--weather-always-call
+```
+
+手動測試：
+
+```bash
+curl -X POST http://127.0.0.1:8788/weather \
+  -H "Content-Type: application/json" \
+  -d '{"text":"明天下午三點所在地天氣如何","default_location":"Taipei"}'
+```
+
+天氣失敗 fallback：
+
+```text
+/weather 連不到      -> Wake Bridge 會嘗試 autostart Terminal 4 sidecar
+Open-Meteo 連不到    -> TTS 說「我剛剛連不到本地天氣工具或天氣資料來源」
+intent 沒命中        -> 不查天氣，走原本桌機 AI 回覆
+```
+
+## Windows Server
+
+Windows 桌面實際跑的是 Desktop bundle 裡的 `desktop_fast_chat_server.py`。只要 Jetson 端 bundle 有更新、`debug_version` 不對、或不確定 Windows 是不是最新版，就先 refresh/scp。
+
+Windows PowerShell：
+
+```powershell
+$ErrorActionPreference = "Continue"
+
+$port = 8766
+$owners = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue |
+  Select-Object -ExpandProperty OwningProcess -Unique
+foreach ($ownerPid in $owners) {
+  if ($ownerPid -and $ownerPid -ne 0) {
+    Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
+  }
+}
+
+New-Item -ItemType Directory -Force "$env:USERPROFILE\Desktop\windows_desktop_server_bundle" | Out-Null
+
+scp asrlab-yian@100.110.90.72:/home/asrlab-yian/MakeNTU/emotion_robot_controller/voice_stt_remote/windows_desktop_server_bundle/desktop_fast_chat_server.py "$env:USERPROFILE\Desktop\windows_desktop_server_bundle\desktop_fast_chat_server.py"
+
+cd "$env:USERPROFILE\Desktop\windows_desktop_server_bundle"
+.\.venv\Scripts\Activate.ps1
+python desktop_fast_chat_server.py --self-test
+```
+
+如果 scp 連不到 Jetson，先在 Jetson 跑 `tailscale ip -4`，再把 `100.110.90.72` 換成目前 Jetson Tailscale IP。
+
+啟動 Windows server：
 
 ```powershell
 cd "$env:USERPROFILE\Desktop\windows_desktop_server_bundle"
@@ -669,6 +897,9 @@ Silence detected. volume=..., silence_threshold=..., peak=...
 ## Troubleshooting
 
 ```text
+another wake bridge is already running
+-> pkill -9 -f wake_voice_chat_frdm_bridge.py，然後重開 Terminal 3。
+
 No microphone matching UACDemo
 -> Jetson 沒看到 USB mic。跑 lsusb / --list-mics；若 lsusb 看不到 UACDemo，跑 ./recover_demo_usb.sh。
 
@@ -678,6 +909,9 @@ Recording 後像卡住
 -> 如果現場一直有風扇/人聲，直接用 --speech-start-margin 450 --silence-margin 650 --max-speech-seconds 5 --max-recording-seconds 7 --audio-read-timeout 0.75 --recording-progress-interval 1.0。
 -> `--max-speech-seconds` 只在 Speech started 後生效；要防止整輪卡住請用 `--max-recording-seconds`。
 -> 如果完全沒有 Recording progress，代表舊版 blocking read 卡住或 USB mic stream 停吐；新版會印 WARNING 並退出當輪。
+
+命令尾端出現 `--uart-debug\terval`
+-> 指令打錯。改成 --tts-poll-interval 0.75、--tts-debug、--uart-debug 三行。
 
 Wake 被 ignore
 -> 低音量保護。正式用 --wake-volume-min 350；仍漏叫可降到 200。
@@ -697,6 +931,9 @@ debug_version 不是 10
 
 TTS ready 但沒聲音
 -> curl /health，確認 AUDIO_DEVICE=auto:UACDemo 和 audio.device 是 UACDemo；重開 TTS。
+
+音樂 pause/resume 沒反應
+-> 確認 Terminal 4 `music_web_player.py --backend mpv` 開著，`curl http://127.0.0.1:8788/health` 裡 active/paused 合理。browser backend 不能可靠 pause/resume。
 
 vision_intent=True 但 used_vision=False
 -> 看 image_received / image_size_bytes / vision_error。
@@ -724,6 +961,8 @@ Jetson：
 [ ] --list-mics 有 UACDemo input
 [ ] --list-uarts 有 FRDM
 [ ] lsusb 有 UACDemo / Global Shutter Camera / MCU-LINK
+[ ] Music Web Player /health ok=true
+[ ] Music backend 是 mpv，pause/resume 測試 OK
 [ ] wake bridge self-test OK
 [ ] 純語音 used_vision=False
 [ ] 視覺句 used_vision=True

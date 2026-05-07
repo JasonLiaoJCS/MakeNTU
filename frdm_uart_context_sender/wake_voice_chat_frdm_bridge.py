@@ -23,6 +23,7 @@ from pathlib import Path
 import queue
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -42,6 +43,7 @@ THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parent
 VOICE_DIR = PROJECT_ROOT / "emotion_robot_controller" / "voice_stt_remote"
 VISION_DIR = PROJECT_ROOT / "vision"
+MUSIC_DIR = PROJECT_ROOT / "music_web_player"
 
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
@@ -49,13 +51,22 @@ if str(VOICE_DIR) not in sys.path:
     sys.path.insert(0, str(VOICE_DIR))
 if str(VISION_DIR) not in sys.path:
     sys.path.insert(0, str(VISION_DIR))
+if str(MUSIC_DIR) not in sys.path:
+    sys.path.insert(0, str(MUSIC_DIR))
 
 import voice_chat_frdm_uart_bridge as bridge  # noqa: E402
 import jetson_fast_voice_chat as voice_chat  # noqa: E402
+try:
+    import music_web_player as music_tool  # noqa: E402
+except Exception:
+    music_tool = None  # type: ignore[assignment]
 
 
 CLIENT_VERSION = "wake_voice_chat_frdm_bridge_vision_v2"
 DEFAULT_INSTANCE_LOCK = "/tmp/wake_voice_chat_frdm_bridge.lock"
+DEFAULT_MUSIC_TOOL_URL = os.getenv("MUSIC_TOOL_URL", "http://127.0.0.1:8788/music")
+DEFAULT_WEATHER_TOOL_URL = os.getenv("WEATHER_TOOL_URL", "http://127.0.0.1:8788/weather")
+DEFAULT_WEATHER_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "Taipei")
 DEMO_STALE_PROCESS_PATTERNS = (
     "wake_voice_chat_frdm_bridge.py",
     "camera_ollama_status.py",
@@ -1005,6 +1016,507 @@ def sanitize_reply(response: dict[str, Any]) -> str:
         reply = "我剛剛有收到，但這次回覆有點不穩，我先保持待命。"
         response["reply"] = reply
     return reply
+
+
+def normalize_local_tool_url(raw_url: str, *, default_url: str, endpoint: str) -> str:
+    value = str(raw_url or default_url).strip() or default_url
+    parsed = urllib.parse.urlsplit(value)
+    if not parsed.scheme:
+        value = "http://" + value
+        parsed = urllib.parse.urlsplit(value)
+    path = parsed.path.rstrip("/") or endpoint
+    if path == "":
+        path = endpoint
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def normalize_music_url(raw_url: str) -> str:
+    value = normalize_local_tool_url(raw_url, default_url=DEFAULT_MUSIC_TOOL_URL, endpoint="/music")
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.path.rstrip("/") in {"", "/", "/weather"}:
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/music", "", ""))
+    return value
+
+
+def normalize_weather_url(raw_url: str) -> str:
+    value = normalize_local_tool_url(raw_url, default_url=DEFAULT_WEATHER_TOOL_URL, endpoint="/weather")
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.path.rstrip("/") in {"", "/", "/music"}:
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/weather", "", ""))
+    return value
+
+
+def local_tool_health_url(tool_url: str) -> str:
+    parsed = urllib.parse.urlsplit(tool_url)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/health", "", ""))
+
+
+def fallback_detect_music_intent(text: str) -> dict[str, Any]:
+    normalized = re.sub(r"[，。！？、；：,.!?;:()\[\]{}\"'`《》〈〉「」『』]+", " ", str(text or ""))
+    normalized = re.sub(r"\bhey\s+jarvis\b|\bjarvis\b|嘿\s*jarvis|嗨\s*jarvis|賈維斯|贾维斯", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    lowered = normalized.lower()
+    if not normalized:
+        return {"intent": False, "action": "none", "query": "", "reason": "empty", "normalized_text": ""}
+    if re.search(r"停止|不要播|別播|别播|停歌|\bstop\b", lowered, flags=re.IGNORECASE):
+        return {"intent": True, "action": "stop", "query": "", "reason": "fallback_stop", "normalized_text": normalized}
+    if re.search(r"暫停|暂停|\bpause\b", lowered, flags=re.IGNORECASE):
+        return {"intent": True, "action": "pause", "query": "", "reason": "fallback_pause", "normalized_text": normalized}
+    if re.search(r"(繼續|继续|接著|接着|恢復|恢复).{0,4}(播放|播|放|音樂|音乐|歌曲|歌)|\b(resume|unpause)\b|\bcontinue\s+(the\s+)?(music|song|audio|playback)\b", lowered, flags=re.IGNORECASE):
+        return {"intent": True, "action": "resume", "query": "", "reason": "fallback_resume", "normalized_text": normalized}
+    play_pattern = re.compile(
+        r"(?:播放|播一下|播|波一下|波|放一下|放|換成|换成|換一首|换一首|改播|切到|我想要聽|我想要听|想要聽|想要听|我想聽|我想听|想聽|想听|我要聽|我要听|聽一下|听一下|聽|听|play|listen to)\s*(?P<query>.+)",
+        flags=re.IGNORECASE,
+    )
+    match = play_pattern.search(normalized)
+    if match:
+        query = re.sub(r"\s*(?:這首歌|这首歌|這首|这首|音樂|音乐|歌曲|謝謝|谢谢|please)\s*$", "", match.group("query"), flags=re.IGNORECASE)
+        query = re.sub(r"\s+", " ", query).strip()
+        return {"intent": True, "action": "play", "query": query or "music", "reason": "fallback_play", "normalized_text": normalized}
+    if any(word in lowered for word in ("音樂", "音乐", "歌曲", "聽歌", "听歌", "music", "song")) and any(
+        word in lowered for word in ("播放", "播", "波", "放", "聽", "听", "play", "listen")
+    ):
+        return {"intent": True, "action": "play", "query": "music", "reason": "fallback_implicit_music", "normalized_text": normalized}
+    return {"intent": False, "action": "none", "query": "", "reason": "fallback_no_music_intent", "normalized_text": normalized}
+
+
+def detect_music_route(response: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    transcript = str(response.get("transcript", "") or "").strip()
+    route: dict[str, Any] = {
+        "enabled": not bool(getattr(args, "no_music", False)),
+        "intent": False,
+        "action": "none",
+        "query": "",
+        "reason": "disabled" if getattr(args, "no_music", False) else "empty",
+        "transcript": transcript,
+        "should_call": False,
+    }
+    if getattr(args, "no_music", False) or not transcript:
+        response["music"] = route
+        return route
+
+    try:
+        if music_tool is not None:
+            intent_obj = music_tool.detect_music_intent(transcript)
+            route.update(
+                {
+                    "intent": bool(getattr(intent_obj, "intent", False)),
+                    "action": str(getattr(intent_obj, "action", "none") or "none"),
+                    "query": str(getattr(intent_obj, "query", "") or ""),
+                    "reason": str(getattr(intent_obj, "reason", "") or ""),
+                    "normalized_text": str(getattr(intent_obj, "normalized_text", "") or ""),
+                }
+            )
+        else:
+            route.update(fallback_detect_music_intent(transcript))
+    except Exception as exc:
+        route.update(fallback_detect_music_intent(transcript))
+        route["warning"] = f"music intent fallback used: {exc}"
+
+    route["should_call"] = bool(route.get("intent") or getattr(args, "music_always_call", False))
+    response["music"] = route
+    if route["should_call"] or getattr(args, "music_debug", False):
+        print()
+        print("Music routing:")
+        print(f"  transcript : {transcript or '(empty)'}")
+        print(f"  intent     : {route.get('intent')}")
+        print(f"  action     : {route.get('action')}")
+        print(f"  query      : {route.get('query') or '(none)'}")
+        print(f"  reason     : {route.get('reason')}")
+        print(f"  url        : {args.music_url}")
+    return route
+
+
+def fallback_detect_weather_intent(text: str, *, default_location: str = DEFAULT_WEATHER_LOCATION) -> dict[str, Any]:
+    normalized = re.sub(r"[，。！？、；：,.!?;:()\[\]{}\"'`《》〈〉「」『』]+", " ", str(text or ""))
+    normalized = re.sub(r"\bhey\s+jarvis\b|\bjarvis\b|嘿\s*jarvis|嗨\s*jarvis|賈維斯|贾维斯", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    lowered = normalized.lower()
+    if not normalized:
+        return {"intent": False, "action": "none", "location": "", "reason": "empty", "normalized_text": ""}
+    weather_words = (
+        "天氣",
+        "天气",
+        "氣溫",
+        "气温",
+        "溫度",
+        "温度",
+        "幾度",
+        "几度",
+        "下雨",
+        "降雨",
+        "雨傘",
+        "雨伞",
+        "帶傘",
+        "带伞",
+        "冷不冷",
+        "熱不熱",
+        "热不热",
+        "weather",
+        "forecast",
+        "temperature",
+        "rain",
+        "umbrella",
+    )
+    if any(word in lowered for word in weather_words) or re.search(r"(今天|明天|後天|后天|今晚|明早).{0,8}(冷|熱|热|雨|傘|伞|幾度|几度)", normalized):
+        location = default_location
+        for alias, canonical in (
+            ("台北", "Taipei"),
+            ("臺北", "Taipei"),
+            ("新竹", "Hsinchu"),
+            ("台中", "Taichung"),
+            ("臺中", "Taichung"),
+            ("台南", "Tainan"),
+            ("臺南", "Tainan"),
+            ("高雄", "Kaohsiung"),
+            ("東京", "Tokyo"),
+            ("大阪", "Osaka"),
+            ("首爾", "Seoul"),
+            ("首尔", "Seoul"),
+        ):
+            if alias.lower() in lowered:
+                location = canonical
+                break
+        english_match = re.search(r"\b(?:in|for|at)\s+(?P<location>[A-Za-z][A-Za-z\s.-]{1,40})", normalized, flags=re.IGNORECASE)
+        if english_match:
+            location = re.sub(r"\b(today|tomorrow|weather|forecast|temperature|rain)\b", " ", english_match.group("location"), flags=re.IGNORECASE)
+            location = re.sub(r"\s+", " ", location).strip() or default_location
+        return {"intent": True, "action": "weather", "location": location, "reason": "fallback_weather_keyword", "normalized_text": normalized}
+    return {"intent": False, "action": "none", "location": "", "reason": "fallback_no_weather_intent", "normalized_text": normalized}
+
+
+def detect_weather_route(response: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    transcript = str(response.get("transcript", "") or "").strip()
+    route: dict[str, Any] = {
+        "enabled": not bool(getattr(args, "no_weather", False)),
+        "intent": False,
+        "action": "none",
+        "location": "",
+        "reason": "disabled" if getattr(args, "no_weather", False) else "empty",
+        "transcript": transcript,
+        "should_call": False,
+    }
+    if getattr(args, "no_weather", False) or not transcript:
+        response["weather_route"] = route
+        return route
+
+    try:
+        if music_tool is not None and hasattr(music_tool, "detect_weather_intent"):
+            intent_obj = music_tool.detect_weather_intent(transcript, default_location=args.weather_default_location)
+            route.update(
+                {
+                    "intent": bool(getattr(intent_obj, "intent", False)),
+                    "action": "weather" if bool(getattr(intent_obj, "intent", False)) else "none",
+                    "location": str(getattr(intent_obj, "location", "") or ""),
+                    "reason": str(getattr(intent_obj, "reason", "") or ""),
+                    "normalized_text": str(getattr(intent_obj, "normalized_text", "") or ""),
+                }
+            )
+        else:
+            route.update(fallback_detect_weather_intent(transcript, default_location=args.weather_default_location))
+    except Exception as exc:
+        route.update(fallback_detect_weather_intent(transcript, default_location=args.weather_default_location))
+        route["warning"] = f"weather intent fallback used: {exc}"
+
+    route["should_call"] = bool(route.get("intent") or getattr(args, "weather_always_call", False))
+    response["weather_route"] = route
+    if route["should_call"] or getattr(args, "weather_debug", False):
+        print()
+        print("Weather routing:")
+        print(f"  transcript : {transcript or '(empty)'}")
+        print(f"  intent     : {route.get('intent')}")
+        print(f"  location   : {route.get('location') or args.weather_default_location}")
+        print(f"  reason     : {route.get('reason')}")
+        print(f"  url        : {args.weather_url}")
+    return route
+
+
+def music_health_url(music_url: str) -> str:
+    return local_tool_health_url(music_url)
+
+
+def resolve_music_backend(args: argparse.Namespace) -> str:
+    backend = str(getattr(args, "music_backend", "auto") or "auto").strip().lower()
+    if backend in {"browser", "mpv"}:
+        return backend
+    env_backend = os.getenv("MUSIC_PLAYER_BACKEND", "").strip().lower()
+    if env_backend in {"browser", "mpv"}:
+        return env_backend
+    if shutil.which("mpv") and (shutil.which("yt-dlp") or shutil.which("youtube-dl")):
+        return "mpv"
+    return "browser"
+
+
+def maybe_autostart_music_tool(args: argparse.Namespace, *, tool_url: str | None = None) -> bool:
+    if getattr(args, "no_music_autostart", False):
+        return False
+    target_url = tool_url or args.music_url
+    parsed = urllib.parse.urlsplit(target_url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost"}:
+        print(f"Music tool autostart skipped: non-local host {host!r}.")
+        return False
+    script = MUSIC_DIR / "music_web_player.py"
+    if not script.exists():
+        print(f"Music tool autostart skipped: missing {script}.")
+        return False
+    backend = resolve_music_backend(args)
+    port = int(parsed.port or 8788)
+    command = [
+        sys.executable,
+        str(script),
+        "--server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--backend",
+        backend,
+    ]
+    if getattr(args, "music_dry_run", False):
+        command.append("--dry-run")
+    print(f"Music tool autostart: {' '.join(command)}")
+    try:
+        subprocess.Popen(command, cwd=str(MUSIC_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        print(f"Music tool autostart failed: {exc}")
+        return False
+
+    deadline = time.monotonic() + 3.0
+    health_url = local_tool_health_url(target_url)
+    while time.monotonic() < deadline:
+        try:
+            health = voice_chat.get_json(health_url, timeout_sec=0.5)
+            if health.get("ok"):
+                print(f"Music tool autostart ready: {health_url}")
+                return True
+        except Exception:
+            time.sleep(0.2)
+    print("Music tool autostart did not become ready in time.")
+    return False
+
+
+def pause_music_for_wake(args: argparse.Namespace) -> dict[str, Any] | None:
+    if getattr(args, "no_music", False) or getattr(args, "no_music_pause_on_wake", False):
+        return None
+    payload: dict[str, Any] = {
+        "action": "pause",
+        "source": "wake_voice_chat_frdm_bridge",
+        "phase": "wake_pause",
+    }
+    try:
+        started = time.monotonic()
+        result = voice_chat.post_json(
+            args.music_url,
+            payload,
+            timeout_sec=float(getattr(args, "music_wake_pause_timeout", 0.6) or 0.6),
+        )
+        result["post_ms"] = int((time.monotonic() - started) * 1000)
+        if result.get("stopped") or result.get("paused") or getattr(args, "music_debug", False):
+            print(
+                "Music wake pause: "
+                f"ok={result.get('ok')} action={result.get('action')} "
+                f"paused={result.get('paused')} stopped={result.get('stopped')} "
+                f"post_ms={result.get('post_ms')}"
+            )
+        return result
+    except Exception as exc:
+        if getattr(args, "music_debug", False):
+            print(f"Music wake pause skipped: {exc}")
+        return {"ok": False, "action": "pause", "error": str(exc)}
+
+
+def execute_music_route(route: dict[str, Any], args: argparse.Namespace, response: dict[str, Any], *, phase: str) -> dict[str, Any] | None:
+    if not route.get("should_call"):
+        return None
+
+    payload: dict[str, Any] = {
+        "text": route.get("transcript", ""),
+        "action": route.get("action", "none"),
+        "source": "wake_voice_chat_frdm_bridge",
+        "phase": phase,
+    }
+    if route.get("query"):
+        payload["query"] = route.get("query")
+    payload["backend"] = resolve_music_backend(args)
+    if getattr(args, "music_dry_run", False):
+        payload["dry_run"] = True
+
+    try:
+        started = time.monotonic()
+        result = voice_chat.post_json(args.music_url, payload, timeout_sec=float(getattr(args, "music_timeout", 3.0)))
+        result["post_ms"] = int((time.monotonic() - started) * 1000)
+        result["phase"] = phase
+    except Exception as exc:
+        first_error = str(exc)
+        if route.get("action") in {"pause", "stop", "resume"}:
+            result = {
+                "ok": route.get("action") in {"pause", "stop"},
+                "handled": route.get("action") in {"pause", "stop"},
+                "phase": phase,
+                "action": route.get("action", "none"),
+                "query": route.get("query", ""),
+                "message": "music sidecar unavailable; nothing to pause/stop" if route.get("action") in {"pause", "stop"} else "music sidecar unavailable; cannot resume",
+                "warning": first_error,
+            }
+        elif maybe_autostart_music_tool(args):
+            try:
+                started = time.monotonic()
+                result = voice_chat.post_json(args.music_url, payload, timeout_sec=float(getattr(args, "music_timeout", 3.0)))
+                result["post_ms"] = int((time.monotonic() - started) * 1000)
+                result["phase"] = phase
+                result["autostarted"] = True
+            except Exception as retry_exc:
+                result = {
+                    "ok": False,
+                    "handled": False,
+                    "phase": phase,
+                    "action": route.get("action", "none"),
+                    "query": route.get("query", ""),
+                    "error": str(retry_exc),
+                    "first_error": first_error,
+                }
+        else:
+            result = {
+                "ok": False,
+                "handled": False,
+                "phase": phase,
+                "action": route.get("action", "none"),
+                "query": route.get("query", ""),
+                "error": first_error,
+            }
+
+    response["music"] = {**route, **result}
+    print()
+    print("Music tool:")
+    print(f"  phase   : {phase}")
+    print(f"  ok      : {result.get('ok')}")
+    print(f"  handled : {result.get('handled', result.get('ok', False))}")
+    print(f"  action  : {result.get('action', route.get('action'))}")
+    print(f"  query   : {result.get('query', route.get('query', '')) or '(none)'}")
+    if result.get("backend"):
+        print(f"  backend : {result.get('backend')}")
+    if result.get("autostarted"):
+        print("  autostarted: True")
+    if result.get("url"):
+        print(f"  url     : {result.get('url')}")
+    if result.get("target"):
+        print(f"  target  : {result.get('target')}")
+    if "paused" in result:
+        print(f"  paused  : {result.get('paused')}")
+    if "resumed" in result:
+        print(f"  resumed : {result.get('resumed')}")
+    if "stopped" in result:
+        print(f"  stopped : {result.get('stopped')}")
+    if "ipc_ready" in result:
+        print(f"  ipc_ready: {result.get('ipc_ready')}")
+    if result.get("error"):
+        print(f"  error   : {result.get('error')}")
+        print("  hint    : start Terminal 4 music_web_player, or use --no-music.")
+    return result
+
+
+def execute_weather_route(route: dict[str, Any], args: argparse.Namespace, response: dict[str, Any], *, phase: str) -> dict[str, Any] | None:
+    if not route.get("should_call"):
+        return None
+
+    payload: dict[str, Any] = {
+        "text": route.get("transcript", ""),
+        "action": "weather",
+        "source": "wake_voice_chat_frdm_bridge",
+        "phase": phase,
+        "default_location": getattr(args, "weather_default_location", DEFAULT_WEATHER_LOCATION),
+        "timeout_sec": float(getattr(args, "weather_api_timeout", 5.0) or 5.0),
+    }
+    if route.get("location"):
+        payload["location"] = route.get("location")
+
+    try:
+        started = time.monotonic()
+        result = voice_chat.post_json(args.weather_url, payload, timeout_sec=float(getattr(args, "weather_timeout", 6.0)))
+        result["post_ms"] = int((time.monotonic() - started) * 1000)
+        result["phase"] = phase
+    except Exception as exc:
+        first_error = str(exc)
+        if maybe_autostart_music_tool(args, tool_url=args.weather_url):
+            try:
+                started = time.monotonic()
+                result = voice_chat.post_json(args.weather_url, payload, timeout_sec=float(getattr(args, "weather_timeout", 6.0)))
+                result["post_ms"] = int((time.monotonic() - started) * 1000)
+                result["phase"] = phase
+                result["autostarted"] = True
+            except Exception as retry_exc:
+                result = {
+                    "ok": False,
+                    "handled": False,
+                    "phase": phase,
+                    "action": "weather",
+                    "location": route.get("location", ""),
+                    "error": str(retry_exc),
+                    "first_error": first_error,
+                }
+        else:
+            result = {
+                "ok": False,
+                "handled": False,
+                "phase": phase,
+                "action": "weather",
+                "location": route.get("location", ""),
+                "error": first_error,
+            }
+
+    response["weather"] = {**route, **result}
+    print()
+    print("Weather tool:")
+    print(f"  phase    : {phase}")
+    print(f"  ok       : {result.get('ok')}")
+    print(f"  handled  : {result.get('handled', result.get('ok', False))}")
+    print(f"  location : {result.get('location', route.get('location', '')) or args.weather_default_location}")
+    if result.get("target"):
+        print(f"  target   : {result.get('target')}")
+    if result.get("source"):
+        print(f"  source   : {result.get('source')}")
+    if result.get("reply"):
+        print(f"  reply    : {result.get('reply')}")
+    if result.get("error"):
+        print(f"  error    : {result.get('error')}")
+        print("  hint     : check network, Open-Meteo reachability, or use --no-weather.")
+    return result
+
+
+def maybe_apply_weather_response(response: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
+    weather_route = detect_weather_route(response, args)
+    if not weather_route.get("should_call"):
+        return None
+
+    result = execute_weather_route(weather_route, args, response, phase="before_tts")
+    if not result:
+        return None
+
+    if result.get("ok") and result.get("handled") and str(result.get("reply", "")).strip():
+        response["reply"] = str(result["reply"]).strip()
+        response["control"] = {
+            "persistent_state": "unchanged",
+            "emotion": "curious",
+            "head_motion": "gentle_nod",
+            "reason": "local weather API answer",
+        }
+        response["emotion"] = emotion_summary_from_control(response["control"])
+        response.setdefault("debug", {})
+        if isinstance(response["debug"], dict):
+            response["debug"]["local_weather_used"] = True
+            response["debug"]["local_weather_source"] = result.get("source", "open-meteo")
+        return result
+
+    response["reply"] = "我有聽到你在問天氣，但我剛剛連不到本地天氣工具或天氣資料來源。你可以稍後再問我一次。"
+    response["control"] = {
+        "persistent_state": "unchanged",
+        "emotion": "confused",
+        "head_motion": "gentle_nod",
+        "reason": "local weather API failed",
+    }
+    response["emotion"] = emotion_summary_from_control(response["control"])
+    return result
 
 
 class RobotUartController:
@@ -2121,6 +2633,9 @@ def build_wake_hook(
         turn_state["timing"] = timing
         timing.mark("wake detected")
 
+        pause_music_for_wake(args)
+        timing.mark("music paused for wake")
+
         metadata: dict[str, Any] = {
             "capture_timestamp": datetime.now(timezone.utc).isoformat(),
             "image_format": "jpeg",
@@ -2361,6 +2876,39 @@ def run_self_test() -> int:
     if silence_threshold < silence_base:
         raise AssertionError("adaptive silence threshold below base")
 
+    music_args = argparse.Namespace(
+        no_music=False,
+        music_always_call=False,
+        music_debug=False,
+        music_url=DEFAULT_MUSIC_TOOL_URL,
+        music_backend="auto",
+        music_dry_run=True,
+        music_timeout=0.1,
+    )
+    music_route = detect_music_route({"transcript": "我想要听《告白气球》。"}, music_args)
+    if not music_route.get("intent") or music_route.get("action") != "play" or "告白" not in str(music_route.get("query", "")):
+        raise AssertionError(f"music route detection failed: {music_route}")
+    stop_route = detect_music_route({"transcript": "停止音樂"}, music_args)
+    if stop_route.get("action") != "stop":
+        raise AssertionError(f"music stop detection failed: {stop_route}")
+    resume_route = detect_music_route({"transcript": "繼續播放音樂"}, music_args)
+    if resume_route.get("action") != "resume":
+        raise AssertionError(f"music resume detection failed: {resume_route}")
+
+    weather_args = argparse.Namespace(
+        no_weather=False,
+        weather_always_call=False,
+        weather_debug=False,
+        weather_url=DEFAULT_WEATHER_TOOL_URL,
+        weather_default_location="Taipei",
+    )
+    weather_route = detect_weather_route({"transcript": "明天下午三點所在地天氣如何？"}, weather_args)
+    if not weather_route.get("intent") or weather_route.get("action") != "weather":
+        raise AssertionError(f"weather route detection failed: {weather_route}")
+    non_weather_route = detect_weather_route({"transcript": "講個笑話"}, weather_args)
+    if non_weather_route.get("intent"):
+        raise AssertionError(f"non-weather route should not trigger: {non_weather_route}")
+
     print("wake bridge self-test OK")
     return 0
 
@@ -2453,6 +3001,10 @@ def handle_wake_chat_response(
     robot: RobotUartController,
     timing: TimingLogger | None,
 ) -> bool:
+    weather_result = maybe_apply_weather_response(response, args)
+    if weather_result is not None and timing is not None:
+        timing.mark("weather tool handled" if weather_result.get("ok") else "weather tool failed")
+
     control = normalize_control(response)
     response["control"] = control
     reply = sanitize_reply(response)
@@ -2465,6 +3017,9 @@ def handle_wake_chat_response(
 
     voice_chat.print_result(response, verbose_debug=args.debug)
     response_vision_summary(response)
+    music_route = detect_music_route(response, args)
+    if music_route.get("action") in {"stop", "pause"}:
+        execute_music_route(music_route, args, response, phase="before_tts")
 
     if control["persistent_state"] in {"normal", "sleep"}:
         robot.set_persistent_state(control["persistent_state"])
@@ -2478,6 +3033,11 @@ def handle_wake_chat_response(
     tts_ok = speak_reply_and_wait(response, args)
     if timing is not None:
         timing.mark("TTS finished or estimated finished")
+
+    if music_route.get("action") in {"play", "resume"}:
+        execute_music_route(music_route, args, response, phase="after_tts")
+        if timing is not None:
+            timing.mark("music triggered")
 
     head_thread.join(timeout=2.0)
     if head_thread.is_alive():
@@ -2623,6 +3183,20 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     vision_mode = "off" if args.no_vision else ("force" if args.force_vision else "auto")
     print(f"Vision mode: {vision_mode}")
     print(f"Camera: {'disabled' if args.no_camera or args.no_vision else f'{args.camera_id}, {args.camera_width}x{args.camera_height}, jpeg_quality={args.camera_jpeg_quality}'}")
+    if args.no_music:
+        music_desc = "disabled"
+    else:
+        music_desc = (
+            f"{args.music_url}, backend={args.music_backend}->{resolve_music_backend(args)}, "
+            f"autostart={not args.no_music_autostart}, "
+            f"pause_on_wake={not args.no_music_pause_on_wake}"
+        )
+    print(f"Music tool: {music_desc}")
+    if args.no_weather:
+        weather_desc = "disabled"
+    else:
+        weather_desc = f"{args.weather_url}, default_location={args.weather_default_location}, source=Open-Meteo"
+    print(f"Weather tool: {weather_desc}")
     print(f"TTS queue polling: every {args.tts_poll_interval:g}s, playback_timeout={args.tts_playback_timeout:g}s")
     if args._manual_input_device:
         print("WARNING: --device pins a numeric microphone index. Omit --device and use --mic-keyword for USB replug recovery.")
@@ -2829,6 +3403,30 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     vision_group = parser.add_argument_group("vision routing")
     vision_group.add_argument("--force-vision", action="store_true", help="Force Windows server to use the uploaded image when one is available.")
     vision_group.add_argument("--no-vision", action="store_true", help="Disable camera capture and Windows vision analysis for this client.")
+    music_group = parser.add_argument_group("music tool routing")
+    music_group.add_argument("--no-music", action="store_true", help="Disable local Music Web Player sidecar routing.")
+    music_group.add_argument("--music-url", default=os.getenv("MUSIC_TOOL_URL", DEFAULT_MUSIC_TOOL_URL), help="Music Web Player /music endpoint.")
+    music_group.add_argument("--music-backend", choices=["auto", "browser", "mpv"], default=os.getenv("MUSIC_TOOL_BACKEND", "auto"))
+    music_group.add_argument("--music-timeout", type=float, default=_env_float("MUSIC_TOOL_TIMEOUT", 3.0))
+    music_group.add_argument(
+        "--music-wake-pause-timeout",
+        type=float,
+        default=_env_float("MUSIC_WAKE_PAUSE_TIMEOUT", 0.6),
+        help="Short local HTTP timeout for pausing music immediately after wake detection.",
+    )
+    music_group.add_argument("--music-dry-run", action="store_true", help="Ask music sidecar to detect but not open/play.")
+    music_group.add_argument("--music-always-call", action="store_true", help="POST every transcript to the music sidecar, even if local intent detection is false.")
+    music_group.add_argument("--music-debug", action="store_true", help="Print music routing details even when no music intent was detected.")
+    music_group.add_argument("--no-music-autostart", action="store_true", help="Do not auto-start the local music sidecar when /music is unreachable.")
+    music_group.add_argument("--no-music-pause-on-wake", action="store_true", help="Do not pause active music as soon as Hey Jarvis is detected.")
+    weather_group = parser.add_argument_group("weather tool routing")
+    weather_group.add_argument("--no-weather", action="store_true", help="Disable local weather routing through the Music Web Player sidecar.")
+    weather_group.add_argument("--weather-url", default=os.getenv("WEATHER_TOOL_URL", DEFAULT_WEATHER_TOOL_URL), help="Local tool /weather endpoint.")
+    weather_group.add_argument("--weather-default-location", default=os.getenv("WEATHER_DEFAULT_LOCATION", DEFAULT_WEATHER_LOCATION), help="Location used for '所在地/這裡/here' weather requests.")
+    weather_group.add_argument("--weather-timeout", type=float, default=_env_float("WEATHER_TOOL_TIMEOUT", 6.0), help="HTTP timeout for the local /weather endpoint.")
+    weather_group.add_argument("--weather-api-timeout", type=float, default=_env_float("WEATHER_API_TIMEOUT", 5.0), help="Open-Meteo request timeout inside the local weather tool.")
+    weather_group.add_argument("--weather-always-call", action="store_true", help="POST every transcript to /weather, even if local intent detection is false.")
+    weather_group.add_argument("--weather-debug", action="store_true", help="Print weather routing details even when no weather intent was detected.")
     tts_timing_group = parser.add_argument_group("tts timing")
     tts_timing_group.add_argument(
         "--tts-playback-timeout",
@@ -2855,6 +3453,8 @@ def main() -> int:
     args._manual_beep_device = args.beep_device is not None
     args.server_url = voice_chat.normalize_server_url(args.server_url)
     args.tts_url = voice_chat.normalize_tts_url(args.tts_url, blocking=args.tts_blocking)
+    args.music_url = normalize_music_url(args.music_url)
+    args.weather_url = normalize_weather_url(args.weather_url)
     bridge.apply_default_tts_voice(args)
     args.tts_interrupt = not args.tts_no_interrupt
     args.tts_stream = False if args.tts_file_playback else None
