@@ -40,6 +40,7 @@ PROJECT_ROOT = THIS_DIR.parent
 VOICE_DIR = PROJECT_ROOT / "emotion_robot_controller" / "voice_stt_remote"
 VISION_DIR = PROJECT_ROOT / "vision"
 MUSIC_AGENT_DIR = PROJECT_ROOT / "music_agent"
+REPO_VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
 
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
@@ -631,8 +632,12 @@ def build_music_orchestrator(args: argparse.Namespace) -> Any | None:
         print("WARNING: music_agent package is unavailable; music control is disabled.")
         return None
 
+    default_play_cmd = ""
+    if REPO_VENV_PYTHON.exists():
+        default_play_cmd = f'"{REPO_VENV_PYTHON}" "{MUSIC_AGENT_DIR / "play_youtube_music.py"}" {{query}}'
+
     return CommandMusicOrchestrator(
-        play_cmd=getattr(args, "music_play_cmd", ""),
+        play_cmd=getattr(args, "music_play_cmd", "") or default_play_cmd,
         pause_cmd=getattr(args, "music_pause_cmd", ""),
         resume_cmd=getattr(args, "music_resume_cmd", ""),
         next_cmd=getattr(args, "music_next_cmd", ""),
@@ -2027,7 +2032,7 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     music_group.add_argument("--music-resume-cmd", default=os.getenv("MUSIC_RESUME_CMD", ""), help="Command for resume action.")
     music_group.add_argument("--music-next-cmd", default=os.getenv("MUSIC_NEXT_CMD", ""), help="Command for next action.")
     music_group.add_argument("--music-stop-cmd", default=os.getenv("MUSIC_STOP_CMD", ""), help="Command for stop action.")
-    music_group.add_argument("--music-cmd-timeout", type=float, default=_env_float("MUSIC_CMD_TIMEOUT", 8.0), help="Timeout in seconds for each music command.")
+    music_group.add_argument("--music-cmd-timeout", type=float, default=_env_float("MUSIC_CMD_TIMEOUT", 30.0), help="Timeout in seconds for each music command.")
     return parser
 
 

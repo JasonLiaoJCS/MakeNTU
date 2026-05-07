@@ -52,7 +52,6 @@ class CommandMusicOrchestrator:
                 cmd_template,
                 query=query,
                 success_message=f"好，幫你播放：{query}",
-                background=True,
             )
 
         if action == "pause":
@@ -83,30 +82,29 @@ class CommandMusicOrchestrator:
         *,
         query: Optional[str] = None,
         success_message: str,
-        background: bool = False,
     ) -> MusicActionResult:
         expanded = cmd_template.format(query=(query or ""))
         try:
             argv = shlex.split(expanded)
             if not argv:
                 return MusicActionResult(handled=True, action="error", message="音樂命令是空的，請重新設定。")
-            if background:
-                subprocess.Popen(
-                    argv,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            else:
-                subprocess.run(
-                    argv,
-                    check=True,
-                    timeout=self.command_timeout_sec,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+            result = subprocess.run(
+                argv,
+                check=False,
+                timeout=self.command_timeout_sec,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()
+                stdout = (result.stdout or "").strip()
+                detail_parts = [part for part in [stderr, stdout] if part]
+                detail = " | ".join(detail_parts)
+                if detail:
+                    detail = f": {detail}"
+                return MusicActionResult(handled=True, action="error", message=f"音樂命令執行失敗{detail}")
             return MusicActionResult(handled=True, action="ok", message=success_message)
         except subprocess.TimeoutExpired:
             return MusicActionResult(handled=True, action="error", message="音樂命令逾時，請檢查播放器是否正常。")
-        except Exception:
-            return MusicActionResult(handled=True, action="error", message="音樂命令執行失敗，請檢查命令設定。")
+        except Exception as exc:
+            return MusicActionResult(handled=True, action="error", message=f"音樂命令執行失敗: {exc!r}")

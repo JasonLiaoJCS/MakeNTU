@@ -12,14 +12,16 @@ def _must_have(binary: str) -> None:
         raise RuntimeError(f"Missing dependency: {binary}")
 
 
+def _yt_dlp_cmd() -> list[str]:
+    try:
+        import yt_dlp  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError("Missing dependency: yt-dlp Python module") from exc
+    return [sys.executable, "-m", "yt_dlp"]
+
+
 def _resolve_first_result_url(query: str) -> str:
-    cmd = [
-        "yt-dlp",
-        "--default-search",
-        "ytsearch1",
-        "--get-url",
-        f"ytsearch1:{query}",
-    ]
+    cmd = _yt_dlp_cmd() + ["--default-search", "ytsearch1", "--get-url", f"ytsearch1:{query}"]
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     url = result.stdout.strip().splitlines()
     if not url:
