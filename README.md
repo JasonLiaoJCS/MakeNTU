@@ -1,35 +1,38 @@
 # MakeNTU Desktop Pet Demo
 
-這個 repo 目前主要是 MakeNTU 桌寵系統的整合專案：Jetson 端負責 wake word、錄音、相機、TTS、FRDM UART、music/weather sidecar、to-do list、專心工作模式；Windows 桌機負責 ASR、Ollama/Qwen 回覆與 vision/focus-check。
+This repository is the integration project for the MakeNTU desktop pet system. The Jetson side handles wake word detection, recording, camera capture, TTS, FRDM UART, the music/weather sidecar, the local to-do list, and focus work mode. The Windows desktop handles ASR, Ollama/Qwen replies, vision, and `/focus-check`.
 
-正式 demo 建議優先看：
+For the live demo, start here:
 
 ```text
-frdm_uart_context_sender/QUICK_START.md   # 現場完整啟動手冊
-frdm_uart_context_sender/README.md        # 架構、UART、focus/to-do/music/weather 詳細說明
+frdm_uart_context_sender/QUICK_START.md   # full on-site startup guide
+frdm_uart_context_sender/README.md        # architecture, UART, focus/to-do/music/weather details
 ```
 
 ## Current Main Features
 
 ```text
 Wake word             : Hey Jarvis / openWakeWord
-Conversation mode     : 一次喚醒後可連續 follow-up，結束後回 wake-only standby
+Conversation mode     : continuous follow-up after one wake; returns to wake-only standby when done
 Windows AI server     : /voice-chat, /text-chat, /focus-check
 Local model path      : Windows ASR + Ollama qwen35-fast:latest
-Vision                : speech-end beep 後拍照，上傳到 Windows；照片預設 memory-only
+Vision                : captures after the end-of-speech beep, uploads to Windows; images are memory-only by default
 FRDM UART             : auto @ 115200 CRLF
 FRDM state machine    : Normal / Thinking / Speaking / Music / Focus / Sleep
+FRDM startup data     : Time + Weather UART payloads before Normal
+FRDM dashboard data   : Todo / Music / Focus / Health UART payloads for swipe pages
 Head motor            : MotorPitch 65..90..115, MotorYaw 0..90..180
 TTS                   : Jetson Piper /speak_async, UACDemo audio
 Music tool            : Jetson local /music, mpv + yt-dlp
 Weather tool          : Jetson local /weather, Open-Meteo
 To-do list            : local JSON voice tool, frdm_uart_context_sender/logs/todo_list.json
-Focus work mode       : 每 60 秒取樣，產生 focus_summary.json + focus_report.md
+Focus work mode       : samples every 60 seconds; writes focus_summary.json + focus_report.md
+Focus report title    : "專心報告：YYYY/MM/DD/HH 開始的專注時段"
 Focus notification    : optional Discord webhook; fallback reads ~/.config/makentu/discord_webhook_url
 Display toolkit       : OBS/Hagibis capture troubleshooting scripts, kept below
 ```
 
-不要固定 USB 數字 index。正式 demo 用 keyword/auto：
+Do not pin numeric USB indexes. For the live demo, use keyword/auto discovery:
 
 ```text
 mic       : --mic-keyword UACDemo
@@ -40,7 +43,7 @@ FRDM UART : --uart-port auto
 
 ## One-Page Startup
 
-啟動順序：
+Startup order:
 
 ```text
 Terminal 1 on Windows : desktop_fast_chat_server.py
@@ -49,7 +52,7 @@ Terminal 4 on Jetson  : music_web_player.py   # /music + /weather
 Terminal 3 on Jetson  : wake_voice_chat_frdm_bridge.py
 ```
 
-目前預設 Tailscale / endpoint：
+Current default Tailscale addresses and endpoints:
 
 ```text
 Windows Tailscale : 100.108.141.26
@@ -59,11 +62,11 @@ Jetson TTS        : http://127.0.0.1:8777
 Local tools       : http://127.0.0.1:8788/music and /weather
 ```
 
-如果 IP 變了，把下面指令裡的 `100.108.141.26` 一起改掉。
+If the IP changes, update every `100.108.141.26` in the commands below.
 
 ### Terminal 1: Windows ASR/Ollama Server
 
-Windows PowerShell：
+Windows PowerShell:
 
 ```powershell
 try {
@@ -86,7 +89,7 @@ python desktop_fast_chat_server.py `
   --no-think
 ```
 
-如果 server code 有更新，先從 Jetson 同步最新版 bundle：
+If the server code changed, sync the latest bundle from the Jetson first:
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\Desktop\windows_desktop_server_bundle" | Out-Null
@@ -95,7 +98,7 @@ scp asrlab-yian@100.110.90.72:/home/asrlab-yian/MakeNTU/emotion_robot_controller
 
 ### Terminal 2: Jetson Piper TTS
 
-Jetson：
+Jetson:
 
 ```bash
 cd /home/asrlab-yian/MakeNTU/jetson_piper_tts
@@ -109,7 +112,7 @@ python -m jetson_piper_tts.server \
   --no-warmup
 ```
 
-`.env` 建議：
+Recommended `.env`:
 
 ```text
 AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
@@ -119,7 +122,7 @@ ENABLE_STREAM_PLAYBACK=true
 
 ### Terminal 4: Jetson Music/Weather Tool
 
-Jetson：
+Jetson:
 
 ```bash
 cd /home/asrlab-yian/MakeNTU/music_web_player
@@ -133,7 +136,7 @@ python3 music_web_player.py \
   --weather-default-location Taipei
 ```
 
-Health check：
+Health check:
 
 ```bash
 curl http://127.0.0.1:8788/health
@@ -141,7 +144,7 @@ curl http://127.0.0.1:8788/health
 
 ### Discord Webhook Setup For Focus Reports
 
-建議把 webhook 放在 secret file，不要每次 export，也不要 commit 到 git：
+Store the webhook in a secret file so you do not need to export it every time. Do not commit this file:
 
 ```bash
 mkdir -p ~/.config/makentu
@@ -149,7 +152,7 @@ printf '%s\n' 'https://discord.com/api/webhooks/...' > ~/.config/makentu/discord
 chmod 600 ~/.config/makentu/discord_webhook_url
 ```
 
-確認不要印完整 URL：
+Check it without printing the full URL:
 
 ```bash
 python3 - <<'PY'
@@ -163,7 +166,7 @@ print("prefix:", value[:38])
 PY
 ```
 
-程式會依序讀：
+The program reads these sources in order:
 
 ```text
 --focus-discord-webhook-url
@@ -174,7 +177,7 @@ DISCORD_WEBHOOK_URL
 
 ### Terminal 3: Jetson Wake Bridge Full Demo
 
-Jetson：
+Jetson:
 
 ```bash
 cd /home/asrlab-yian/MakeNTU
@@ -241,7 +244,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --uart-debug
 ```
 
-若 FRDM motor parser 還在修，暫時把 `--enable-head-motor` 換成：
+If the FRDM motor parser is still being debugged, temporarily replace `--enable-head-motor` with:
 
 ```bash
 --disable-head-motor \
@@ -249,7 +252,9 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 
 ## Voice Test Flow
 
-Wake Bridge 啟動後，可以照這個順序測完整功能：
+After the Wake Bridge starts, use this flow to test the full feature set:
+
+The following Mandarin lines are intentional demo utterances, because they are the actual phrases currently tested by the voice intent rules.
 
 ```text
 Hey Jarvis，講個笑話
@@ -263,24 +268,25 @@ Hey Jarvis，講個笑話
 開始專心工作 1 分鐘 測試報告整合
 ```
 
-進入專心模式後，focus 指令會回到 wake-only standby，所以要再喚醒：
+After entering focus mode, the focus command returns the bridge to wake-only standby, so wake it again:
 
 ```text
 Hey Jarvis，完成待辦 1
 Hey Jarvis，結束工作
 ```
 
-預期結果：
+Expected result:
 
 ```text
-FRDM 切到 Focus / Thinking / Speaking / Normal 等狀態
-speech-end 時相機拍照並上傳
-to-do JSON 被更新
-focus 結束產生 focus_summary.json + focus_report.md
-Discord 收到 focus summary
+FRDM switches among Focus / Thinking / Speaking / Normal states
+camera captures and uploads at speech end
+to-do JSON is updated
+focus session writes focus_summary.json + focus_report.md
+focus_report.md H1 and Discord title use "專心報告：YYYY/MM/DD/HH 開始的專注時段"
+Discord receives the focus summary
 ```
 
-查最新 focus 報告：
+Inspect the latest focus report:
 
 ```bash
 latest=$(find /tmp/focus_voice_test -maxdepth 1 -type d -name 'focus_*' | sort | tail -n 1)
@@ -291,7 +297,7 @@ sed -n '1,220p' "$latest/focus_report.md"
 
 ## Direct Tests
 
-不開完整 wake bridge，只測 focus report + Discord：
+Test focus report + Discord without starting the full wake bridge:
 
 ```bash
 cd /home/asrlab-yian/MakeNTU
@@ -308,7 +314,7 @@ python3 frdm_uart_context_sender/focus_work_mode.py \
   --notify-mode discord
 ```
 
-抓一張相機視野：
+Capture one camera preview:
 
 ```bash
 cd /home/asrlab-yian/MakeNTU
@@ -323,7 +329,7 @@ python3 frdm_uart_context_sender/focus_work_mode.py \
   --log-root /tmp/camera_preview_focus
 ```
 
-測 FRDM head motor，不開 mic/camera/TTS/server：
+Test the FRDM head motor without mic/camera/TTS/server:
 
 ```bash
 python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
@@ -338,19 +344,19 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 ## FRDM UART State Machine Quick Reference
 
 ```text
-bridge startup        -> wait 2s -> Normal 0 0
+bridge startup        -> wait 2s -> Time <payload> -> Weather <payload> -> Normal 0 0
 Hey Jarvis detected   -> Thinking 0 0
 AI/TTS starts         -> Speaking <0..5>
 TTS speaking          -> MotorPitch <angle>, MotorYaw <angle>
 follow-up listening   -> Thinking 0 0
-掰掰/拜拜/再見        -> Normal 0 0, then wake-only standby
-睡覺/休息/晚安        -> Sleep 0 0, then wake-only standby
-播放/繼續音樂         -> Music 0 0, then wake-only standby
-暫停/停止音樂         -> Normal 0 0, then wake-only standby
-專注/專心/工作模式    -> Focus 0 0, then wake-only standby
+bye / goodbye / 掰掰 / 拜拜 / 再見             -> Normal 0 0, then wake-only standby
+sleep / rest / good night / 睡覺 / 休息 / 晚安  -> Sleep 0 0, then wake-only standby
+play/resume music / 播放/繼續音樂              -> Music 0 0, then wake-only standby
+pause/stop music / 暫停/停止音樂               -> Normal 0 0, then wake-only standby
+focus/work mode / 專注/專心/工作模式           -> Focus 0 0, then wake-only standby
 ```
 
-`Speaking`、`MotorPitch`、`MotorYaw` 是單參數格式：
+`Speaking`, `MotorPitch`, and `MotorYaw` use a single-argument wire format:
 
 ```text
 Speaking 4
@@ -358,7 +364,7 @@ MotorPitch 90
 MotorYaw 90
 ```
 
-其他畫面 command 保留兩個參數：
+Other screen commands keep two arguments:
 
 ```text
 Normal 0 0
@@ -368,15 +374,36 @@ Focus 0 0
 Sleep 0 0
 ```
 
-Servo 角度定義：
+Startup data commands update GUI data and do not switch screens by themselves:
 
 ```text
-Pitch 65  = 低頭極限
-Pitch 90  = 中間
-Pitch 115 = 抬頭極限
-Yaw 0     = 右轉極限
-Yaw 90    = 中間
-Yaw 180   = 左轉極限
+Time 20260509,213005,6,+480
+Weather daily,23,29,40,61
+Todo 3,1                  # open_count, done_count
+TodoItem 1,17,open,Write%20report
+TodoEnd 1
+Music playing,Lo-fi%20Study,mpv
+Focus focused,25,2        # state, remaining_min, streak_count
+Health win=1,tts=1,music=1,camera=1
+```
+
+FRDM checkbox completion is a reverse UART event:
+
+```text
+TodoDone 17
+```
+
+Jetson completes item id `17` and sends a fresh `Todo` / `TodoItem` / `TodoEnd` snapshot back to FRDM.
+
+Servo angle definition:
+
+```text
+Pitch 65  = lower/down limit
+Pitch 90  = center
+Pitch 115 = upper/up limit
+Yaw 0     = right limit
+Yaw 90    = center
+Yaw 180   = left limit
 ```
 
 ## OBS Capture Display Toolkit

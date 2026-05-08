@@ -32,6 +32,7 @@ Wake word         : Hey Jarvis
 FRDM baudrate     : 115200, CRLF
 Local tool server : http://127.0.0.1:8788
 Weather source    : Open-Meteo, default location=Taipei
+Startup weather   : enabled, sends Weather UART once before Normal
 ```
 
 如果 Tailscale IP 變了，所有指令裡的 IP 要一起改。
@@ -61,6 +62,7 @@ boot_normal_delay=2.0s
 focus_work_mode=on, interval=60s, manual stop
 todo_list=on, local JSON at frdm_uart_context_sender/logs/todo_list.json
 focus_report=focus_summary.json + focus_report.md, optional Discord webhook
+focus_report_title=專心報告：YYYY/MM/DD/HH 開始的專注時段
 tts_poll_interval=0.75
 music_backend=mpv
 music_wake_pause_timeout=0.6
@@ -68,7 +70,7 @@ weather_default_location=Taipei
 head_pitch=65..90..115 (down..center..up)
 head_yaw=0..90..180 (right..center..left)
 head_motor=enabled in Terminal 3 full demo, disable only for FRDM parser debugging
-head_motion=smooth interpolation, max 10deg per UART step
+head_motion=pose-driven cute motion, large yaw/pitch targets with longer holds
 ```
 
 這組偏向 demo 穩定與低延遲：現場吵也不會一輪卡太久，USB mic 停吐 audio chunk 時也會自動退出當輪。
@@ -112,10 +114,10 @@ Jetson Terminal 4   -> music/weather tool 若已正常可不用重啟；若點�
 FRDM UART 狀態機速查：
 
 ```text
-bridge startup        -> wait 2s -> Normal 0 0
+bridge startup        -> wait 2s -> Weather <payload> -> Normal 0 0
 Hey Jarvis detected   -> Thinking 0 0
 AI/TTS starts         -> Speaking <0..5>
-TTS speaking          -> MotorPitch <angle>, MotorYaw <angle>
+TTS speaking          -> MotorYawPitch <yaw> <pitch>
 follow-up listening   -> Thinking 0 0
 掰掰/拜拜/再見        -> Normal 0 0, then wake-only standby
 睡覺/休息/晚安        -> Sleep 0 0, then wake-only standby
@@ -139,10 +141,12 @@ confused  -> Speaking 5
 sleepy    -> Speaking 3   # FRDM 沒有獨立 sleepy 臉，借用 sad 臉
 ```
 
+注意：這裡的 emotion 是機器人自己的表情反應，不是使用者的情緒分類。使用者罵髒話、生氣或責備時，機器人預設會送 `concerned -> Speaking 1`，代表冷靜關心，不會自動把使用者的怒氣鏡像成 angry 臉。只有機器人自己的回覆真的在嚴肅設界線或表達不悅時，才會送 `angry -> Speaking 2`。
+
 常見同義情緒也會自動轉成目前 FRDM 支援的 speaking code：
 
 ```text
-操你媽 / 生氣 / 火大 / 不爽  -> angry     -> Speaking 2
+操你媽 / 生氣 / 火大 / 不爽  -> concerned -> Speaking 1   # robot does not mirror user anger
 sad / 難過 / 沮喪             -> sad       -> Speaking 3
 anxious / worried / 急 / 擔心 -> concerned -> Speaking 1
 surprised / amazed / 興奮     -> excited   -> Speaking 4
@@ -157,6 +161,22 @@ emotion_robot_controller/frdm_firmware/patches/speaking_gui_emotion_fix.c
 ```
 
 如果你聽到「聲音超小」這類音量抱怨，程式不應再把 `聽到聲音` 誤判成點歌；只有明確「播放、放歌、我想聽歌、我想聽告白氣球」才會走 Music。
+
+Startup Weather UART：
+
+```text
+Jetson startup weather lookup -> Weather daily,23,29,40,61
+
+格式：Weather kind,low_or_temp,high_or_temp,rain_percent,open_meteo_weather_code
+daily   例：Weather daily,23,29,40,61
+current 例：Weather current,27,27,0,2
+```
+
+Jetson 會用既有 `/weather` 工具查 Open-Meteo，FRDM 只負責解析這行 UART 並把資料顯示在 Sleep 畫面。FRDM 端參考 patch：
+
+```text
+emotion_robot_controller/frdm_firmware/patches/weather_uart_sleep_screen.c
+```
 
 ## 0. 一頁照貼版
 
@@ -436,11 +456,11 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
-  --motor-step-delay 0.80 \
-  --motor-smooth-step-deg 10 \
-  --motor-speaking-step-delay 0.75 \
-  --motor-speaking-smooth-step-deg 60 \
-  --motor-reset-repeats 4 \
+  --motor-step-delay 0.55 \
+  --motor-smooth-step-deg 120 \
+  --motor-speaking-step-delay 0.72 \
+  --motor-speaking-smooth-step-deg 120 \
+  --motor-reset-repeats 1 \
   --motor-reset-delay 0.35 \
   --motor-stop-timeout 6 \
   --motor-join-timeout 6 \
@@ -452,7 +472,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 
 這是 Wake Bridge 完整功能版：wake word、連續對話、speech-end 拍照、FRDM UART、Piper TTS、To-Do、Music、Weather、Focus Work Mode 都會開。第一次說 `Hey Jarvis` 後會進入 conversation mode，後續 follow-up 不用重複喚醒詞；說 `byebye / 掰掰 / 拜拜 / 再見`、叫它睡覺、音樂控制結束、或 focus mode 指令處理完後，會回到只聽喚醒詞的 standby。
 
-Terminal 3 預設就是完整功能版，包含頭部馬達；啟動指令內已經有 `--enable-head-motor`，所以 TTS 說話期間會依 `head_motion` 送 `MotorPitch` / `MotorYaw`。
+Terminal 3 預設就是完整功能版，包含頭部馬達；啟動指令內已經有 `--enable-head-motor`，所以 TTS 說話期間會依 `head_motion` 送 `MotorYawPitch <yaw> <pitch>`。新版馬達策略是「少量大動作 + 到位停留」，不是密集小步進。
 
 如果 FRDM parser 還在 debug、暫時不想讓馬達動，把指令中的 `--enable-head-motor \` 改成：
 
@@ -498,7 +518,7 @@ speech end/silence <= 13000
 
 Focus Work Mode 指令也會自動結束 conversation mode，避免進入工作模式後還一直收 follow-up。開始後會立刻拍第一張工作狀態照片，之後每 `--focus-interval-sec 60` 秒取樣一次；照片預設只存在記憶體，判斷完就丟掉。`--focus-duration-min 0` 代表不自動結束，要再說「結束工作 / 停止專心 / 下班」才會停。
 
-Focus 結束時會寫 `focus_summary.json` 和 `focus_report.md`，內容會整合專注時間、分心時間、專注分數、建議，以及這段期間完成/剩下的 To-Do。若有設定 `DISCORD_WEBHOOK_URL`，會透過 Discord webhook 送一則短摘要；沒設 webhook 時只會留下檔案。
+Focus 結束時會寫 `focus_summary.json` 和 `focus_report.md`，內容會整合專注時間、分心時間、專注分數、建議，以及這段期間完成/剩下的 To-Do。報告標題會使用「專心報告：YYYY/MM/DD/HH 開始的專注時段」，同時寫進 `focus_summary.json` 的 `report_title`，Discord 第一行也會使用同一個標題。若有設定 `DISCORD_WEBHOOK_URL`，會透過 Discord webhook 送一則短摘要；沒設 webhook 時只會留下檔案。
 
 To-Do List 是本機 JSON 功能，不需要 Terminal 4 或 Windows server 額外支援。說「新增待辦 寫報告」「列出待辦」「完成待辦 1」會直接更新 `frdm_uart_context_sender/logs/todo_list.json`；它不會啟動/停止 focus mode，focus mode 執行中仍可先記明確的待辦。
 
@@ -509,8 +529,8 @@ To-Do List 是本機 JSON 功能，不需要 Terminal 4 或 Windows server 額�
 Terminal 3 看到這些就可以開始說 `Hey Jarvis`：
 
 ```text
-Client version: wake_voice_chat_frdm_bridge_vision_conversation_motor_safe_v4
-Server health: debug_version=11, chat_ready=True, asr_loaded=True
+Client version: wake_voice_chat_frdm_bridge_vision_conversation_motor_natural_v5
+Server health: debug_version=13, chat_ready=True, asr_loaded=True
 TTS health: ready=True
 Selected input device ... by keyword 'UACDemo'
 Selected beep output device ... by keyword 'UACDemo'
@@ -520,7 +540,7 @@ Focus work mode: enabled, script=/home/asrlab-yian/MakeNTU/frdm_uart_context_sen
 To-do list: enabled, path=/home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json
 Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True, beep_settle=0.18s, post_music_cooldown=0.8s
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
-Head motor motion: enabled=True, smooth_step=10deg, step_delay=0.8s, speaking_step_delay=0.75s, speaking_smooth_step=60deg, reset_repeats=4, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
+Head motor motion: enabled=True, smooth_step=120deg, step_delay=0.55s, speaking_step_delay=0.72s, speaking_smooth_step=120deg, reset_repeats=1, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
 Boot screen settle: waiting 2s, then sending Normal.
 FRDM UART TX: Normal 0 0
 Listening for wake word 'hey_jarvis'
@@ -538,7 +558,7 @@ MotorYaw 90     -> 中間
 MotorYaw 180    -> 左轉極限
 ```
 
-所有 head motion 結束都會多次回 `Pitch 90 / Yaw 90`。馬達 UART 只能送一個角度參數：`MotorPitch 90`、`MotorYaw 90`，不要送第二個數值。
+所有 head motion 結束都會回 `Yaw 90 / Pitch 90`。一般單軸馬達 UART 只送一個角度參數：`MotorPitch 90`、`MotorYaw 90`；新的同步馬達指令會送兩個數值：`MotorYawPitch 120 90`。目前頭部動作表會優先使用 `MotorYawPitch`，讓 yaw/pitch 同時到位。
 
 如果 TX 是正確的 `MotorPitch 90`，但 RX 變成：
 
@@ -561,6 +581,18 @@ PRINTF("Motor Yaw raw pValue = [%s]\r\n", pValue ? pValue : "(null)");
 
 如果 raw pValue 是 `[MotorYaw 90]`，handler 不能只用 `sscanf(pValue, "%d", &value)`，要改成同時支援「純參數」和「整行命令」的 parser。
 
+新的同步頭部指令要在 FRDM command table 加：
+
+```c
+{ "MotorYawPitch", "<yaw> <pitch>", "control yaw and pitch together", MotorControlYawPitch },
+```
+
+參考 patch：
+
+```text
+emotion_robot_controller/frdm_firmware/patches/motor_yaw_pitch_parser.c
+```
+
 先 dry-run 看全部 motion 會送什麼：
 
 ```bash
@@ -571,31 +603,21 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --test-head-motion all \
   --uart-dry-run \
   --uart-debug \
-  --motor-step-delay 0.02 \
-  --motor-smooth-step-deg 10 \
-  --motor-reset-delay 0.02 \
+  --motor-step-delay 0.01 \
+  --motor-reset-delay 0.01 \
   --test-head-gap 0
 ```
 
 你應該會看到類似：
 
 ```text
-Motor settings: pitch=65..90..115 (down..center..up), yaw=0..90..180 (right..center..left), smooth_step=10deg
+Motor settings: pitch=65..90..115 (down..center..up), yaw=0..90..180 (right..center..left), smooth_step=120deg
 Testing head motion: nod
-head motion keyframes: MotorPitch:90 -> MotorPitch:106 -> MotorPitch:106 -> MotorPitch:74 -> MotorPitch:74 -> MotorPitch:90
-head motion expanded: MotorPitch:90 -> MotorPitch:98 -> MotorPitch:106 -> MotorPitch:106 -> MotorPitch:98 -> MotorPitch:90 -> MotorPitch:82 -> MotorPitch:74 -> MotorPitch:74 -> MotorPitch:82 -> MotorPitch:90
-FRDM UART dry-run TX: MotorPitch 90
-FRDM UART dry-run TX: MotorPitch 98
-FRDM UART dry-run TX: MotorPitch 106
-FRDM UART dry-run TX: MotorPitch 106
-FRDM UART dry-run TX: MotorPitch 98
-FRDM UART dry-run TX: MotorPitch 90
-FRDM UART dry-run TX: MotorPitch 82
-FRDM UART dry-run TX: MotorPitch 74
-FRDM UART dry-run TX: MotorPitch 74
-FRDM UART dry-run TX: MotorPitch 82
-FRDM UART dry-run TX: MotorPitch 90
-FRDM UART dry-run TX: MotorYaw 90
+head motion keyframes: MotorYawPitch:yaw=90,pitch=90 -> MotorYawPitch:yaw=90,pitch=65 -> MotorYawPitch:yaw=90,pitch=108 -> MotorYawPitch:yaw=90,pitch=90
+head motion expanded: MotorYawPitch:yaw=90,pitch=90 -> MotorYawPitch:yaw=90,pitch=65 -> MotorYawPitch:yaw=90,pitch=108 -> MotorYawPitch:yaw=90,pitch=90
+head motion reset skipped: already centered
+FRDM UART dry-run TX: MotorYawPitch 90 90
+FRDM UART dry-run TX: MotorYawPitch 90 65
 ```
 
 再測「情緒會不會自動對應頭部動作」：
@@ -605,9 +627,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --test-head-emotion all \
   --uart-dry-run \
   --uart-debug \
-  --motor-step-delay 0.02 \
-  --motor-smooth-step-deg 10 \
-  --motor-reset-delay 0.02 \
+  --motor-step-delay 0.01 \
+  --motor-reset-delay 0.01 \
   --test-head-gap 0
 ```
 
@@ -625,7 +646,7 @@ confused  -> Speaking 5 -> shake
 sleepy    -> Speaking 3 -> sleepy_drop
 surprised / amazed       -> excited
 anxious / worried / 急   -> concerned
-操你媽 / 生氣 / 不爽     -> angry
+操你媽 / 生氣 / 不爽     -> concerned
 tired / drowsy           -> sleepy
 unsure / puzzled         -> confused
 ```
@@ -639,9 +660,9 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --enable-head-motor \
   --test-speaking-head-motion shake \
   --test-speaking-seconds 6 \
-  --motor-speaking-step-delay 0.75 \
-  --motor-speaking-smooth-step-deg 60 \
-  --motor-reset-repeats 4 \
+  --motor-speaking-step-delay 0.72 \
+  --motor-speaking-smooth-step-deg 120 \
+  --motor-reset-repeats 1 \
   --motor-reset-delay 0.35
 ```
 
@@ -653,21 +674,22 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --uart-debug \
   --enable-head-motor \
   --test-head-motion all \
-  --motor-step-delay 0.80 \
-  --motor-smooth-step-deg 10 \
-  --motor-reset-repeats 4 \
+  --motor-step-delay 0.55 \
+  --motor-smooth-step-deg 120 \
+  --motor-reset-repeats 1 \
   --motor-reset-delay 0.35
 ```
 
 現場調參：
 
 ```text
-看起來只轉一次、不連續      -> --motor-smooth-step-deg 6 或 8
-講話時動作太快              -> --motor-speaking-step-delay 0.9 或 1.0
-講話時動作太少              -> --motor-speaking-step-delay 0.55
-一次性測試動作太快          -> --motor-step-delay 1.0
-一次性測試太慢              -> --motor-step-delay 0.6
-偶爾沒有回正                -> --motor-reset-repeats 5
+看起來太碎、一直抖          -> --motor-smooth-step-deg 120
+想要稍微有中間過渡          -> --motor-smooth-step-deg 60
+講話時動作太快              -> --motor-speaking-step-delay 0.9
+講話時動作太慢              -> --motor-speaking-step-delay 0.55
+一次性測試動作太快          -> --motor-step-delay 0.75
+一次性測試太慢              -> --motor-step-delay 0.35
+偶爾沒有回正                -> --motor-reset-repeats 2
 回正指令太密或 FRDM 吃不穩   -> --motor-reset-delay 0.45
 TTS 結束後太早切下一個畫面      -> --motor-join-timeout 8
 ```
@@ -766,7 +788,7 @@ cd "$env:USERPROFILE\Desktop\windows_desktop_server_bundle"
 python desktop_fast_chat_server.py --self-test
 ```
 
-同步後一定要重啟 Windows server，health 要看到 `debug_version: 11`。
+同步後一定要重啟 Windows server，health 要看到 `debug_version: 13`。
 
 ### 1.3 軟體 Self-Test
 
@@ -778,7 +800,7 @@ Jetson：
 cd /home/asrlab-yian/MakeNTU
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --self-test
-python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --test-head-emotion all --uart-dry-run --uart-debug --motor-step-delay 0.02 --motor-smooth-step-deg 10 --motor-reset-delay 0.02 --test-head-gap 0
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --test-head-emotion all --uart-dry-run --uart-debug --motor-step-delay 0.01 --motor-reset-delay 0.01 --test-head-gap 0
 ```
 
 Windows PowerShell：
@@ -927,11 +949,11 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
-  --motor-step-delay 0.80 \
-  --motor-smooth-step-deg 10 \
-  --motor-speaking-step-delay 0.75 \
-  --motor-speaking-smooth-step-deg 60 \
-  --motor-reset-repeats 4 \
+  --motor-step-delay 0.55 \
+  --motor-smooth-step-deg 120 \
+  --motor-speaking-step-delay 0.72 \
+  --motor-speaking-smooth-step-deg 120 \
+  --motor-reset-repeats 1 \
   --motor-reset-delay 0.35 \
   --motor-stop-timeout 6 \
   --motor-join-timeout 6 \
@@ -985,7 +1007,7 @@ Standby audio...     -> 還在等 Hey Jarvis；recent_peak 是最近 1 秒音量
 Windows server health：
 
 ```text
-debug_version: 11
+debug_version: 13
 chat_ready   : True
 asr_loaded   : True
 ollama_model : qwen35-fast:latest
@@ -1004,7 +1026,7 @@ Jetson bridge：
 ```text
 Device preflight: releasing stale demo device owners.
 Device preflight: target devices look free.
-Client version: wake_voice_chat_frdm_bridge_vision_conversation_motor_safe_v4
+Client version: wake_voice_chat_frdm_bridge_vision_conversation_motor_natural_v5
 Selected input device ... by keyword 'UACDemo'.
 Selected beep output device ... by keyword 'UACDemo'.
 Camera ready in continuous warm-reader mode.
@@ -1013,7 +1035,7 @@ Adaptive recording gate: on, noise_p75, speech_margin=750, speech_ratio=1.45, si
 Audio read watchdog: callback queue, timeout=0.75s, progress_interval=1s
 Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True, beep_settle=0.18s, post_music_cooldown=0.8s
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
-Head motor motion: enabled=True, smooth_step=10deg, step_delay=0.8s, speaking_step_delay=0.75s, speaking_smooth_step=60deg, reset_repeats=4, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
+Head motor motion: enabled=True, smooth_step=120deg, step_delay=0.55s, speaking_step_delay=0.72s, speaking_smooth_step=120deg, reset_repeats=1, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
 TTS queue polling: every 0.75s, playback_timeout=45s
 USB auto-discovery: mic=keyword 'UACDemo'; beep=keyword 'UACDemo'; camera=auto; FRDM UART=auto
 Listening for wake word 'hey_jarvis'
@@ -1119,7 +1141,7 @@ Hey Jarvis，我好睏想睡
 -> Speaking 3
 
 Hey Jarvis，我操你媽的
--> Speaking 2
+-> Speaking 1
 
 Hey Jarvis，為什麼沒聲音，聲音超小
 -> 不應出現 Music routing action=play
@@ -1260,7 +1282,7 @@ Weather routing: intent=True location=...
 Weather tool: ok=True handled=True source=open-meteo
 Reply: <城市><時間>大約 ... °C，... 降雨機率 ...
 AI control: emotion=curious, head_motion=gentle_nod
-FRDM UART TX: Speaking 2
+FRDM UART TX: Speaking 5
 最後 FRDM UART TX: Thinking 0 0 或 Normal/Music/Focus/Sleep
 ```
 
@@ -1635,7 +1657,7 @@ ollama pull qwen35-fast:latest
 
 再重啟 Terminal 1。
 
-### debug_version 不是 11
+### debug_version 不是 13
 
 重新 scp 同步，關掉舊 server，重開 Terminal 1。
 
@@ -1777,7 +1799,7 @@ Windows：
 ```text
 [ ] 已同步 desktop_fast_chat_server.py
 [ ] ollama list 有 qwen35-fast:latest
-[ ] server health debug_version=11
+[ ] server health debug_version=13
 [ ] vision_model=qwen35-fast:latest
 ```
 

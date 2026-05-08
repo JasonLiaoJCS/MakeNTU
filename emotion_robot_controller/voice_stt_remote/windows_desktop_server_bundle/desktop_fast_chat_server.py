@@ -76,7 +76,7 @@ DEFAULT_FAST_MODEL = "qwen35-fast:latest"
 DEFAULT_VISION_MODEL = "qwen35-fast:latest"
 VISION_FALLBACK_MODELS: tuple[str, ...] = ()
 DEFAULT_MAX_IMAGE_BYTES = 2_000_000
-DEBUG_VERSION = 11
+DEBUG_VERSION = 13
 
 CONTROL_PERSISTENT_STATES = {"normal", "sleep", "unchanged"}
 CONTROL_SCREEN_MODES = {"unchanged", "normal", "sleep", "music", "focus", "thinking"}
@@ -241,11 +241,14 @@ control 規則：
 - 使用者要求播放音樂、放歌、來點音樂、繼續音樂：screen_mode="music"；emotion 通常 "happy" 或 "excited"。
 - 使用者要求專注、專心、工作模式、番茄鐘：screen_mode="focus"；emotion 通常 "curious" 或 "happy"。
 - 使用者說停止專注、回來、回到一般、開始正常工作：screen_mode="normal"。
+- 使用者直接叫你點頭、點個頭、nod：head_motion="nod"。使用者叫你搖頭、shake your head：head_motion="shake"。使用者叫你左右看、轉頭、look around：head_motion="look_around"。
 - 問問題、分析、思考、辨識時 emotion 通常是 "curious"。
 - 稱讚、完成任務、愉快對話用 "happy"。
 - 高能量好消息或興奮情境用 "excited"。
 - 不確定、資訊模糊、看不清楚用 "confused"。
-- 使用者憤怒或強烈髒話用 "angry"；使用者難過沮喪用 "sad"；焦慮擔心、需要關心時用 "concerned"。
+- emotion 是「機器人自己的臉部反應」，不是使用者的情緒標籤；不要照抄使用者的怒氣、難過或焦慮。
+- 使用者憤怒、罵髒話、責備你時，通常保持冷靜關心：emotion="concerned", head_motion="gentle_nod"。只有當你的回覆本身是在嚴肅設界線、明確不悅時，才可以用 "angry"。
+- 使用者難過、沮喪、焦慮時，通常用 "concerned" 表示陪伴和關心；只有當你自己在回覆中表達遺憾或難過時，才用 "sad"。
 - 你不用輸出馬達角度；Jetson 會根據 emotion/head_motion 自動送 MotorPitch/MotorYaw。
 """.strip()
 
@@ -277,6 +280,7 @@ control 規則：
 - 視覺辨識、看物品、看桌面、看螢幕通常 emotion="curious", head_motion="look_around", screen_mode="unchanged"。
 - 使用者問自己是否疲憊、表情是否不好、狀態是否低落時，若畫面合理可用 emotion="concerned", head_motion="gentle_nod"。
 - 看不清楚、無法判斷時 emotion="confused", head_motion="shake"。
+- emotion 仍然代表機器人自己的臉部反應，不是圖片中使用者的情緒分類；使用者看起來生氣或難過時，機器人通常用 concerned 關心，不要直接鏡像 angry/sad。
 - 睡覺/起床/回來/音樂/專注意圖仍依照一般 prompt 的 persistent_state 與 screen_mode 規則處理。
 - 你不用輸出馬達角度；Jetson 會根據 emotion/head_motion 自動送 MotorPitch/MotorYaw。
 """.strip()
@@ -582,8 +586,6 @@ def normalize_control(raw: Any, transcript: str, *, used_vision: bool = False) -
         screen_mode = fallback["screen_mode"]
 
     emotion = normalize_control_emotion(source.get("emotion", fallback["emotion"]), default=fallback["emotion"])
-    if fallback["emotion"] in {"angry", "sad"} and emotion in {"neutral", "concerned"}:
-        emotion = fallback["emotion"]
 
     head_motion = str(source.get("head_motion", "")).strip().lower()
     if head_motion not in CONTROL_HEAD_MOTIONS:
@@ -624,9 +626,9 @@ def emotion_from_control(control: dict[str, str], transcript: str) -> dict[str, 
 
     presets = {
         "neutral": (0.25, 0.0, 0.25, False, "自然中性互動。"),
-        "concerned": (0.65, -0.35, 0.35, True, "使用者可能需要關心或溫和支持。"),
-        "angry": (0.90, -0.85, 0.90, False, "使用者明顯生氣或挫折。"),
-        "sad": (0.70, -0.65, 0.25, True, "使用者情緒低落或難過。"),
+        "concerned": (0.65, -0.35, 0.35, True, "機器人用關心和穩定的表情回應。"),
+        "angry": (0.90, -0.85, 0.90, False, "機器人正在嚴肅設界線或表達不悅。"),
+        "sad": (0.70, -0.65, 0.25, True, "機器人自己表達遺憾或難過。"),
         "happy": (0.65, 0.65, 0.55, False, "使用者情境偏正向或回覆語氣愉快。"),
         "curious": (0.45, 0.10, 0.45, False, "正在回答問題或分析畫面，帶有好奇。"),
         "excited": (0.8, 0.75, 0.8, False, "情境能量較高，偏興奮。"),
@@ -695,23 +697,26 @@ def analyze_emotion_local(transcript: str) -> dict[str, Any]:
     summary = "語氣接近中性，沒有明顯強烈情緒。"
 
     if has_any(text, ["操你媽", "操你妈", "幹你娘", "干你娘", "媽的", "妈的", "靠北", "靠邀", "fuck", "shit"]):
-        primary = "angry"
-        intensity = 0.9
-        valence = -0.85
-        arousal = 0.9
-        summary = "使用者使用強烈髒話，情緒明顯偏憤怒或強烈挫折。"
+        primary = "concerned"
+        intensity = 0.74
+        valence = -0.35
+        arousal = 0.45
+        support_needed = True
+        summary = "使用者語氣很強，機器人先保持冷靜關心，不直接鏡像怒氣。"
     elif has_any(text, ["生氣", "生气", "很氣", "很气", "氣死", "气死", "火大", "憤怒", "愤怒"]):
-        primary = "angry"
-        intensity = 0.82
-        valence = -0.75
-        arousal = 0.82
-        summary = "使用者明確表達生氣或火大，情緒偏高強度負向。"
+        primary = "concerned"
+        intensity = 0.7
+        valence = -0.35
+        arousal = 0.45
+        support_needed = True
+        summary = "使用者明確表達生氣，機器人以穩定關心反應。"
     elif has_any(text, ["太慢", "很慢", "慢", "爛", "烂", "鳥", "鸟", "蠢", "笨", "智障", "不聰明", "不聪明", "聰明一點", "聪明一点", "不爽", "煩", "烦", "敷衍", "罐頭", "罐头", "迂迴", "迂回", "不夠親近", "不够亲近", "不像人", "像客服", "太官方"]):
-        primary = "angry"
-        intensity = 0.75
-        valence = -0.55
-        arousal = 0.7
-        summary = "使用者明顯對速度或品質不滿，帶有挫折和急迫感。"
+        primary = "concerned"
+        intensity = 0.68
+        valence = -0.3
+        arousal = 0.42
+        support_needed = True
+        summary = "使用者明顯不滿，機器人以關心和修正姿態回應。"
     elif has_any(text, ["想睡", "好睏", "好困", "睏了", "困了", "睡意", "昏昏欲睡"]):
         primary = "sleepy"
         intensity = 0.62
@@ -1444,8 +1449,6 @@ def normalize_emotion(raw: Any, transcript: str) -> dict[str, Any]:
         return fallback
 
     primary = normalize_control_emotion(raw.get("primary", fallback["primary"]), default=fallback["primary"])
-    if fallback["primary"] in {"angry", "sad"} and primary in {"neutral", "concerned"}:
-        primary = fallback["primary"]
 
     return {
         "primary": primary,
@@ -1678,6 +1681,8 @@ def run_self_test() -> int:
             raise AssertionError(f"bad emotion alias for {raw_emotion}: {control}")
 
     local_emotion_cases = {
+        "我操你妈的！": "concerned",
+        "我現在很生氣": "concerned",
         "太酷了我超期待": "excited",
         "這個結果怪怪的我看不懂": "confused",
         "我好睏想睡": "sleepy",
@@ -1689,6 +1694,9 @@ def run_self_test() -> int:
         local = analyze_emotion_local(transcript)
         if local["primary"] != expected_emotion:
             raise AssertionError(f"bad local emotion for {transcript!r}: {local}")
+    non_mirroring = normalize_control({"emotion": "concerned"}, "我操你妈的！")
+    if non_mirroring["emotion"] != "concerned":
+        raise AssertionError(f"robot emotion should not mirror user profanity as angry: {non_mirroring}")
 
     unavailable = prefix_vision_unavailable(
         {"reply": "我先照你說的回答。", "control": {"persistent_state": "unchanged", "emotion": "curious"}},

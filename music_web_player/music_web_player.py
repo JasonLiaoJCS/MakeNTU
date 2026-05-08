@@ -695,7 +695,13 @@ def build_weather_reply(location_info: dict[str, Any], forecast: dict[str, Any],
         wind = _fmt_number(current.get("wind_speed_10m"), " km/h")
         rain = _fmt_number(current.get("precipitation"), " mm", digits=1)
         reply = f"{location}現在約 {temp}，體感 {feels}，{condition}，濕度 {humidity}，風速 {wind}，目前降雨量 {rain}。"
-        return reply, {"kind": "current", "condition": condition, "temperature_c": current.get("temperature_2m")}
+        return reply, {
+            "kind": "current",
+            "condition": condition,
+            "weather_code": current.get("weather_code"),
+            "temperature_c": current.get("temperature_2m"),
+            "precipitation_probability": 0,
+        }
 
     if kind == "hourly":
         row = _hourly_row(forecast, target)
@@ -706,7 +712,13 @@ def build_weather_reply(location_info: dict[str, Any], forecast: dict[str, Any],
         rain = _fmt_number(row.get("precipitation"), " mm", digits=1)
         wind = _fmt_number(row.get("wind_speed_10m"), " km/h")
         reply = f"{location}{target.get('label')}預報約 {temp}，體感 {feels}，{condition}，降雨機率 {pop}，預估雨量 {rain}，風速 {wind}。"
-        return reply, {"kind": "hourly", "condition": condition, "temperature_c": row.get("temperature_2m"), "precipitation_probability": row.get("precipitation_probability")}
+        return reply, {
+            "kind": "hourly",
+            "condition": condition,
+            "weather_code": row.get("weather_code"),
+            "temperature_c": row.get("temperature_2m"),
+            "precipitation_probability": row.get("precipitation_probability"),
+        }
 
     row = _daily_row(forecast, target)
     condition = weather_code_text(row.get("weather_code"))
@@ -715,7 +727,14 @@ def build_weather_reply(location_info: dict[str, Any], forecast: dict[str, Any],
     pop = _fmt_number(row.get("precipitation_probability_max"), "%")
     rain = _fmt_number(row.get("precipitation_sum"), " mm", digits=1)
     reply = f"{location}{target.get('label')}大約 {min_temp} 到 {max_temp}，{condition}，最高降雨機率 {pop}，累積雨量約 {rain}。"
-    return reply, {"kind": "daily", "condition": condition, "temperature_min_c": row.get("temperature_2m_min"), "temperature_max_c": row.get("temperature_2m_max"), "precipitation_probability_max": row.get("precipitation_probability_max")}
+    return reply, {
+        "kind": "daily",
+        "condition": condition,
+        "weather_code": row.get("weather_code"),
+        "temperature_min_c": row.get("temperature_2m_min"),
+        "temperature_max_c": row.get("temperature_2m_max"),
+        "precipitation_probability_max": row.get("precipitation_probability_max"),
+    }
 
 
 def handle_weather_text(

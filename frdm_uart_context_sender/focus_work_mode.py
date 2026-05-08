@@ -271,6 +271,52 @@ class UartSender:
             print(f"WARNING: UART send failed for {wire}: {exc}")
             return False
 
+    def send_raw_line(self, line: str, *, reason: str = "") -> bool:
+        wire = str(line or "").strip()
+        if not wire:
+            return True
+        if any(ch in wire for ch in "\r\n"):
+            print(f"WARNING: UART raw line rejected because it contains newline: {wire!r}")
+            return False
+        if len(wire.encode("utf-8")) > 120:
+            print(f"WARNING: UART raw line too long ({len(wire.encode('utf-8'))} bytes): {wire!r}")
+            return False
+        if self.no_uart:
+            print(f"FRDM UART skipped (--no-uart): {wire}")
+            return True
+        if self.dry_run:
+            print(f"FRDM UART dry-run TX: {wire}" + (f" ({reason})" if reason else ""))
+            return True
+        try:
+            import serial
+
+            port = resolve_uart_port(self.port)
+            with serial.Serial(
+                port=port,
+                baudrate=self.baudrate,
+                timeout=max(0.005, self.timeout),
+                write_timeout=max(0.005, self.timeout),
+            ) as ser:
+                time.sleep(0.04)
+                try:
+                    ser.reset_input_buffer()
+                except Exception:
+                    pass
+                ser.write(wire.encode("utf-8") + line_ending_bytes(self.line_ending))
+                ser.flush()
+                print(f"FRDM UART TX: {wire}" + (f" ({reason})" if reason else ""))
+                if self.debug:
+                    deadline = time.monotonic() + max(0.0, self.timeout)
+                    while time.monotonic() < deadline:
+                        raw = ser.readline()
+                        if not raw:
+                            break
+                        print(f"FRDM UART RX: {raw.decode('utf-8', errors='replace').rstrip()}")
+            return True
+        except Exception as exc:
+            print(f"WARNING: UART send failed for {wire}: {exc}")
+            return False
+
 
 class OneShotCamera:
     def __init__(
@@ -613,6 +659,31 @@ def build_encouragement(summary: dict[str, Any]) -> str:
     return "這輪先當作校準，下一輪從一個更小的待辦開始會比較容易進入狀態。"
 
 
+def parse_datetime_value(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+
+
+def focus_report_title(summary: dict[str, Any]) -> str:
+    started_at = parse_datetime_value(summary.get("started_at"))
+    if started_at is not None:
+        return f"專心報告：{started_at.strftime('%Y/%m/%d/%H')} 開始的專注時段"
+
+    session_id = str(summary.get("session_id", "") or "")
+    match = re.search(r"(\d{4})(\d{2})(\d{2})_(\d{2})", session_id)
+    if match:
+        year, month, day, hour = match.groups()
+        return f"專心報告：{year}/{month}/{day}/{hour} 開始的專注時段"
+
+    return "專心報告：未記錄開始時間的專注時段"
+
+
 def build_focus_summary(
     *,
     session_id: str,
@@ -672,6 +743,7 @@ def build_focus_summary(
         "log_file": str(log_file),
         "report_file": str(report_file),
     }
+    summary["report_title"] = focus_report_title(summary)
     summary["recommendation"] = build_focus_recommendation(summary)
     summary["encouragement"] = build_encouragement(summary)
     return summary
@@ -694,8 +766,10 @@ def build_report(
     state_stats = summary.get("state_stats") if isinstance(summary.get("state_stats"), dict) else {}
     todo = summary.get("todo") if isinstance(summary.get("todo"), dict) else {}
 
+    title = str(summary.get("report_title") or focus_report_title(summary))
+
     lines = [
-        f"# 專心報告：{summary.get('session_id', '')}",
+        f"# {title}",
         "",
         "## 本次摘要",
         "",
@@ -773,10 +847,12 @@ def build_discord_message(summary: dict[str, Any]) -> str:
         completed_text += f" 等 {len(completed)} 個"
     if len(remaining) > 4:
         remaining_text += f" 等 {len(remaining)} 個"
+    title = str(summary.get("report_title") or focus_report_title(summary))
     return truncate_discord_content(
         "\n".join(
             [
-                f"**專心報告：{summary.get('task') or summary.get('session_id')}**",
+                f"**{title}**",
+                f"工作目標：{summary.get('task') or '(未指定)'}",
                 f"專注分數：{summary.get('focus_score', 0)} / 100",
                 f"專心時間：約 {summary.get('focused_min', 0)} 分鐘；分心時間：約 {summary.get('distracted_min', 0)} 分鐘",
                 f"完成 To-Do：{completed_text}",
@@ -877,6 +953,7 @@ class FocusSession:
         self.last_uart_command = ""
         self.streak_state = ""
         self.streak_count = 0
+        self.deadline_monotonic: float | None = None
         self.camera = OneShotCamera(
             camera_id=parse_camera_id(args.camera_id),
             width=args.camera_width,
@@ -943,6 +1020,8 @@ class FocusSession:
             if self.args.duration_min is not None
             else None
         )
+        self.deadline_monotonic = deadline
+        self._send_focus_dashboard("active", streak=0, reason="focus session start")
 
         sample_index = 0
         try:
@@ -958,6 +1037,7 @@ class FocusSession:
                     break
         finally:
             ended_at = now_local()
+            self._send_focus_dashboard("idle", remaining_min=0, streak=0, reason="focus session end")
             self._send_uart("Normal", reason="focus session end", force=True)
             todo_items = load_todo_items(self.todo_list_path)
             summary = build_focus_summary(
@@ -1079,6 +1159,8 @@ class FocusSession:
             self.streak_state = state
             self.streak_count = 1
 
+        self._send_focus_dashboard(state, streak=self.streak_count, reason=f"{state} dashboard")
+
         if state == "focused":
             self._send_uart("Thinking", reason="focused")
             return
@@ -1091,6 +1173,28 @@ class FocusSession:
             return
         if self.uart.send(command, reason=reason):
             self.last_uart_command = command
+
+    def _remaining_minutes(self) -> int:
+        deadline = self.deadline_monotonic
+        if deadline is None:
+            return 0
+        remaining_sec = max(0.0, deadline - time.monotonic())
+        return int((remaining_sec + 59.0) // 60.0)
+
+    def _send_focus_dashboard(
+        self,
+        state: str,
+        *,
+        remaining_min: int | None = None,
+        streak: int = 0,
+        reason: str,
+    ) -> None:
+        normalized = str(state or "idle").strip().lower()
+        if normalized not in FOCUS_STATES and normalized not in {"active", "idle"}:
+            normalized = "uncertain"
+        remaining = self._remaining_minutes() if remaining_min is None else max(0, int(remaining_min))
+        streak_count = max(0, int(streak))
+        self.uart.send_raw_line(f"Focus {normalized},{remaining},{streak_count}", reason=reason)
 
     def _sleep_until_next_sample(self, deadline: float | None) -> bool:
         wait_sec = max(0.0, float(self.args.interval_sec))
