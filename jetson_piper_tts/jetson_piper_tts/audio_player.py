@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import logging
+import audioop
 import itertools
 import os
 import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -17,6 +20,55 @@ logger = logging.getLogger(__name__)
 
 class AudioPlaybackError(RuntimeError):
     pass
+
+
+def _normalize_volume_gain(volume_gain: float | None) -> float:
+    if volume_gain is None:
+        return 1.0
+    try:
+        gain = float(volume_gain)
+    except (TypeError, ValueError):
+        return 1.0
+    if gain <= 0:
+        return 1.0
+    return max(0.05, min(gain, 8.0))
+
+
+def _apply_volume_gain(audio: bytes, *, sample_format: str, volume_gain: float | None) -> bytes:
+    gain = _normalize_volume_gain(volume_gain)
+    if gain == 1.0 or not audio:
+        return audio
+    if sample_format.upper() != "S16_LE":
+        logger.warning("volume_gain is only supported for S16_LE raw audio; ignoring gain=%s", gain)
+        return audio
+    try:
+        return audioop.mul(audio, 2, gain)
+    except Exception as exc:
+        logger.warning("failed to apply volume_gain=%s: %s", gain, exc)
+        return audio
+
+
+def _write_gain_adjusted_wav(source: Path, *, volume_gain: float | None) -> Path:
+    gain = _normalize_volume_gain(volume_gain)
+    if gain == 1.0:
+        return source
+
+    with wave.open(str(source), "rb") as reader:
+        params = reader.getparams()
+        if params.sampwidth != 2:
+            logger.warning("volume_gain is only supported for 16-bit WAV files; ignoring gain=%s", gain)
+            return source
+        frames = reader.readframes(params.nframes)
+
+    adjusted = _apply_volume_gain(frames, sample_format="S16_LE", volume_gain=gain)
+    temp = tempfile.NamedTemporaryFile(prefix="tts_gain_", suffix=".wav", delete=False)
+    temp_path = Path(temp.name)
+    temp.close()
+
+    with wave.open(str(temp_path), "wb") as writer:
+        writer.setparams(params)
+        writer.writeframes(adjusted)
+    return temp_path
 
 
 class AudioPlayer:
@@ -132,7 +184,7 @@ class AudioPlayer:
             "playing": self.is_playing(),
         }
 
-    def play_file(self, wav_path: Path, *, blocking: bool = True) -> dict[str, Any]:
+    def play_file(self, wav_path: Path, *, blocking: bool = True, volume_gain: float | None = None) -> dict[str, Any]:
         path = Path(wav_path)
         if not path.exists():
             raise AudioPlaybackError(f"WAV file does not exist: {path}")
@@ -143,11 +195,22 @@ class AudioPlayer:
                 "aplay was not found. Install alsa-utils or set APLAY_BIN to a valid player."
             )
 
+        gain = _normalize_volume_gain(volume_gain)
+        playback_path = path
+        temp_playback_path: Path | None = None
+        if gain != 1.0:
+            if blocking:
+                playback_path = _write_gain_adjusted_wav(path, volume_gain=gain)
+                if playback_path != path:
+                    temp_playback_path = playback_path
+            else:
+                logger.warning("volume_gain is ignored for non-blocking direct WAV playback")
+
         command = [aplay_path, "-q"]
         device = self.resolve_device()
         if device:
             command.extend(["-D", device])
-        command.append(str(path))
+        command.append(str(playback_path))
 
         started = time.perf_counter()
         process = subprocess.Popen(
@@ -159,7 +222,7 @@ class AudioPlayer:
         with self._lock:
             self._current_process = process
             self._current_processes = [process]
-            self._current_file = path
+            self._current_file = playback_path
 
         if not blocking:
             return {
@@ -178,6 +241,8 @@ class AudioPlayer:
                     self._current_process = None
                     self._current_processes = []
                     self._current_file = None
+            if temp_playback_path is not None:
+                temp_playback_path.unlink(missing_ok=True)
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         if process.returncode != 0:
@@ -185,7 +250,7 @@ class AudioPlayer:
             raise AudioPlaybackError(f"aplay failed with code {process.returncode}: {error}")
 
         logger.info("played %s in %d ms", path, elapsed_ms)
-        return {"wav": str(path), "blocking": True, "elapsed_ms": elapsed_ms}
+        return {"wav": str(path), "blocking": True, "elapsed_ms": elapsed_ms, "volume_gain": gain}
 
     def play_raw_from_command(
         self,
@@ -197,6 +262,7 @@ class AudioPlayer:
         channels: int = 1,
         sample_format: str = "S16_LE",
         timeout_seconds: int | None = None,
+        volume_gain: float | None = None,
     ) -> dict[str, Any]:
         aplay_path = self.aplay_path
         if not aplay_path:
@@ -221,6 +287,9 @@ class AudioPlayer:
             aplay_command.extend(["-D", device])
 
         started = time.perf_counter()
+        gain = _normalize_volume_gain(volume_gain)
+        use_gain = gain != 1.0
+
         aplay_process = subprocess.Popen(
             aplay_command,
             stdin=subprocess.PIPE,
@@ -231,13 +300,13 @@ class AudioPlayer:
         producer_process = subprocess.Popen(
             producer_command,
             stdin=subprocess.PIPE,
-            stdout=aplay_process.stdin,
+            stdout=subprocess.PIPE if use_gain else aplay_process.stdin,
             stderr=subprocess.PIPE,
             env=env,
             start_new_session=True,
         )
 
-        if aplay_process.stdin is not None:
+        if not use_gain and aplay_process.stdin is not None:
             aplay_process.stdin.close()
             aplay_process.stdin = None
 
@@ -249,11 +318,19 @@ class AudioPlayer:
         producer_stderr = b""
         aplay_stderr = b""
         try:
-            _, producer_stderr = producer_process.communicate(
+            producer_stdout, producer_stderr = producer_process.communicate(
                 input=input_text.encode("utf-8"),
                 timeout=timeout_seconds,
             )
-            _, aplay_stderr = aplay_process.communicate(timeout=5)
+            if use_gain:
+                processed = _apply_volume_gain(
+                    producer_stdout or b"",
+                    sample_format=sample_format,
+                    volume_gain=gain,
+                )
+                _, aplay_stderr = aplay_process.communicate(input=processed, timeout=5)
+            else:
+                _, aplay_stderr = aplay_process.communicate(timeout=5)
         except subprocess.TimeoutExpired as exc:
             self.stop()
             raise AudioPlaybackError(f"raw playback pipeline timed out after {exc.timeout}s") from exc
@@ -283,6 +360,7 @@ class AudioPlayer:
             "sample_rate": sample_rate,
             "channels": channels,
             "format": sample_format,
+            "volume_gain": gain,
         }
 
     def play_raw_chunks(
@@ -292,6 +370,7 @@ class AudioPlayer:
         sample_rate: int,
         channels: int = 1,
         sample_format: str = "S16_LE",
+        volume_gain: float | None = None,
     ) -> dict[str, Any]:
         aplay_path = self.aplay_path
         if not aplay_path:
@@ -317,6 +396,7 @@ class AudioPlayer:
 
         started = time.perf_counter()
         bytes_written = 0
+        gain = _normalize_volume_gain(volume_gain)
         stderr = b""
         iterator = iter(audio_chunks)
         first_audio = b""
@@ -354,6 +434,7 @@ class AudioPlayer:
             for audio in itertools.chain((first_audio,), iterator):
                 if not audio:
                     continue
+                audio = _apply_volume_gain(audio, sample_format=sample_format, volume_gain=gain)
                 process.stdin.write(audio)
                 process.stdin.flush()
                 bytes_written += len(audio)
@@ -384,6 +465,7 @@ class AudioPlayer:
             "channels": channels,
             "format": sample_format,
             "bytes_written": bytes_written,
+            "volume_gain": gain,
         }
 
     def stop(self) -> bool:

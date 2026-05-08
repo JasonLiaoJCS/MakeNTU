@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import glob
 import json
 import os
@@ -34,6 +34,10 @@ from typing import Any
 THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_FOCUS_URL = os.getenv("FOCUS_SERVER_URL", "http://100.108.141.26:8766/focus-check")
 DEFAULT_LOG_ROOT = THIS_DIR / "logs" / "focus_sessions"
+DEFAULT_TODO_LIST_PATH = THIS_DIR / "logs" / "todo_list.json"
+DEFAULT_INTERVAL_SEC = 60.0
+DEFAULT_DISCORD_WEBHOOK_FILE = Path(os.getenv("DISCORD_WEBHOOK_FILE", "~/.config/makentu/discord_webhook_url")).expanduser()
+DISCORD_USER_AGENT = "DiscordBot (https://github.com/asrlab-yian/MakeNTU, 0.1)"
 UART_PREFERRED_KEYWORDS = (
     "frdm",
     "mcu",
@@ -86,6 +90,41 @@ def clamp_float(value: Any, default: float, low: float = 0.0, high: float = 1.0)
     except (TypeError, ValueError):
         return default
     return max(low, min(high, number))
+
+
+def parse_iso_datetime(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=now_local().tzinfo)
+    return parsed.astimezone()
+
+
+def clean_todo_text(text: Any) -> str:
+    return " ".join(str(text or "").strip().split())[:160]
+
+
+def read_secret_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        print(f"WARNING: could not read secret file {path}: {exc}")
+        return ""
+
+
+def default_discord_webhook_url() -> str:
+    return (
+        os.getenv("FOCUS_DISCORD_WEBHOOK_URL", "").strip()
+        or os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+        or read_secret_file(DEFAULT_DISCORD_WEBHOOK_FILE)
+    )
 
 
 def normalize_focus_url(raw_url: str) -> str:
@@ -427,6 +466,92 @@ def save_debug_image(session_dir: Path, sample_index: int, image_bytes: bytes) -
     return str(path)
 
 
+def load_todo_items(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"WARNING: could not read to-do list {path}: {exc}")
+        return []
+    items = data.get("items") if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = clean_todo_text(item.get("text"))
+        if not text:
+            continue
+        try:
+            item_id = int(item.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            item_id = 0
+        status = str(item.get("status", "open") or "open").strip().lower()
+        if status not in {"open", "done"}:
+            status = "open"
+        cleaned.append(
+            {
+                "id": item_id,
+                "text": text,
+                "status": status,
+                "created_at": str(item.get("created_at", "") or ""),
+                "completed_at": str(item.get("completed_at", "") or "") if item.get("completed_at") else "",
+                "source": str(item.get("source", "voice") or "voice"),
+            }
+        )
+    return cleaned
+
+
+def todo_public_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id", 0),
+        "text": item.get("text", ""),
+        "status": item.get("status", "open"),
+        "created_at": item.get("created_at", ""),
+        "completed_at": item.get("completed_at", ""),
+    }
+
+
+def analyze_todos_for_session(
+    *,
+    todo_items: list[dict[str, Any]],
+    started_at: datetime,
+    ended_at: datetime,
+) -> dict[str, Any]:
+    completed_during: list[dict[str, Any]] = []
+    remaining_open: list[dict[str, Any]] = []
+    added_during_open: list[dict[str, Any]] = []
+    added_during_completed: list[dict[str, Any]] = []
+
+    for item in todo_items:
+        status = str(item.get("status", "open") or "open")
+        created_at = parse_iso_datetime(item.get("created_at"))
+        completed_at = parse_iso_datetime(item.get("completed_at"))
+        created_during = created_at is not None and started_at <= created_at <= ended_at
+        completed_in_session = completed_at is not None and started_at <= completed_at <= ended_at
+
+        if completed_in_session:
+            completed_during.append(todo_public_item(item))
+            if created_during:
+                added_during_completed.append(todo_public_item(item))
+        elif status == "open":
+            remaining_open.append(todo_public_item(item))
+            if created_during:
+                added_during_open.append(todo_public_item(item))
+
+    return {
+        "completed_during": completed_during,
+        "remaining_open": remaining_open,
+        "added_during_open": added_during_open,
+        "added_during_completed": added_during_completed,
+        "completed_count": len(completed_during),
+        "remaining_count": len(remaining_open),
+        "added_during_open_count": len(added_during_open),
+    }
+
+
 def state_counts(entries: list[dict[str, Any]]) -> dict[str, int]:
     counts = {state: 0 for state in sorted(FOCUS_STATES)}
     for entry in entries:
@@ -447,7 +572,48 @@ def longest_streak(entries: list[dict[str, Any]], target_state: str) -> int:
     return best
 
 
-def build_report(
+def build_focus_recommendation(summary: dict[str, Any]) -> str:
+    score = float(summary.get("focus_score", 0.0) or 0.0)
+    state_stats = summary.get("state_stats") if isinstance(summary.get("state_stats"), dict) else {}
+    todo = summary.get("todo") if isinstance(summary.get("todo"), dict) else {}
+    notes: list[str] = []
+
+    if score >= 85:
+        notes.append("這輪專注品質很穩，可以維持同樣的工作節奏。")
+    elif score >= 70:
+        notes.append("整體專注狀態不錯，下一輪可以保留 5 分鐘緩衝處理中斷。")
+    elif score >= 50:
+        notes.append("有進入工作狀態，但中斷偏多；建議把下一輪縮短成 20 分鐘並先收掉通知。")
+    else:
+        notes.append("這輪比較難維持專心，建議先把工作切成更小步驟，從一個可完成的待辦開始。")
+
+    if int(state_stats.get("phone", {}).get("count", 0) or 0) > 0:
+        notes.append("有偵測到疑似手機狀態，下一輪可以把手機放遠或開勿擾。")
+    if int(state_stats.get("away", {}).get("count", 0) or 0) > 0:
+        notes.append("有離席紀錄，若是必要休息可以改用較短的番茄鐘節奏。")
+    if int(state_stats.get("sleeping", {}).get("count", 0) or 0) > 0:
+        notes.append("有疑似睡覺狀態，建議先休息再開下一輪，不要硬撐。")
+    if int(todo.get("completed_count", 0) or 0) > 0:
+        notes.append("這輪有完成待辦，很好，下一輪可以接著處理剩餘清單中風險最高的一項。")
+    elif int(todo.get("remaining_count", 0) or 0) > 0:
+        notes.append("這輪還沒有完成待辦，下一輪建議先選一個最小可收尾項目。")
+    return " ".join(notes)
+
+
+def build_encouragement(summary: dict[str, Any]) -> str:
+    todo = summary.get("todo") if isinstance(summary.get("todo"), dict) else {}
+    completed = int(todo.get("completed_count", 0) or 0)
+    score = float(summary.get("focus_score", 0.0) or 0.0)
+    if completed > 0 and score >= 70:
+        return f"做得不錯，這輪不只維持住專注，還完成了 {completed} 個待辦。"
+    if completed > 0:
+        return f"雖然中間有些波動，但你還是完成了 {completed} 個待辦，這很有價值。"
+    if score >= 70:
+        return "這輪專注狀態穩定，就算待辦還沒收掉，也是在累積進度。"
+    return "這輪先當作校準，下一輪從一個更小的待辦開始會比較容易進入狀態。"
+
+
+def build_focus_summary(
     *,
     session_id: str,
     task: str,
@@ -456,32 +622,113 @@ def build_report(
     interval_sec: float,
     entries: list[dict[str, Any]],
     log_file: Path,
-) -> str:
+    report_file: Path,
+    todo_items: list[dict[str, Any]],
+    todo_list_path: Path,
+) -> dict[str, Any]:
     counts = state_counts(entries)
     valid_samples = max(1, len([entry for entry in entries if entry.get("state") != "error"]))
     focused = counts.get("focused", 0)
     focus_ratio = focused / valid_samples
     duration_min = max(0.0, (ended_at - started_at).total_seconds() / 60.0)
-    longest_focus_min = longest_streak(entries, "focused") * interval_sec / 60.0
+    sample_min = duration_min / len(entries) if duration_min > 0 and entries else interval_sec / 60.0
+    longest_focus_min = longest_streak(entries, "focused") * sample_min
     average_attention = (
         sum(float(entry.get("attention_score", 0.0) or 0.0) for entry in entries) / len(entries)
         if entries
         else 0.0
     )
+    focus_score = round((average_attention * 70.0) + (focus_ratio * 30.0))
+    focus_score = max(0, min(100, int(focus_score)))
+    state_stats = {}
+    for state in ("focused", "distracted", "phone", "sleeping", "away", "uncertain", "error"):
+        count = counts.get(state, 0)
+        state_stats[state] = {
+            "label": STATE_LABELS.get(state, state),
+            "count": count,
+            "estimated_min": round(count * sample_min, 1),
+        }
+    distracted_count = sum(counts.get(state, 0) for state in ("distracted", "phone", "sleeping", "away"))
+    summary: dict[str, Any] = {
+        "version": 1,
+        "session_id": session_id,
+        "task": task,
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "ended_at": ended_at.isoformat(timespec="seconds"),
+        "duration_min": round(duration_min, 1),
+        "interval_sec": interval_sec,
+        "sample_count": len(entries),
+        "valid_sample_count": valid_samples,
+        "focus_ratio": round(focus_ratio, 3),
+        "focus_percent": round(focus_ratio * 100.0, 1),
+        "average_attention": round(average_attention, 3),
+        "focus_score": focus_score,
+        "focused_min": round(counts.get("focused", 0) * sample_min, 1),
+        "distracted_min": round(distracted_count * sample_min, 1),
+        "longest_focus_min": round(longest_focus_min, 1),
+        "state_stats": state_stats,
+        "todo_list_path": str(todo_list_path),
+        "todo": analyze_todos_for_session(todo_items=todo_items, started_at=started_at, ended_at=ended_at),
+        "log_file": str(log_file),
+        "report_file": str(report_file),
+    }
+    summary["recommendation"] = build_focus_recommendation(summary)
+    summary["encouragement"] = build_encouragement(summary)
+    return summary
+
+
+def format_todo_lines(items: list[dict[str, Any]], *, empty: str, limit: int = 8) -> list[str]:
+    if not items:
+        return [f"- {empty}"]
+    lines = [f"- {item.get('text', '')}" for item in items[:limit]]
+    if len(items) > limit:
+        lines.append(f"- 還有 {len(items) - limit} 個沒有列出")
+    return lines
+
+
+def build_report(
+    *,
+    summary: dict[str, Any],
+    entries: list[dict[str, Any]],
+) -> str:
+    state_stats = summary.get("state_stats") if isinstance(summary.get("state_stats"), dict) else {}
+    todo = summary.get("todo") if isinstance(summary.get("todo"), dict) else {}
 
     lines = [
-        f"# Focus Work Report: {session_id}",
+        f"# 專心報告：{summary.get('session_id', '')}",
         "",
-        f"- 工作目標：{task or '(未指定)'}",
-        f"- 開始時間：{started_at.isoformat(timespec='seconds')}",
-        f"- 結束時間：{ended_at.isoformat(timespec='seconds')}",
-        f"- 總時長：約 {duration_min:.1f} 分鐘",
-        f"- 取樣間隔：{interval_sec:g} 秒",
-        f"- 有效取樣：{valid_samples} / {len(entries)}",
-        f"- 專心比例：{focus_ratio * 100:.1f}%",
-        f"- 平均專注分數：{average_attention:.2f}",
-        f"- 最長連續專心：約 {longest_focus_min:.1f} 分鐘",
-        f"- JSONL log：{log_file}",
+        "## 本次摘要",
+        "",
+        f"- 工作目標：{summary.get('task') or '(未指定)'}",
+        f"- 開始時間：{summary.get('started_at')}",
+        f"- 結束時間：{summary.get('ended_at')}",
+        f"- 總時長：約 {summary.get('duration_min', 0)} 分鐘",
+        f"- 取樣間隔：{summary.get('interval_sec', 0):g} 秒",
+        f"- 有效取樣：{summary.get('valid_sample_count', 0)} / {summary.get('sample_count', 0)}",
+        f"- 專心時間：約 {summary.get('focused_min', 0)} 分鐘",
+        f"- 分心時間：約 {summary.get('distracted_min', 0)} 分鐘",
+        f"- 專注比例：{summary.get('focus_percent', 0)}%",
+        f"- 專注分數：{summary.get('focus_score', 0)} / 100",
+        f"- 平均 attention score：{summary.get('average_attention', 0)}",
+        f"- 最長連續專心：約 {summary.get('longest_focus_min', 0)} 分鐘",
+        f"- JSONL log：{summary.get('log_file')}",
+        f"- Summary JSON：{summary.get('summary_file', '')}",
+        "",
+        "## 建議",
+        "",
+        str(summary.get("recommendation", "")),
+        "",
+        "## 完成 To-Do 與鼓勵",
+        "",
+        *format_todo_lines(todo.get("completed_during", []) if isinstance(todo.get("completed_during"), list) else [], empty="這輪還沒有完成待辦。"),
+        "",
+        str(summary.get("encouragement", "")),
+        "",
+        "## 剩餘 To-Do 與下一步",
+        "",
+        *format_todo_lines(todo.get("remaining_open", []) if isinstance(todo.get("remaining_open"), list) else [], empty="目前沒有剩餘未完成待辦。"),
+        "",
+        "建議下一輪先挑一個最小、最能降低 demo 風險的項目開始。",
         "",
         "## 狀態統計",
         "",
@@ -489,9 +736,11 @@ def build_report(
         "| --- | ---: | ---: |",
     ]
     for state in ("focused", "distracted", "phone", "sleeping", "away", "uncertain", "error"):
-        count = counts.get(state, 0)
-        estimate_min = count * interval_sec / 60.0
-        lines.append(f"| {STATE_LABELS.get(state, state)} | {count} | {estimate_min:.1f} 分鐘 |")
+        stat = state_stats.get(state) if isinstance(state_stats.get(state), dict) else {}
+        lines.append(
+            f"| {stat.get('label', STATE_LABELS.get(state, state))} | "
+            f"{stat.get('count', 0)} | {stat.get('estimated_min', 0)} 分鐘 |"
+        )
 
     lines.extend(["", "## 時間軸", "", "| 時間 | 狀態 | 信心 | 分數 | 摘要 |", "| --- | --- | ---: | ---: | --- |"])
     for entry in entries:
@@ -505,6 +754,103 @@ def build_report(
         )
     lines.append("")
     return "\n".join(lines)
+
+
+def truncate_discord_content(text: str, limit: int = 1900) -> str:
+    cleaned = str(text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 20].rstrip() + "\n...(略)"
+
+
+def build_discord_message(summary: dict[str, Any]) -> str:
+    todo = summary.get("todo") if isinstance(summary.get("todo"), dict) else {}
+    completed = todo.get("completed_during") if isinstance(todo.get("completed_during"), list) else []
+    remaining = todo.get("remaining_open") if isinstance(todo.get("remaining_open"), list) else []
+    completed_text = "、".join(str(item.get("text", "")) for item in completed[:4]) if completed else "這輪還沒有完成待辦"
+    remaining_text = "、".join(str(item.get("text", "")) for item in remaining[:4]) if remaining else "沒有剩餘待辦"
+    if len(completed) > 4:
+        completed_text += f" 等 {len(completed)} 個"
+    if len(remaining) > 4:
+        remaining_text += f" 等 {len(remaining)} 個"
+    return truncate_discord_content(
+        "\n".join(
+            [
+                f"**專心報告：{summary.get('task') or summary.get('session_id')}**",
+                f"專注分數：{summary.get('focus_score', 0)} / 100",
+                f"專心時間：約 {summary.get('focused_min', 0)} 分鐘；分心時間：約 {summary.get('distracted_min', 0)} 分鐘",
+                f"完成 To-Do：{completed_text}",
+                f"剩餘 To-Do：{remaining_text}",
+                f"建議：{summary.get('recommendation', '')}",
+                f"報告檔：{summary.get('report_file', '')}",
+            ]
+        )
+    )
+
+
+def send_discord_notification(
+    summary: dict[str, Any],
+    *,
+    webhook_url: str,
+    timeout_sec: float,
+    dry_run: bool,
+) -> dict[str, Any]:
+    content = build_discord_message(summary)
+    if dry_run:
+        print("Discord notify dry-run:")
+        print(content)
+        return {"mode": "discord", "ok": True, "dry_run": True, "content_preview": content[:300]}
+    payload = json.dumps({"content": content}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        webhook_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": DISCORD_USER_AGENT,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=max(0.1, timeout_sec)) as response:
+        status = int(getattr(response, "status", 0) or 0)
+        body = response.read().decode("utf-8", errors="replace")
+    ok = 200 <= status < 300
+    return {"mode": "discord", "ok": ok, "status": status, "response": short_text(body, 300)}
+
+
+def send_focus_notification(
+    summary: dict[str, Any],
+    report: str,
+    *,
+    mode: str,
+    discord_webhook_url: str,
+    timeout_sec: float,
+    dry_run: bool,
+) -> dict[str, Any]:
+    del report
+    selected = str(mode or "none").strip().lower()
+    if selected in {"", "none"}:
+        return {"mode": "none", "ok": True}
+    if selected != "discord":
+        return {"mode": selected, "ok": False, "error": f"unsupported notify mode: {selected}"}
+    webhook_url = str(discord_webhook_url or "").strip()
+    if not webhook_url:
+        print("WARNING: notify-mode=discord but --discord-webhook-url is empty; report was not sent.")
+        return {"mode": "discord", "ok": False, "error": "missing discord webhook url"}
+    try:
+        result = send_discord_notification(
+            summary,
+            webhook_url=webhook_url,
+            timeout_sec=timeout_sec,
+            dry_run=dry_run,
+        )
+        if result.get("ok"):
+            print("Focus report notification sent to Discord." if not dry_run else "Focus report Discord dry-run complete.")
+        else:
+            print(f"WARNING: Discord notification returned non-2xx status: {result}")
+        return result
+    except Exception as exc:
+        print(f"WARNING: Discord notification failed: {exc}")
+        return {"mode": "discord", "ok": False, "error": str(exc)}
 
 
 def stdin_requested_stop() -> bool:
@@ -524,6 +870,8 @@ class FocusSession:
         self.session_dir = Path(args.log_root).expanduser() / self.session_id
         self.log_file = self.session_dir / "focus_log.jsonl"
         self.report_file = self.session_dir / "focus_report.md"
+        self.summary_file = self.session_dir / "focus_summary.json"
+        self.todo_list_path = Path(str(args.todo_list_path)).expanduser()
         self.entries: list[dict[str, Any]] = []
         self.stop_requested = False
         self.last_uart_command = ""
@@ -554,6 +902,7 @@ class FocusSession:
         self.session_dir.mkdir(parents=True, exist_ok=True)
         focus_url = normalize_focus_url(self.args.server_url)
         started_at = now_local()
+        start_todos = load_todo_items(self.todo_list_path)
         metadata_path = self.session_dir / "session.json"
         metadata_path.write_text(
             json.dumps(
@@ -564,6 +913,9 @@ class FocusSession:
                     "interval_sec": self.args.interval_sec,
                     "duration_min": self.args.duration_min,
                     "focus_url": focus_url,
+                    "todo_list_path": str(self.todo_list_path),
+                    "todo_open_count_at_start": len([item for item in start_todos if item.get("status") == "open"]),
+                    "notify_mode": self.args.notify_mode,
                     "privacy": "images are memory-only unless --save-images is set",
                 },
                 ensure_ascii=False,
@@ -578,6 +930,9 @@ class FocusSession:
         print(f"Interval: {self.args.interval_sec:g}s")
         print(f"Log: {self.log_file}")
         print(f"Report: {self.report_file}")
+        print(f"Summary: {self.summary_file}")
+        print(f"To-do list: {self.todo_list_path}")
+        print(f"Notify mode: {self.args.notify_mode}")
         print("Image privacy: memory-only; use --save-images only for debugging.")
         if sys.stdin.isatty():
             print("Type q + Enter to end the session.")
@@ -604,7 +959,8 @@ class FocusSession:
         finally:
             ended_at = now_local()
             self._send_uart("Normal", reason="focus session end", force=True)
-            report = build_report(
+            todo_items = load_todo_items(self.todo_list_path)
+            summary = build_focus_summary(
                 session_id=self.session_id,
                 task=self.args.task,
                 started_at=started_at,
@@ -612,8 +968,26 @@ class FocusSession:
                 interval_sec=self.args.interval_sec,
                 entries=self.entries,
                 log_file=self.log_file,
+                report_file=self.report_file,
+                todo_items=todo_items,
+                todo_list_path=self.todo_list_path,
             )
+            summary["summary_file"] = str(self.summary_file)
+            self.summary_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            report = build_report(summary=summary, entries=self.entries)
             self.report_file.write_text(report, encoding="utf-8")
+            notify_result = send_focus_notification(
+                summary,
+                report,
+                mode=self.args.notify_mode,
+                discord_webhook_url=self.args.discord_webhook_url,
+                timeout_sec=self.args.notify_timeout,
+                dry_run=self.args.notify_dry_run,
+            )
+            if notify_result:
+                summary["notification"] = notify_result
+                self.summary_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(f"Focus summary written: {self.summary_file}")
             print(f"Focus work report written: {self.report_file}")
         return 0
 
@@ -745,18 +1119,49 @@ def run_self_test() -> int:
     if response["state"] != "phone" or response["confidence"] != 1.0 or response["attention_score"] != 0.0:
         raise AssertionError(f"focus response normalization failed: {response}")
     started = now_local()
-    ended = started
-    report = build_report(
+    ended = started + timedelta(minutes=25)
+    completed_at = started + timedelta(minutes=10)
+    todo_items = [
+        {
+            "id": 1,
+            "text": "整理 demo 指令",
+            "status": "done",
+            "created_at": started.isoformat(timespec="seconds"),
+            "completed_at": completed_at.isoformat(timespec="seconds"),
+        },
+        {
+            "id": 2,
+            "text": "測試 FRDM 馬達",
+            "status": "open",
+            "created_at": started.isoformat(timespec="seconds"),
+            "completed_at": "",
+        },
+    ]
+    entries = [
+        {"timestamp": now_iso(), **normalize_focus_response({"state": "focused", "attention_score": 0.9}), "sample_index": 1},
+        {"timestamp": now_iso(), **response, "sample_index": 2},
+    ]
+    summary = build_focus_summary(
         session_id="focus_self_test",
         task="test task",
         started_at=started,
         ended_at=ended,
         interval_sec=60,
-        entries=[{"timestamp": now_iso(), **response, "sample_index": 1}],
+        entries=entries,
         log_file=Path("/tmp/focus_self_test.jsonl"),
+        report_file=Path("/tmp/focus_self_test.md"),
+        todo_items=todo_items,
+        todo_list_path=Path("/tmp/focus_todo_self_test.json"),
     )
-    if "專心比例" not in report or "疑似手機" not in report:
+    summary["summary_file"] = "/tmp/focus_summary_self_test.json"
+    if summary["todo"]["completed_count"] != 1 or summary["todo"]["remaining_count"] != 1:
+        raise AssertionError(f"focus to-do summary failed: {summary['todo']}")
+    report = build_report(summary=summary, entries=entries)
+    if "專注分數" not in report or "疑似手機" not in report or "完成 To-Do" not in report:
         raise AssertionError("report generation failed")
+    discord_message = build_discord_message(summary)
+    if "專注分數" not in discord_message or "整理 demo 指令" not in discord_message:
+        raise AssertionError("discord summary message failed")
     if not normalize_focus_url("http://host:8766").endswith("/focus-check"):
         raise AssertionError("focus URL normalization failed")
     print("focus_work_mode self-test OK")
@@ -769,12 +1174,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", default=os.getenv("FOCUS_TASK", ""), help="Optional work goal shown in the report.")
     parser.add_argument("--session-id", default="", help="Optional fixed session id.")
     parser.add_argument("--duration-min", type=float, default=None, help="End automatically after this many minutes.")
-    parser.add_argument("--interval-sec", type=float, default=float(os.getenv("FOCUS_INTERVAL_SEC", "180")), help="Seconds between checks.")
+    parser.add_argument("--interval-sec", type=float, default=float(os.getenv("FOCUS_INTERVAL_SEC", str(DEFAULT_INTERVAL_SEC))), help="Seconds between checks.")
     parser.add_argument("--once", action="store_true", help="Run one sample and generate a report.")
     parser.add_argument("--timeout", type=float, default=float(os.getenv("FOCUS_TIMEOUT_SEC", "180")), help="HTTP timeout for /focus-check.")
     parser.add_argument("--log-root", default=str(DEFAULT_LOG_ROOT), help="Root folder for focus session logs.")
     parser.add_argument("--save-images", action="store_true", help="Debug only: save sampled images instead of memory-only operation.")
     parser.add_argument("--mock-state", choices=sorted(FOCUS_STATES - {"error"}), default="", help="Skip camera/server and use a fixed state.")
+    parser.add_argument("--todo-list-path", default=os.getenv("TODO_LIST_PATH", str(DEFAULT_TODO_LIST_PATH)), help="Wake Bridge to-do JSON used in focus summary.")
+
+    notify = parser.add_argument_group("notification")
+    notify.add_argument("--notify-mode", choices=["none", "discord"], default=os.getenv("FOCUS_NOTIFY_MODE", "none"))
+    notify.add_argument("--discord-webhook-url", default=default_discord_webhook_url())
+    notify.add_argument("--notify-timeout", type=float, default=float(os.getenv("FOCUS_NOTIFY_TIMEOUT", "8.0")))
+    notify.add_argument("--notify-dry-run", action="store_true", help="Print notification payload without sending it.")
 
     camera = parser.add_argument_group("camera")
     camera.add_argument("--camera-id", default=os.getenv("FOCUS_CAMERA_ID", "auto"))

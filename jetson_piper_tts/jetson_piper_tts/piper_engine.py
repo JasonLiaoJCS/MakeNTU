@@ -195,6 +195,7 @@ class PiperEngine:
         noise_scale: float | None = None,
         noise_w: float | None = None,
         timeout_seconds: int | None = None,
+        volume_gain: float | None = None,
     ) -> dict[str, Any]:
         piper_path, model, config = self._validate_ready(voice=voice)
         length = float(length_scale if length_scale is not None else self.settings.default_length_scale)
@@ -220,6 +221,7 @@ class PiperEngine:
                 channels=1,
                 sample_format="S16_LE",
                 timeout_seconds=timeout_seconds or self.settings.synth_timeout_seconds,
+                volume_gain=volume_gain,
             )
         except Exception as exc:
             raise PiperError(f"Piper raw streaming playback failed: {exc}") from exc
@@ -270,6 +272,7 @@ class PiperEngine:
         length_scale: float | None = None,
         noise_scale: float | None = None,
         noise_w: float | None = None,
+        volume_gain: float | None = None,
     ) -> dict[str, Any]:
         self._ensure_python_import_path()
         try:
@@ -300,6 +303,7 @@ class PiperEngine:
                 sample_rate=int(piper_voice.config.sample_rate),
                 channels=1,
                 sample_format="S16_LE",
+                volume_gain=volume_gain,
             )
         except Exception as exc:
             raise PiperError(f"Piper in-process playback failed: {exc}") from exc
@@ -584,21 +588,33 @@ class TTSService:
             "synth_ms": synth_ms,
         }
 
-    def play_wavs(self, wav_files: list[str | Path], *, blocking: bool = True) -> dict[str, Any]:
+    def play_wavs(
+        self,
+        wav_files: list[str | Path],
+        *,
+        blocking: bool = True,
+        volume_gain: float | None = None,
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         paths = [Path(path) for path in wav_files]
         if not blocking:
             import threading
 
-            thread = threading.Thread(target=self.play_wavs, args=(paths,), kwargs={"blocking": True}, daemon=True)
+            thread = threading.Thread(
+                target=self.play_wavs,
+                args=(paths,),
+                kwargs={"blocking": True, "volume_gain": volume_gain},
+                daemon=True,
+            )
             thread.start()
-            return {"blocking": False, "queued_for_playback": len(paths), "play_ms": 0}
+            return {"blocking": False, "queued_for_playback": len(paths), "play_ms": 0, "volume_gain": volume_gain}
 
-        results = [self.player.play_file(path, blocking=True) for path in paths]
+        results = [self.player.play_file(path, blocking=True, volume_gain=volume_gain) for path in paths]
         return {
             "blocking": True,
             "played": len(results),
             "play_ms": int((time.perf_counter() - started) * 1000),
+            "volume_gain": volume_gain,
         }
 
     def speak(
@@ -613,6 +629,7 @@ class TTSService:
         noise_scale: float | None = None,
         noise_w: float | None = None,
         stream: bool | None = None,
+        volume_gain: float | None = None,
     ) -> dict[str, Any]:
         total_started = time.perf_counter()
         normalized = self.normalize(text)
@@ -634,6 +651,7 @@ class TTSService:
                         "noise_scale": noise_scale,
                         "noise_w": noise_w,
                         "stream": True,
+                        "volume_gain": volume_gain,
                     },
                     daemon=True,
                 )
@@ -666,6 +684,7 @@ class TTSService:
                         length_scale=length_scale,
                         noise_scale=noise_scale,
                         noise_w=noise_w,
+                        volume_gain=volume_gain,
                     )
                 except PiperError as exc:
                     logger.warning("in-process Piper failed, falling back to subprocess streaming: %s", exc)
@@ -676,6 +695,7 @@ class TTSService:
                         length_scale=length_scale,
                         noise_scale=noise_scale,
                         noise_w=noise_w,
+                        volume_gain=volume_gain,
                     )
             else:
                 playback = self.engine.stream_raw_to_player(
@@ -685,6 +705,7 @@ class TTSService:
                     length_scale=length_scale,
                     noise_scale=noise_scale,
                     noise_w=noise_w,
+                    volume_gain=volume_gain,
                 )
             return {
                 "original_text": normalized.original_text,
@@ -726,7 +747,7 @@ class TTSService:
 
             if play and blocking:
                 play_started = time.perf_counter()
-                self.player.play_file(wav, blocking=True)
+                self.player.play_file(wav, blocking=True, volume_gain=volume_gain)
                 play_ms += int((time.perf_counter() - play_started) * 1000)
                 played += 1
 
@@ -734,9 +755,9 @@ class TTSService:
         if output is not None:
             output_path = concat_wavs(wavs, Path(output))
 
-        playback = {"play_ms": play_ms, "played": played, "blocking": blocking}
+        playback = {"play_ms": play_ms, "played": played, "blocking": blocking, "volume_gain": volume_gain}
         if play and not blocking:
-            playback = self.play_wavs(wavs, blocking=False)
+            playback = self.play_wavs(wavs, blocking=False, volume_gain=volume_gain)
 
         return {
             "original_text": normalized.original_text,

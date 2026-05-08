@@ -1,0 +1,156 @@
+Jetson display diagnosis log
+Log file: jetson_display_log_20260508_201639.txt
+Using sudo GDM greeter Xauthority fallback for xrandr/xset commands.
+
+==== Date And Time ====
+Fri May  8 08:16:39 PM CST 2026
+
+==== Environment ====
+Original DISPLAY=
+Effective DISPLAY=:0
+Effective XAUTHORITY=/home/asrlab-yian/.Xauthority
+
+==== X11 Access Diagnostics ====
+User: asrlab-yian
+UID: 1000
+
+Possible Xauthority files:
+-rw------- 1 asrlab-yian asrlab-yian 100 May  7 22:02 /home/asrlab-yian/.Xauthority
+/run/user/1000/gdm/Xauthority not found
+/run/user/1000/Xauthority not found
+-rw------- 1 asrlab-yian asrlab-yian 100 May  7 22:02 /home/asrlab-yian/.Xauthority
+/var/run/lightdm/root/:0 not found
+
+Xorg -auth files discovered from running Xorg processes:
+/run/user/128/gdm/Xauthority not found
+
+X server socket files:
+total 0
+srwxrwxrwx 1 root root 0 May  8 19:58 X0
+
+Xorg/Xwayland processes:
+root        1009       1  0 19:59 ?        00:00:00 /usr/sbin/gdm3
+root        1058    1009  0 19:59 ?        00:00:00 gdm-session-worker [pam/gdm-launch-environment]
+gdm         1148       1  0 19:59 ?        00:00:00 /lib/systemd/systemd --user
+gdm         1158    1148  0 19:59 ?        00:00:00 (sd-pam)
+gdm         1327    1148  0 19:59 ?        00:00:00 /usr/bin/pipewire
+gdm         1328    1148  0 19:59 ?        00:00:00 /usr/bin/pipewire-media-session
+gdm         1329    1148  0 19:59 ?        00:00:00 /usr/bin/pulseaudio --daemonize=no --log-target=journal
+gdm         1330    1058  0 19:59 tty1     00:00:00 /usr/libexec/gdm-x-session dbus-run-session -- gnome-session --autostart /usr/share/gdm/greeter/autostart
+root        1332    1330  0 19:59 tty1     00:00:01 /usr/lib/xorg/Xorg vt1 -displayfd 3 -auth /run/user/128/gdm/Xauthority -nolisten tcp -background none -noreset -keeptty -novtswitch -verbose 3
+gdm         1338    1148  0 19:59 ?        00:00:00 /usr/bin/dbus-daemon --session --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+gdm         1402    1330  0 19:59 tty1     00:00:00 dbus-run-session -- gnome-session --autostart /usr/share/gdm/greeter/autostart
+gdm         1403    1402  0 19:59 tty1     00:00:00 dbus-daemon --nofork --print-address 4 --session
+gdm         1410    1402  0 19:59 tty1     00:00:00 /usr/libexec/gnome-session-binary --autostart /usr/share/gdm/greeter/autostart
+gdm         1497       1  0 19:59 tty1     00:00:00 /usr/libexec/at-spi-bus-launcher
+gdm         1511    1497  0 19:59 tty1     00:00:00 /usr/bin/dbus-daemon --config-file=/usr/share/defaults/at-spi2/accessibility.conf --nofork --print-address 11 --address=unix:path=/run/user/128/at-spi/bus_0
+gdm         1566    1410  0 19:59 tty1     00:00:05 /usr/bin/gnome-shell
+gdm         1582       1  0 19:59 tty1     00:00:00 /usr/libexec/xdg-permission-store
+gdm         1603       1  0 19:59 tty1     00:00:00 /usr/bin/gjs /usr/share/gnome-shell/org.gnome.Shell.Notifications
+gdm         1605       1  0 19:59 tty1     00:00:00 /usr/libexec/at-spi2-registryd --use-gnome-session
+gdm         1616    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-sharing
+gdm         1618    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-wacom
+gdm         1620    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-color
+gdm         1621    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-keyboard
+gdm         1623    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-print-notifications
+gdm         1626    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-rfkill
+gdm         1627    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-smartcard
+gdm         1632    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-datetime
+gdm         1635    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-media-keys
+gdm         1636    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-screensaver-proxy
+gdm         1637    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-sound
+gdm         1640    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-a11y-settings
+gdm         1652    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-housekeeping
+gdm         1654    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-power
+gdm         1685       1  0 19:59 tty1     00:00:00 /usr/libexec/gsd-printer
+gdm         1687    1566  0 19:59 tty1     00:00:00 ibus-daemon --panel disable --xim
+gdm         1723       1  0 19:59 tty1     00:00:00 /usr/libexec/gvfsd
+gdm         1731    1687  0 19:59 tty1     00:00:00 /usr/libexec/ibus-dconf
+gdm         1737       1  0 19:59 tty1     00:00:00 /usr/libexec/ibus-portal
+gdm         1749       1  0 19:59 tty1     00:00:00 /usr/bin/gjs /usr/share/gnome-shell/org.gnome.ScreenSaver
+gdm         1760    1687  0 19:59 tty1     00:00:00 /usr/libexec/ibus-engine-simple
+asrlab-+    7534    4027  0 20:16 pts/3    00:00:00 bash ./install_jetson_display_fix.sh --force-720p --use-gdm-greeter
+asrlab-+    7601    7534  0 20:16 pts/3    00:00:00 bash /home/asrlab-yian/MakeNTU/jetson_display_diagnose.sh --use-gdm-greeter
+asrlab-+    7604    7601  0 20:16 pts/3    00:00:00 bash /home/asrlab-yian/MakeNTU/jetson_display_diagnose.sh --use-gdm-greeter
+
+Login sessions:
+SESSION  UID USER        SEAT  TTY
+     10 1000 asrlab-yian       
+     11 1000 asrlab-yian       
+     12 1000 asrlab-yian       
+     13 1000 asrlab-yian       
+      2 1000 asrlab-yian       
+      4 1000 asrlab-yian       
+      6 1000 asrlab-yian       
+      9 1000 asrlab-yian       
+     c1  128 gdm         seat0 tty1
+
+9 sessions listed.
+
+X11 access note:
+A GDM greeter session appears to be running. That is the login screen, not necessarily the user desktop.
+No obvious graphical desktop session owned by this user was found. SSH/TTY shells usually cannot run xrandr without the desktop session authority.
+
+==== xrandr --query ====
+Screen 0: minimum 8 x 8, current 1920 x 1080, maximum 32767 x 32767
+DP-0 disconnected (normal left inverted right x axis y axis)
+DP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 708mm x 398mm
+   1920x1080     60.00*+  50.00    29.97    25.00    23.98  
+   1280x1024     60.02  
+   1280x960      60.00  
+   1280x720      60.00    50.00    29.97    25.00    23.98  
+   1024x768      60.00  
+   800x600       60.32  
+   640x480       59.94  
+
+==== Connected Outputs ====
+DP-1
+
+==== Preferred Output ====
+Preferred output: DP-1
+Reason: DP-1 is connected and is preferred for this Jetson.
+
+==== Supported Modes For Preferred Output ====
+DP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 708mm x 398mm
+   1920x1080     60.00*+  50.00    29.97    25.00    23.98  
+   1280x1024     60.02  
+   1280x960      60.00  
+   1280x720      60.00    50.00    29.97    25.00    23.98  
+   1024x768      60.00  
+   800x600       60.32  
+   640x480       59.94  
+
+==== DRM Connector Status ====
+/sys/class/drm/card1-DP-1/status: disconnected
+
+==== DPMS And Screen Saver Status ====
+Keyboard Control:
+  auto repeat:  on    key click percent:  0    LED mask:  00000000
+  XKB indicators:
+    00: Caps Lock:   off    01: Num Lock:    off    02: Scroll Lock: off
+    03: Compose:     off    04: Kana:        off    05: Sleep:       off
+    06: Suspend:     off    07: Mute:        off    08: Misc:        off
+    09: Mail:        off    10: Charging:    off    11: Shift Lock:  off
+    12: Group 2:     off    13: Mouse Keys:  off
+  auto repeat delay:  500    repeat rate:  33
+  auto repeating keys:  00ffffffdffffbbf
+                        fadfffefffedffff
+                        9fffffffffffffff
+                        fff7ffffffffffff
+  bell percent:  50    bell pitch:  400    bell duration:  100
+Pointer Control:
+  acceleration:  2/1    threshold:  4
+Screen Saver:
+  prefer blanking:  no    allow exposures:  yes
+  timeout:  0    cycle:  0
+Colors:
+  default colormap:  0x20    BlackPixel:  0x0    WhitePixel:  0xffffff
+Font Path:
+  /usr/share/fonts/X11/misc,/usr/share/fonts/X11/Type1,built-ins
+DPMS (Energy Star):
+  Standby: 0    Suspend: 0    Off: 0
+  DPMS is Disabled
+
+==== Display Connection Summary ====
+Display appears CONNECTED to X11. Preferred output is DP-1.
+If OBS is still black through the capture card, try disabling display sleep and forcing 1280x720.

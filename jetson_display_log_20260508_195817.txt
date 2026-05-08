@@ -1,0 +1,30 @@
+Jetson display diagnosis log
+Log file: jetson_display_log_20260508_195817.txt
+
+==== Date And Time ====
+Fri May  8 07:58:17 PM CST 2026
+
+==== Environment ====
+DISPLAY=
+
+==== xrandr --query ====
+Can't open display 
+
+==== Connected Outputs ====
+Could not detect connected outputs because xrandr failed with status 1.
+
+==== Preferred Output ====
+Preferred output: none
+
+==== Supported Modes For Preferred Output ====
+No preferred output was found, so no mode list can be shown.
+
+==== DRM Connector Status ====
+/sys/class/drm/card1-DP-1/status: disconnected
+
+==== DPMS And Screen Saver Status ====
+xset:  unable to open display ""
+xset q failed. DISPLAY may be wrong or the X session may not be available.
+
+==== Display Connection Summary ====
+Display connection could not be determined because xrandr did not run successfully.

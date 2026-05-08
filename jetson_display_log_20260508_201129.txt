@@ -1,0 +1,106 @@
+Jetson display diagnosis log
+Log file: jetson_display_log_20260508_201129.txt
+
+==== Date And Time ====
+Fri May  8 08:11:29 PM CST 2026
+
+==== Environment ====
+Original DISPLAY=
+Effective DISPLAY=:0
+Effective XAUTHORITY=/home/asrlab-yian/.Xauthority
+
+==== X11 Access Diagnostics ====
+User: asrlab-yian
+UID: 1000
+
+Possible Xauthority files:
+-rw------- 1 asrlab-yian asrlab-yian 100 May  7 22:02 /home/asrlab-yian/.Xauthority
+/run/user/1000/gdm/Xauthority not found
+/run/user/1000/Xauthority not found
+-rw------- 1 asrlab-yian asrlab-yian 100 May  7 22:02 /home/asrlab-yian/.Xauthority
+/var/run/lightdm/root/:0 not found
+
+X server socket files:
+total 0
+srwxrwxrwx 1 root root 0 May  8 19:58 X0
+
+Xorg/Xwayland processes:
+root        1009       1  0 19:59 ?        00:00:00 /usr/sbin/gdm3
+root        1058    1009  0 19:59 ?        00:00:00 gdm-session-worker [pam/gdm-launch-environment]
+gdm         1148       1  0 19:59 ?        00:00:00 /lib/systemd/systemd --user
+gdm         1158    1148  0 19:59 ?        00:00:00 (sd-pam)
+gdm         1327    1148  0 19:59 ?        00:00:00 /usr/bin/pipewire
+gdm         1328    1148  0 19:59 ?        00:00:00 /usr/bin/pipewire-media-session
+gdm         1329    1148  0 19:59 ?        00:00:00 /usr/bin/pulseaudio --daemonize=no --log-target=journal
+gdm         1330    1058  0 19:59 tty1     00:00:00 /usr/libexec/gdm-x-session dbus-run-session -- gnome-session --autostart /usr/share/gdm/greeter/autostart
+root        1332    1330  0 19:59 tty1     00:00:01 /usr/lib/xorg/Xorg vt1 -displayfd 3 -auth /run/user/128/gdm/Xauthority -nolisten tcp -background none -noreset -keeptty -novtswitch -verbose 3
+gdm         1338    1148  0 19:59 ?        00:00:00 /usr/bin/dbus-daemon --session --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+gdm         1402    1330  0 19:59 tty1     00:00:00 dbus-run-session -- gnome-session --autostart /usr/share/gdm/greeter/autostart
+gdm         1403    1402  0 19:59 tty1     00:00:00 dbus-daemon --nofork --print-address 4 --session
+gdm         1410    1402  0 19:59 tty1     00:00:00 /usr/libexec/gnome-session-binary --autostart /usr/share/gdm/greeter/autostart
+gdm         1497       1  0 19:59 tty1     00:00:00 /usr/libexec/at-spi-bus-launcher
+gdm         1511    1497  0 19:59 tty1     00:00:00 /usr/bin/dbus-daemon --config-file=/usr/share/defaults/at-spi2/accessibility.conf --nofork --print-address 11 --address=unix:path=/run/user/128/at-spi/bus_0
+gdm         1566    1410  0 19:59 tty1     00:00:05 /usr/bin/gnome-shell
+gdm         1582       1  0 19:59 tty1     00:00:00 /usr/libexec/xdg-permission-store
+gdm         1603       1  0 19:59 tty1     00:00:00 /usr/bin/gjs /usr/share/gnome-shell/org.gnome.Shell.Notifications
+gdm         1605       1  0 19:59 tty1     00:00:00 /usr/libexec/at-spi2-registryd --use-gnome-session
+gdm         1616    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-sharing
+gdm         1618    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-wacom
+gdm         1620    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-color
+gdm         1621    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-keyboard
+gdm         1623    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-print-notifications
+gdm         1626    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-rfkill
+gdm         1627    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-smartcard
+gdm         1632    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-datetime
+gdm         1635    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-media-keys
+gdm         1636    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-screensaver-proxy
+gdm         1637    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-sound
+gdm         1640    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-a11y-settings
+gdm         1652    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-housekeeping
+gdm         1654    1410  0 19:59 tty1     00:00:00 /usr/libexec/gsd-power
+gdm         1685       1  0 19:59 tty1     00:00:00 /usr/libexec/gsd-printer
+gdm         1687    1566  0 19:59 tty1     00:00:00 ibus-daemon --panel disable --xim
+gdm         1723       1  0 19:59 tty1     00:00:00 /usr/libexec/gvfsd
+gdm         1731    1687  0 19:59 tty1     00:00:00 /usr/libexec/ibus-dconf
+gdm         1737       1  0 19:59 tty1     00:00:00 /usr/libexec/ibus-portal
+gdm         1749       1  0 19:59 tty1     00:00:00 /usr/bin/gjs /usr/share/gnome-shell/org.gnome.ScreenSaver
+gdm         1760    1687  0 19:59 tty1     00:00:00 /usr/libexec/ibus-engine-simple
+
+Login sessions:
+SESSION  UID USER        SEAT  TTY
+     10 1000 asrlab-yian       
+     11 1000 asrlab-yian       
+     12 1000 asrlab-yian       
+     13 1000 asrlab-yian       
+      2 1000 asrlab-yian       
+      4 1000 asrlab-yian       
+      6 1000 asrlab-yian       
+      9 1000 asrlab-yian       
+     c1  128 gdm         seat0 tty1
+
+9 sessions listed.
+
+==== xrandr --query ====
+Authorization required, but no authorization protocol specified
+Can't open display :0
+
+==== Connected Outputs ====
+Could not detect connected outputs because xrandr failed with status 1.
+
+==== Preferred Output ====
+Preferred output: none
+
+==== Supported Modes For Preferred Output ====
+No preferred output was found, so no mode list can be shown.
+
+==== DRM Connector Status ====
+/sys/class/drm/card1-DP-1/status: disconnected
+
+==== DPMS And Screen Saver Status ====
+Authorization required, but no authorization protocol specified
+xset:  unable to open display ":0"
+xset q failed. DISPLAY may be wrong or the X session may not be available.
+
+==== Display Connection Summary ====
+Display connection could not be determined because xrandr did not run successfully.
+If you see "Authorization required", run this from the Jetson desktop Terminal or use the correct DISPLAY/XAUTHORITY for the logged-in desktop session.

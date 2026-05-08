@@ -68,6 +68,8 @@ DEFAULT_INSTANCE_LOCK = "/tmp/wake_voice_chat_frdm_bridge.lock"
 DEFAULT_MUSIC_TOOL_URL = os.getenv("MUSIC_TOOL_URL", "http://127.0.0.1:8788/music")
 DEFAULT_WEATHER_TOOL_URL = os.getenv("WEATHER_TOOL_URL", "http://127.0.0.1:8788/weather")
 DEFAULT_WEATHER_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "Taipei")
+DEFAULT_TODO_LIST_PATH = THIS_DIR / "logs" / "todo_list.json"
+DEFAULT_DISCORD_WEBHOOK_FILE = Path(os.getenv("DISCORD_WEBHOOK_FILE", "~/.config/makentu/discord_webhook_url")).expanduser()
 SESSION_END_KEYWORDS = (
     "結束對話",
     "退出對話模式",
@@ -124,36 +126,111 @@ DEMO_PREFLIGHT_SKIP_ARGS = (
     "--help",
     "--list-mics",
     "--list-uarts",
+    "--test-beep",
 )
 
-CORE_SCREEN_COMMANDS = {"Sleep", "Normal", "Thinking", "Speaking"}
+CORE_SCREEN_COMMANDS = {"Sleep", "Normal", "Thinking", "Speaking", "Music", "Focus"}
 MOTOR_COMMANDS = {"MotorPitch", "MotorYaw"}
 UTILITY_COMMANDS = {"ShowNum"}
-FUTURE_EMOTION_SCREEN_COMMANDS = {"Neutral", "Happy", "Curious", "Excited", "Confused", "Concerned", "Sleepy"}
-ALLOWED_UART_COMMANDS = CORE_SCREEN_COMMANDS | MOTOR_COMMANDS | UTILITY_COMMANDS | FUTURE_EMOTION_SCREEN_COMMANDS
+ALLOWED_UART_COMMANDS = CORE_SCREEN_COMMANDS | MOTOR_COMMANDS | UTILITY_COMMANDS
+SINGLE_ARG_UART_COMMANDS = MOTOR_COMMANDS | {"Speaking"}
 
 VALID_PERSISTENT_STATES = {"normal", "sleep", "unchanged"}
-VALID_EMOTIONS = {"neutral", "happy", "curious", "excited", "confused", "concerned", "sleepy"}
+VALID_SCREEN_MODES = {"unchanged", "normal", "sleep", "thinking", "music", "focus"}
+VALID_EMOTIONS = {"neutral", "concerned", "angry", "sad", "happy", "curious", "excited", "confused", "sleepy"}
 VALID_HEAD_MOTIONS = {"none", "nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop"}
 
-EMOTION_TO_SCREEN_COMMAND = {
-    "neutral": "Neutral",
-    "happy": "Happy",
-    "curious": "Curious",
-    "excited": "Excited",
-    "confused": "Confused",
-    "concerned": "Concerned",
-    "sleepy": "Sleepy",
+SCREEN_MODE_TO_COMMAND = {
+    "normal": "Normal",
+    "sleep": "Sleep",
+    "thinking": "Thinking",
+    "music": "Music",
+    "focus": "Focus",
+}
+
+# FRDM SpeakingGui expects a single emotion argument:
+# 0=neutral, 1=concerned, 2=angry, 3=sad, 4=happy, 5=confused.
+EMOTION_TO_SPEAKING_CODE = {
+    "neutral": 0,
+    "concerned": 1,
+    "angry": 2,
+    "sad": 3,
+    "happy": 4,
+    "curious": 5,
+    "excited": 4,
+    "confused": 5,
+    "sleepy": 3,
 }
 
 EMOTION_TO_HEAD_MOTION = {
     "neutral": "none",
+    "concerned": "gentle_nod",
+    "angry": "shake",
+    "sad": "gentle_nod",
     "happy": "nod",
     "curious": "look_around",
     "excited": "double_nod",
     "confused": "shake",
-    "concerned": "gentle_nod",
     "sleepy": "sleepy_drop",
+}
+
+EMOTION_ALIASES = {
+    "calm": "neutral",
+    "normal": "neutral",
+    "中性": "neutral",
+    "開心": "happy",
+    "开心": "happy",
+    "joy": "happy",
+    "joyful": "happy",
+    "positive": "happy",
+    "interested": "curious",
+    "thinking": "curious",
+    "questioning": "curious",
+    "好奇": "curious",
+    "surprised": "excited",
+    "surprise": "excited",
+    "energetic": "excited",
+    "amazed": "excited",
+    "興奮": "excited",
+    "兴奋": "excited",
+    "unsure": "confused",
+    "uncertain": "confused",
+    "puzzled": "confused",
+    "confusing": "confused",
+    "困惑": "confused",
+    "angry": "angry",
+    "mad": "angry",
+    "furious": "angry",
+    "rage": "angry",
+    "生氣": "angry",
+    "生气": "angry",
+    "火大": "angry",
+    "憤怒": "angry",
+    "愤怒": "angry",
+    "sad": "sad",
+    "down": "sad",
+    "depressed": "sad",
+    "難過": "sad",
+    "难过": "sad",
+    "沮喪": "sad",
+    "沮丧": "sad",
+    "anxious": "concerned",
+    "worried": "concerned",
+    "frustrated": "concerned",
+    "upset": "concerned",
+    "急": "concerned",
+    "急躁": "concerned",
+    "擔心": "concerned",
+    "担心": "concerned",
+    "焦慮": "concerned",
+    "焦虑": "concerned",
+    "tired": "sleepy",
+    "drowsy": "sleepy",
+    "sleep": "sleepy",
+    "asleep": "sleepy",
+    "睏": "sleepy",
+    "困": "sleepy",
+    "疲累": "sleepy",
 }
 
 # FRDM head motors use absolute servo angles:
@@ -221,7 +298,7 @@ def format_motor_sequence(steps: list[MotorStep]) -> str:
 
 
 def format_uart_wire_command(command: str, v1: int, v2: int) -> str:
-    if command in MOTOR_COMMANDS:
+    if command in SINGLE_ARG_UART_COMMANDS:
         return f"{command} {v1}"
     return f"{command} {v1} {v2}"
 
@@ -417,16 +494,26 @@ SLEEP_INTENT_KEYWORDS = (
     "去睡觉",
     "睡覺吧",
     "睡觉吧",
+    "睡一下",
+    "想睡",
+    "先睡",
     "休息一下",
+    "休眠",
+    "休息模式",
     "晚安",
     "進入睡眠模式",
     "进入睡眠模式",
     "安靜一下",
     "安静一下",
+    "安靜模式",
+    "安静模式",
     "不要吵我",
+    "先不要聽",
+    "先不要听",
     "sleep",
     "go to sleep",
     "standby",
+    "quiet mode",
 )
 
 WAKE_INTENT_KEYWORDS = (
@@ -435,20 +522,39 @@ WAKE_INTENT_KEYWORDS = (
     "醒来",
     "回來",
     "回来",
+    "回來了",
+    "回来了",
+    "回來工作",
+    "回来工作",
+    "繼續工作",
+    "继续工作",
+    "開始工作",
+    "开始工作",
     "回到正常",
+    "正常模式",
+    "一般模式",
     "不要睡了",
     "回來陪我",
     "回来陪我",
     "wake up",
     "come back",
     "normal",
+    "back to work",
     "don't sleep",
     "do not sleep",
 )
 
 FOCUS_START_INTENT_KEYWORDS = (
+    "專注",
+    "专注",
+    "專心",
+    "专心",
     "開始工作",
     "开始工作",
+    "開始專注",
+    "开始专注",
+    "開始專心",
+    "开始专心",
     "專心工作",
     "专心工作",
     "進入工作模式",
@@ -474,8 +580,12 @@ FOCUS_STOP_INTENT_KEYWORDS = (
     "停止工作",
     "結束專心",
     "结束专心",
+    "結束專注",
+    "结束专注",
     "停止專心",
     "停止专心",
+    "停止專注",
+    "停止专注",
     "退出工作模式",
     "離開工作模式",
     "离开工作模式",
@@ -487,6 +597,89 @@ FOCUS_STOP_INTENT_KEYWORDS = (
     "stop focus",
     "end focus",
     "exit focus",
+)
+TODO_MARKER_KEYWORDS = (
+    "待辦",
+    "待办",
+    "代辦",
+    "代办",
+    "todo",
+    "to do",
+    "to-do",
+    "任務清單",
+    "任务清单",
+    "工作清單",
+    "工作清单",
+)
+TODO_ADD_INTENT_KEYWORDS = (
+    "新增待辦",
+    "新增待办",
+    "新增代辦",
+    "加入待辦",
+    "加入待办",
+    "加一個待辦",
+    "加一个待办",
+    "記一個待辦",
+    "记一个待办",
+    "幫我記待辦",
+    "帮我记待办",
+    "幫我記一個待辦",
+    "帮我记一个待办",
+    "todo add",
+    "add todo",
+    "new todo",
+)
+TODO_LIST_INTENT_KEYWORDS = (
+    "列出待辦",
+    "列出待办",
+    "查看待辦",
+    "查看待办",
+    "看待辦",
+    "看待办",
+    "我的待辦",
+    "我的待办",
+    "待辦清單",
+    "待办清单",
+    "還有哪些待辦",
+    "还有哪些待办",
+    "todo list",
+    "list todo",
+    "show todo",
+)
+TODO_DONE_INTENT_KEYWORDS = (
+    "完成待辦",
+    "完成待办",
+    "完成代辦",
+    "完成代办",
+    "做完待辦",
+    "做完待办",
+    "勾掉待辦",
+    "勾掉待办",
+    "刪除待辦",
+    "删除待办",
+    "移除待辦",
+    "移除待办",
+    "todo done",
+    "done todo",
+    "finish todo",
+)
+TODO_CLEAR_COMPLETED_INTENT_KEYWORDS = (
+    "清除已完成待辦",
+    "清除已完成待办",
+    "刪除已完成待辦",
+    "删除已完成待办",
+    "清理已完成待辦",
+    "清理已完成待办",
+    "clear completed todo",
+)
+TODO_CLEAR_ALL_INTENT_KEYWORDS = (
+    "清空待辦",
+    "清空待办",
+    "清除所有待辦",
+    "清除所有待办",
+    "刪除所有待辦",
+    "删除所有待办",
+    "clear all todo",
 )
 CAMERA_CAPTURE_HELPER = r"""
 import glob
@@ -614,6 +807,24 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def read_secret_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        print(f"WARNING: could not read secret file {path}: {exc}")
+        return ""
+
+
+def default_discord_webhook_url() -> str:
+    return (
+        os.getenv("FOCUS_DISCORD_WEBHOOK_URL", "").strip()
+        or os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+        or read_secret_file(DEFAULT_DISCORD_WEBHOOK_FILE)
+    )
+
+
 def resample_float(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
     if source_rate == target_rate:
         return np.asarray(audio, dtype=np.float32)
@@ -654,15 +865,37 @@ def adaptive_recording_thresholds(args: argparse.Namespace, ambient_volumes: lis
     speech_start_threshold = int(getattr(args, "volume_min", 700))
     silence_base_threshold = speech_start_threshold
     if not getattr(args, "no_adaptive_volume", False):
+        speech_start_ratio = max(0.0, float(getattr(args, "speech_start_ratio", 1.25) or 0.0))
+        silence_noise_ratio = max(0.0, float(getattr(args, "silence_noise_ratio", 1.15) or 0.0))
         speech_start_threshold = max(
             speech_start_threshold,
             noise_floor + int(getattr(args, "speech_start_margin", 350)),
+            int(round(noise_floor * speech_start_ratio)),
         )
         silence_base_threshold = max(
             int(getattr(args, "volume_min", 700)),
             noise_floor + int(getattr(args, "silence_margin", 500)),
+            int(round(noise_floor * silence_noise_ratio)),
         )
     return noise_floor, speech_start_threshold, silence_base_threshold
+
+
+def adaptive_wake_volume_threshold(args: argparse.Namespace, ambient_volumes: list[int], *, fallback_volume: int) -> tuple[int, int]:
+    """Return ambient floor and dynamic volume needed to accept a wake score."""
+    noise_floor = percentile_int(
+        ambient_volumes,
+        getattr(args, "noise_floor_percentile", 75.0),
+        fallback=fallback_volume,
+    )
+    wake_volume_threshold = int(getattr(args, "wake_volume_min", 350))
+    if not getattr(args, "no_adaptive_volume", False):
+        wake_volume_ratio = max(0.0, float(getattr(args, "wake_volume_ratio", 1.15) or 0.0))
+        wake_volume_threshold = max(
+            wake_volume_threshold,
+            noise_floor + int(getattr(args, "wake_volume_margin", 0)),
+            int(round(noise_floor * wake_volume_ratio)),
+        )
+    return noise_floor, wake_volume_threshold
 
 
 def adaptive_silence_threshold(args: argparse.Namespace, silence_base_threshold: int, peak_volume: int) -> int:
@@ -1211,6 +1444,152 @@ def extract_focus_task(transcript: str) -> str:
     return task[:120]
 
 
+def contains_todo_marker(text: str) -> bool:
+    return contains_intent(text, TODO_MARKER_KEYWORDS)
+
+
+def detect_todo_intent(transcript: str) -> str | None:
+    text = str(transcript or "")
+    compact = normalize_intent_text(text)
+    lowered = text.lower()
+
+    if contains_intent(text, TODO_CLEAR_ALL_INTENT_KEYWORDS):
+        return "clear_all"
+    if contains_intent(text, TODO_CLEAR_COMPLETED_INTENT_KEYWORDS):
+        return "clear_completed"
+    if contains_intent(text, TODO_LIST_INTENT_KEYWORDS):
+        return "list"
+    if contains_intent(text, TODO_DONE_INTENT_KEYWORDS):
+        return "done"
+    if contains_intent(text, TODO_ADD_INTENT_KEYWORDS):
+        return "add"
+
+    marker = contains_todo_marker(text)
+    if marker and any(word in compact for word in ("有哪些", "還有什麼", "还有什么", "列出", "查看", "看看", "清單", "清单")):
+        return "list"
+    if marker and any(word in compact for word in ("完成", "做完", "勾掉", "刪除", "删除", "移除")):
+        return "done"
+    if marker and any(word in compact for word in ("新增", "增加", "加入", "添加", "記", "记", "建立")):
+        return "add"
+    if re.search(r"\b(todo|to-do)\s+(add|new|create)\b", lowered):
+        return "add"
+    if re.search(r"\b(todo|to-do)\s+(done|finish|complete|remove|delete)\b", lowered):
+        return "done"
+    if re.search(r"\b(todo|to-do)\s+(list|show)\b", lowered):
+        return "list"
+    return None
+
+
+def clean_todo_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"^[：:，,。.\s]+", "", cleaned)
+    cleaned = re.sub(r"[。.!！?？\s]+$", "", cleaned)
+    cleaned = re.sub(r"^(幫我|帮我|請|请|麻煩|麻烦|我要|我想要)\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:160]
+
+
+def extract_todo_add_text(transcript: str) -> str:
+    text = str(transcript or "").strip()
+    patterns = (
+        r"^(?:幫我|帮我|請|请|麻煩|麻烦)?\s*"
+        r"(?:新增|增加|加入|添加|建立|記下|记下|記住|记住|記|记|幫我記|帮我记|提醒我)"
+        r"(?:一個|一个|一項|一项|新的)?"
+        r"(?:待辦|待办|代辦|代办|todo|to do|to-do|任務|任务|事項|事项)?"
+        r"(?:清單|清单)?[：:\s,，]*(?P<item>.+)$",
+        r"^(?:待辦|待办|代辦|代办|todo|to do|to-do)\s*(?:新增|增加|加入|add|new|create)?[：:\s,，]*(?P<item>.+)$",
+        r"^(?:把|將|将)?\s*(?P<item>.+?)(?:加入|新增到|加到|放進|放进|放到)(?:我的)?(?:待辦|待办|代辦|代办|todo|清單|清单)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        item = clean_todo_text(match.group("item"))
+        if item and not contains_intent(item, TODO_MARKER_KEYWORDS):
+            return item
+        if item and len(normalize_intent_text(item)) >= 2:
+            return item
+    return ""
+
+
+CHINESE_NUMBER_VALUES = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "兩": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+
+def parse_chinese_number_token(token: str) -> int | None:
+    raw = str(token or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        number = int(raw)
+        return number if number > 0 else None
+    if raw in CHINESE_NUMBER_VALUES:
+        number = CHINESE_NUMBER_VALUES[raw]
+        return number if number > 0 else None
+    if raw == "十":
+        return 10
+    if "十" in raw:
+        left, _, right = raw.partition("十")
+        tens = CHINESE_NUMBER_VALUES.get(left, 1 if left == "" else 0)
+        ones = CHINESE_NUMBER_VALUES.get(right, 0 if right == "" else -1)
+        if tens <= 0 or ones < 0:
+            return None
+        number = tens * 10 + ones
+        return number if number > 0 else None
+    return None
+
+
+def extract_todo_done_number(transcript: str) -> int | None:
+    text = str(transcript or "")
+    patterns = (
+        r"(?:完成|做完|勾掉|刪除|删除|移除|done|finish|complete|remove|delete)"
+        r"(?:\s*(?:待辦|待办|代辦|代办|todo|to-do))?\s*(?:第)?(?P<num>\d+)\s*(?:項|项|個|个|件|筆|笔|號|号)?",
+        r"(?:第)(?P<num>[一二兩两三四五六七八九十]+)\s*(?:項|项|個|个|件|筆|笔)",
+        r"(?:完成|做完|勾掉|刪除|删除|移除)\s*(?:第)?(?P<num>[一二兩两三四五六七八九十]+)\s*(?:項|项|個|个|件|筆|笔)?",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        number = parse_chinese_number_token(match.group("num"))
+        if number is not None:
+            return number
+    return None
+
+
+def extract_todo_done_text(transcript: str) -> str:
+    text = str(transcript or "")
+    text = re.sub(
+        r"(?:完成|做完|勾掉|刪除|删除|移除|done|finish|complete|remove|delete)"
+        r"(?:\s*(?:待辦|待办|代辦|代办|todo|to-do))?",
+        " ",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"(?:第)?\d+\s*(?:項|项|個|个|件|筆|笔|號|号)?", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?:第)?[一二兩两三四五六七八九十]+\s*(?:項|项|個|个|件|筆|笔)?", " ", text)
+    for keyword in TODO_MARKER_KEYWORDS:
+        text = re.sub(re.escape(keyword), " ", text, flags=re.IGNORECASE)
+    return clean_todo_text(text)
+
+
+def todo_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 def extract_json_object(text: str) -> dict[str, Any] | None:
     cleaned = str(text or "").strip()
     cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
@@ -1233,11 +1612,29 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def emotion_from_transcript_keywords(transcript: str) -> str:
+    text = str(transcript or "").lower()
+    if any(word in text for word in ("操你媽", "操你妈", "幹你娘", "干你娘", "媽的", "妈的", "靠北", "靠邀", "fuck", "shit")):
+        return "angry"
+    if any(word in text for word in ("生氣", "生气", "很氣", "很气", "氣死", "气死", "火大", "憤怒", "愤怒", "不爽")):
+        return "angry"
+    if any(word in text for word in ("難過", "难过", "傷心", "伤心", "沮喪", "沮丧", "失落")):
+        return "sad"
+    if any(word in text for word in ("擔心", "担心", "焦慮", "焦虑", "怕", "緊張", "紧张")):
+        return "concerned"
+    if any(word in text for word in ("開心", "开心", "太好了", "讚", "赞", "棒")):
+        return "happy"
+    if any(word in text for word in ("看不懂", "不懂", "怪怪", "奇怪", "搞不懂")):
+        return "confused"
+    return "neutral"
+
+
 def local_control_from_transcript(transcript: str, response: dict[str, Any] | None = None) -> dict[str, str]:
     state_intent = detect_persistent_state_intent(transcript)
     if state_intent == "sleep":
         return {
             "persistent_state": "sleep",
+            "screen_mode": "sleep",
             "emotion": "sleepy",
             "head_motion": "sleepy_drop",
             "reason": "sleep intent",
@@ -1245,22 +1642,26 @@ def local_control_from_transcript(transcript: str, response: dict[str, Any] | No
     if state_intent == "normal":
         return {
             "persistent_state": "normal",
+            "screen_mode": "normal",
             "emotion": "happy",
             "head_motion": "nod",
             "reason": "wake/normal intent",
         }
 
-    emotion = "neutral"
+    keyword_emotion = emotion_from_transcript_keywords(transcript)
+    emotion = keyword_emotion
     if response is not None:
         raw_emotion = response.get("emotion")
         if isinstance(raw_emotion, dict):
-            emotion = str(raw_emotion.get("primary", emotion)).strip().lower()
+            emotion = normalize_emotion_name(raw_emotion.get("primary", emotion), default=emotion)
         elif isinstance(raw_emotion, str):
-            emotion = raw_emotion.strip().lower()
-    if emotion not in VALID_EMOTIONS:
-        emotion = "neutral"
+            emotion = normalize_emotion_name(raw_emotion, default=emotion)
+    if keyword_emotion in {"angry", "sad"} and emotion in {"neutral", "concerned"}:
+        emotion = keyword_emotion
+    emotion = normalize_emotion_name(emotion, default="neutral")
     return {
         "persistent_state": "unchanged",
+        "screen_mode": "unchanged",
         "emotion": emotion,
         "head_motion": EMOTION_TO_HEAD_MOTION.get(emotion, "none"),
         "reason": "local fallback",
@@ -1268,11 +1669,24 @@ def local_control_from_transcript(transcript: str, response: dict[str, Any] | No
 
 
 def head_motion_for_emotion(emotion: str, requested_head_motion: str = "") -> str:
-    normalized_emotion = emotion if emotion in VALID_EMOTIONS else "neutral"
+    normalized_emotion = normalize_emotion_name(emotion, default="neutral")
     requested = str(requested_head_motion or "").strip().lower()
     if requested in VALID_HEAD_MOTIONS and requested != "none":
         return requested
     return EMOTION_TO_HEAD_MOTION.get(normalized_emotion, "none")
+
+
+def speaking_code_for_emotion(emotion: str) -> int:
+    normalized_emotion = normalize_emotion_name(emotion, default="neutral")
+    return EMOTION_TO_SPEAKING_CODE.get(normalized_emotion, 0)
+
+
+def normalize_emotion_name(value: Any, *, default: str = "neutral") -> str:
+    raw = str(value or "").strip().lower()
+    normalized = EMOTION_ALIASES.get(raw, raw)
+    if normalized in VALID_EMOTIONS:
+        return normalized
+    return default if default in VALID_EMOTIONS else "neutral"
 
 
 def normalize_control(response: dict[str, Any]) -> dict[str, str]:
@@ -1301,30 +1715,43 @@ def normalize_control(response: dict[str, Any]) -> dict[str, str]:
     if persistent_state not in VALID_PERSISTENT_STATES:
         persistent_state = fallback["persistent_state"]
 
-    emotion = str(source.get("emotion", fallback["emotion"])).strip().lower()
-    if emotion not in VALID_EMOTIONS:
+    screen_mode = str(source.get("screen_mode", fallback["screen_mode"])).strip().lower()
+    if screen_mode not in VALID_SCREEN_MODES:
+        screen_mode = fallback["screen_mode"]
+
+    emotion = normalize_emotion_name(source.get("emotion", fallback["emotion"]), default=fallback["emotion"])
+    emotion_overridden_by_transcript = False
+    if fallback["emotion"] in {"angry", "sad"} and emotion in {"neutral", "concerned"}:
         emotion = fallback["emotion"]
+        emotion_overridden_by_transcript = True
 
     head_motion = head_motion_for_emotion(emotion, str(source.get("head_motion", "") or ""))
+    if emotion_overridden_by_transcript:
+        head_motion = EMOTION_TO_HEAD_MOTION.get(emotion, head_motion)
 
     reason = str(source.get("reason", fallback["reason"])).strip() or fallback["reason"]
 
     state_intent = detect_persistent_state_intent(transcript)
     if state_intent == "sleep":
         persistent_state = "sleep"
+        screen_mode = "sleep"
         emotion = "sleepy"
         head_motion = "sleepy_drop"
         reason = "sleep intent"
     elif state_intent == "normal":
         persistent_state = "normal"
+        screen_mode = "normal"
         if emotion in {"sleepy", "concerned", "confused"}:
             emotion = "happy"
         if head_motion in {"sleepy_drop", "shake"}:
             head_motion = "nod"
         reason = "wake/normal intent"
+    elif persistent_state in {"normal", "sleep"} and screen_mode == "unchanged":
+        screen_mode = persistent_state
 
     return {
         "persistent_state": persistent_state,
+        "screen_mode": screen_mode,
         "emotion": emotion,
         "head_motion": head_motion,
         "reason": reason,
@@ -1350,6 +1777,7 @@ def sanitize_reply(response: dict[str, Any]) -> str:
     lowered = reply.lower()
     internal_markers = (
         "persistent_state",
+        "screen_mode",
         "head_motion",
         "motorpitch",
         "motoryaw",
@@ -1422,8 +1850,46 @@ def fallback_detect_music_intent(text: str) -> dict[str, Any]:
         return {"intent": True, "action": "pause", "query": "", "reason": "fallback_pause", "normalized_text": normalized}
     if re.search(r"(繼續|继续|接著|接着|恢復|恢复).{0,4}(播放|播|放|音樂|音乐|歌曲|歌)|\b(resume|unpause)\b|\bcontinue\s+(the\s+)?(music|song|audio|playback)\b", lowered, flags=re.IGNORECASE):
         return {"intent": True, "action": "resume", "query": "", "reason": "fallback_resume", "normalized_text": normalized}
+    audio_complaint_words = (
+        "沒聲音",
+        "没声音",
+        "沒有聲音",
+        "没有声音",
+        "聲音太小",
+        "声音太小",
+        "聲音很小",
+        "声音很小",
+        "聲音超小",
+        "声音超小",
+        "小聲",
+        "小声",
+        "音量",
+        "聽不到",
+        "听不到",
+        "聽到聲音",
+        "听到声音",
+    )
+    explicit_music_words = (
+        "播放音樂",
+        "播放音乐",
+        "播放歌曲",
+        "播音樂",
+        "播音乐",
+        "播歌",
+        "放音樂",
+        "放音乐",
+        "放歌",
+        "聽歌",
+        "听歌",
+        "點歌",
+        "点歌",
+        "play music",
+        "play song",
+    )
+    if any(word in lowered for word in audio_complaint_words) and not any(word in lowered for word in explicit_music_words):
+        return {"intent": False, "action": "none", "query": "", "reason": "fallback_audio_complaint_not_music", "normalized_text": normalized}
     play_pattern = re.compile(
-        r"(?:播放|播一下|播|波一下|波|放一下|放|換成|换成|換一首|换一首|改播|切到|我想要聽|我想要听|想要聽|想要听|我想聽|我想听|想聽|想听|我要聽|我要听|聽一下|听一下|聽|听|play|listen to)\s*(?P<query>.+)",
+        r"(?:播放|播一下|播|波一下|波|放一下|放|換成|换成|換一首|换一首|改播|切到|我想要聽|我想要听|想要聽|想要听|我想聽|我想听|想聽|想听|我要聽|我要听|聽一下|听一下|play|listen to)\s*(?P<query>.+)",
         flags=re.IGNORECASE,
     )
     match = play_pattern.search(normalized)
@@ -1964,19 +2430,14 @@ class RobotUartController:
             "normal": "Normal",
             "thinking": "Thinking",
             "speaking": "Speaking",
+            "music": "Music",
+            "focus": "Focus",
             "shownum": "ShowNum",
             "show_num": "ShowNum",
             "motorpitch": "MotorPitch",
             "pitch": "MotorPitch",
             "motoryaw": "MotorYaw",
             "yaw": "MotorYaw",
-            "neutral": "Neutral",
-            "happy": "Happy",
-            "curious": "Curious",
-            "excited": "Excited",
-            "confused": "Confused",
-            "concerned": "Concerned",
-            "sleepy": "Sleepy",
         }
         compact = re.sub(r"[\s_-]+", "", name).lower()
         name = aliases.get(compact, name)
@@ -1992,6 +2453,9 @@ class RobotUartController:
             v2 = 0
         elif name == "ShowNum":
             v1 = clamp_int(v1, 0, 999999)
+            v2 = clamp_int(v2, 0, 999999)
+        elif name == "Speaking":
+            v1 = clamp_int(v1, 0, 5)
             v2 = clamp_int(v2, 0, 999999)
         else:
             v1 = clamp_int(v1, -999999, 999999)
@@ -2134,6 +2598,21 @@ class RobotUartController:
     def set_screen_state(self, state: str) -> bool:
         return self.send_uart_command(state, 0, 0, reason=f"screen state {state}", read_ms=80)
 
+    def set_screen_mode(self, mode: str, *, reason: str = "") -> bool:
+        normalized = str(mode or "").strip().lower()
+        command = SCREEN_MODE_TO_COMMAND.get(normalized)
+        if command is None:
+            print(f"WARNING: unknown screen mode {mode!r}; screen unchanged.")
+            return False
+        if normalized in {"normal", "sleep"}:
+            self.set_persistent_state(normalized)
+        ok = self.set_screen_state(command)
+        if ok:
+            print(f"UART {command} sent ({reason or 'screen mode ' + normalized}).")
+        else:
+            print(f"WARNING: UART {command} not sent; FRDM UART is unavailable.")
+        return ok
+
     def set_persistent_state(self, state: str) -> None:
         if state in {"normal", "sleep"}:
             if state != self.persistent_state:
@@ -2150,31 +2629,24 @@ class RobotUartController:
         return ok
 
     def send_emotion_screen(self, emotion: str) -> str:
-        normalized = emotion if emotion in VALID_EMOTIONS else "neutral"
-        command = EMOTION_TO_SCREEN_COMMAND.get(normalized, "Neutral")
-        ok = self.send_uart_command(command, 0, 0, reason=f"emotion {normalized}", read_ms=60)
-        if ok:
-            print(f"emotion screen command sent: {command} 0 0")
-        else:
-            print(f"WARNING: emotion screen command not sent: {command} 0 0")
-        return command
+        return self.send_speaking_and_emotion(emotion)
 
     def send_speaking_and_emotion(self, emotion: str) -> str:
-        """Switch to Speaking and apply the emotion screen in one serial session."""
-        normalized = emotion if emotion in VALID_EMOTIONS else "neutral"
-        command = EMOTION_TO_SCREEN_COMMAND.get(normalized, "Neutral")
-        ok = self.send_uart_sequence(
-            [("Speaking", 0, 0), (command, 0, 0)],
-            reason=f"speaking + emotion {normalized}",
-            delay_sec=0.02,
+        """Switch to Speaking and pass the FRDM 0..5 speaking emotion code."""
+        normalized = normalize_emotion_name(emotion, default="neutral")
+        code = speaking_code_for_emotion(normalized)
+        ok = self.send_uart_command(
+            "Speaking",
+            code,
+            0,
+            reason=f"speaking emotion {normalized} code {code}",
             read_ms=80,
         )
         if ok:
-            print("UART Speaking sent.")
-            print(f"emotion screen command sent: {command} 0 0")
+            print(f"UART Speaking sent with emotion={normalized}, code={code}.")
         else:
-            print("WARNING: UART Speaking/emotion not sent; FRDM UART is unavailable.")
-        return command
+            print(f"WARNING: UART Speaking {code} not sent; FRDM UART is unavailable.")
+        return "Speaking"
 
     def run_head_motion(self, head_motion: str) -> bool:
         motion = head_motion if head_motion in HEAD_MOTION_SEQUENCES else "none"
@@ -2395,7 +2867,16 @@ class FocusModeManager:
             str(getattr(self.args, "uart_line_ending", "crlf")),
             "--alert-threshold",
             str(getattr(self.args, "focus_alert_threshold", 2)),
+            "--todo-list-path",
+            str(getattr(self.args, "todo_list_path", THIS_DIR / "logs" / "todo_list.json")),
+            "--notify-mode",
+            str(getattr(self.args, "focus_notify_mode", "none")),
+            "--notify-timeout",
+            str(getattr(self.args, "focus_notify_timeout", 8.0)),
         ]
+        discord_webhook_url = str(getattr(self.args, "focus_discord_webhook_url", "") or "").strip()
+        if discord_webhook_url:
+            command.extend(["--discord-webhook-url", discord_webhook_url])
         if task:
             command.extend(["--task", task])
         if duration_min is not None and duration_min > 0:
@@ -2408,6 +2889,8 @@ class FocusModeManager:
             command.append("--uart-debug")
         if getattr(self.args, "focus_save_images", False):
             command.append("--save-images")
+        if getattr(self.args, "focus_notify_dry_run", False):
+            command.append("--notify-dry-run")
 
         child_env = os.environ.copy()
         child_env.setdefault("PYTHONUNBUFFERED", "1")
@@ -2462,6 +2945,237 @@ class FocusModeManager:
         self._terminate_process(graceful_timeout=3.0, kill_timeout=1.0)
 
 
+class TodoListManager:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.path = Path(str(getattr(args, "todo_list_path", DEFAULT_TODO_LIST_PATH))).expanduser()
+
+    def is_enabled(self) -> bool:
+        return not bool(getattr(self.args, "no_todo_list", False))
+
+    def _empty_data(self) -> dict[str, Any]:
+        return {"version": 1, "next_id": 1, "items": []}
+
+    def _read_data(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return self._empty_data()
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"WARNING: could not read to-do list {self.path}: {exc}")
+            return self._empty_data()
+        if not isinstance(raw, dict):
+            return self._empty_data()
+        items = raw.get("items")
+        if not isinstance(items, list):
+            items = []
+        cleaned_items: list[dict[str, Any]] = []
+        max_id = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text = clean_todo_text(str(item.get("text", "") or ""))
+            if not text:
+                continue
+            try:
+                item_id = int(item.get("id", 0) or 0)
+            except (TypeError, ValueError):
+                item_id = 0
+            if item_id <= 0:
+                item_id = max_id + 1
+            max_id = max(max_id, item_id)
+            status = str(item.get("status", "open") or "open").strip().lower()
+            if status not in {"open", "done"}:
+                status = "open"
+            cleaned_items.append(
+                {
+                    "id": item_id,
+                    "text": text,
+                    "status": status,
+                    "created_at": str(item.get("created_at", "") or ""),
+                    "completed_at": item.get("completed_at") if item.get("completed_at") else None,
+                    "source": str(item.get("source", "voice") or "voice"),
+                }
+            )
+        try:
+            next_id = int(raw.get("next_id", max_id + 1) or max_id + 1)
+        except (TypeError, ValueError):
+            next_id = max_id + 1
+        return {"version": 1, "next_id": max(next_id, max_id + 1), "items": cleaned_items}
+
+    def _write_data(self, data: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp_path, self.path)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def open_items(self, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        if data is None:
+            data = self._read_data()
+        items = data.get("items") if isinstance(data.get("items"), list) else []
+        return [item for item in items if isinstance(item, dict) and item.get("status") == "open"]
+
+    def done_items(self, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        if data is None:
+            data = self._read_data()
+        items = data.get("items") if isinstance(data.get("items"), list) else []
+        return [item for item in items if isinstance(item, dict) and item.get("status") == "done"]
+
+    def add_item(self, text: str) -> dict[str, Any]:
+        item_text = clean_todo_text(text)
+        if not item_text:
+            return {
+                "ok": False,
+                "action": "add",
+                "reply": "我有聽到你要新增待辦，但沒有聽清楚內容。可以說：新增待辦，寫報告。",
+            }
+        data = self._read_data()
+        item_id = int(data.get("next_id", 1) or 1)
+        item = {
+            "id": item_id,
+            "text": item_text,
+            "status": "open",
+            "created_at": todo_timestamp(),
+            "completed_at": None,
+            "source": "voice",
+        }
+        data["items"].append(item)
+        data["next_id"] = item_id + 1
+        self._write_data(data)
+        count = len(self.open_items(data))
+        return {
+            "ok": True,
+            "action": "add",
+            "item": item,
+            "reply": f"已加入待辦：{item_text}。目前還有 {count} 個未完成。",
+        }
+
+    def list_items(self) -> dict[str, Any]:
+        data = self._read_data()
+        open_items = self.open_items(data)
+        done_items = self.done_items(data)
+        if not open_items:
+            suffix = f" 已完成的有 {len(done_items)} 個。" if done_items else ""
+            return {
+                "ok": True,
+                "action": "list",
+                "items": [],
+                "reply": f"目前沒有未完成待辦。{suffix}".strip(),
+            }
+        visible = open_items[:8]
+        item_text = "；".join(f"{index}. {item.get('text', '')}" for index, item in enumerate(visible, start=1))
+        more = len(open_items) - len(visible)
+        suffix = f"；還有 {more} 個沒有唸出來" if more > 0 else ""
+        return {
+            "ok": True,
+            "action": "list",
+            "items": open_items,
+            "reply": f"目前有 {len(open_items)} 個待辦：{item_text}{suffix}。",
+        }
+
+    def complete_item(self, *, number: int | None = None, text: str = "") -> dict[str, Any]:
+        data = self._read_data()
+        open_items = self.open_items(data)
+        if not open_items:
+            return {"ok": False, "action": "done", "reply": "目前沒有未完成待辦。"}
+
+        target: dict[str, Any] | None = None
+        if number is not None:
+            if 1 <= number <= len(open_items):
+                target = open_items[number - 1]
+            else:
+                for item in open_items:
+                    if int(item.get("id", 0) or 0) == number:
+                        target = item
+                        break
+            if target is None:
+                return {"ok": False, "action": "done", "reply": f"找不到第 {number} 個未完成待辦。"}
+        else:
+            target_text = normalize_intent_text(text)
+            if not target_text:
+                return {
+                    "ok": False,
+                    "action": "done",
+                    "reply": "要完成哪一個待辦？可以說：完成待辦 1，或完成待辦 寫報告。",
+                }
+            matches = []
+            for item in open_items:
+                item_text = normalize_intent_text(str(item.get("text", "") or ""))
+                if target_text and (target_text in item_text or item_text in target_text):
+                    matches.append(item)
+            if len(matches) == 1:
+                target = matches[0]
+            elif len(matches) > 1:
+                return {"ok": False, "action": "done", "reply": "我找到多個相似待辦，可以改說完成待辦第幾項。"}
+            else:
+                return {"ok": False, "action": "done", "reply": f"找不到和「{clean_todo_text(text)}」相符的未完成待辦。"}
+
+        target_id = int(target.get("id", 0) or 0)
+        completed_text = str(target.get("text", "") or "")
+        for item in data["items"]:
+            if isinstance(item, dict) and int(item.get("id", 0) or 0) == target_id:
+                item["status"] = "done"
+                item["completed_at"] = todo_timestamp()
+                break
+        self._write_data(data)
+        remaining = len(self.open_items(data))
+        return {
+            "ok": True,
+            "action": "done",
+            "item": target,
+            "reply": f"已完成待辦：{completed_text}。剩下 {remaining} 個未完成。",
+        }
+
+    def clear_completed(self) -> dict[str, Any]:
+        data = self._read_data()
+        before = len(data["items"])
+        data["items"] = [item for item in data["items"] if not isinstance(item, dict) or item.get("status") != "done"]
+        removed = before - len(data["items"])
+        self._write_data(data)
+        return {"ok": True, "action": "clear_completed", "reply": f"已清除 {removed} 個已完成待辦。"}
+
+    def clear_all(self) -> dict[str, Any]:
+        data = self._read_data()
+        count = len([item for item in data["items"] if isinstance(item, dict)])
+        data["items"] = []
+        data["next_id"] = 1
+        self._write_data(data)
+        return {"ok": True, "action": "clear_all", "reply": f"已清空待辦清單，共移除 {count} 個項目。"}
+
+    def handle_transcript(self, transcript: str) -> dict[str, Any] | None:
+        if not self.is_enabled():
+            return None
+        intent = detect_todo_intent(transcript)
+        if intent is None:
+            return None
+        if intent == "add":
+            result = self.add_item(extract_todo_add_text(transcript))
+        elif intent == "list":
+            result = self.list_items()
+        elif intent == "done":
+            result = self.complete_item(
+                number=extract_todo_done_number(transcript),
+                text=extract_todo_done_text(transcript),
+            )
+        elif intent == "clear_completed":
+            result = self.clear_completed()
+        elif intent == "clear_all":
+            result = self.clear_all()
+        else:
+            return None
+        result["intent"] = intent
+        result["path"] = str(self.path)
+        if getattr(self.args, "todo_debug", False):
+            print(f"To-do debug: intent={intent}, result={json.dumps(result, ensure_ascii=False, default=str)}")
+        return result
+
+
 def parse_camera_id(raw: str) -> str | int:
     value = str(raw).strip()
     if value.lower() in {"", "auto"}:
@@ -2474,9 +3188,9 @@ def parse_camera_id(raw: str) -> str | int:
 
 def play_recording_beep(
     *,
-    duration_ms: int = 120,
-    frequency_hz: float = 880.0,
-    volume: float = 0.14,
+    duration_ms: int = 180,
+    frequency_hz: float = 1320.0,
+    volume: float = 0.55,
     device: int | None = None,
 ) -> bool:
     """Play a short local cue without making recording depend on audio output."""
@@ -2499,7 +3213,10 @@ def play_recording_beep(
             try:
                 sample_count = max(1, int(round(sample_rate * duration_ms / 1000.0)))
                 t = np.arange(sample_count, dtype=np.float32) / float(sample_rate)
-                tone = np.sin(2.0 * np.pi * float(frequency_hz) * t).astype(np.float32)
+                base = np.sin(2.0 * np.pi * float(frequency_hz) * t)
+                harmonic = 0.25 * np.sin(2.0 * np.pi * float(frequency_hz) * 2.0 * t)
+                tone = (base + harmonic).astype(np.float32)
+                tone /= max(1.0, float(np.max(np.abs(tone))))
                 tone *= float(max(0.0, min(volume, 1.0)))
 
                 fade = max(1, int(round(sample_rate * 0.005)))
@@ -3012,9 +3729,21 @@ class WakeVolumeRecorder:
         wake_score_at_start = 0.0
         wake_context: dict[str, Any] = {}
         last_ignored_wake_at = 0.0
+        last_standby_progress_log_at = 0.0
         last_recording_progress_log_at = 0.0
         ambient_volumes: list[int] = []
         ambient_max_chunks = max(5, int(round(5.0 * self.sample_rate / self.frames_per_chunk)))
+        recent_wake_volumes: list[int] = []
+        wake_volume_window_chunks = max(
+            1,
+            int(
+                round(
+                    float(getattr(self.args, "wake_volume_window_seconds", 1.0) or 1.0)
+                    * self.sample_rate
+                    / self.frames_per_chunk
+                )
+            ),
+        )
         pre_speech_chunks: list[np.ndarray] = []
         pre_speech_max_chunks = max(1, int(round(self.args.pre_speech_seconds * self.sample_rate / self.frames_per_chunk)))
         noise_floor = 0
@@ -3026,6 +3755,7 @@ class WakeVolumeRecorder:
         max_queue_chunks = max(20, int(round(3.0 * self.sample_rate / self.frames_per_chunk)))
         audio_read_timeout = max(0.1, float(getattr(self.args, "audio_read_timeout", 1.0) or 1.0))
         progress_interval = max(0.25, float(getattr(self.args, "recording_progress_interval", 1.0) or 1.0))
+        standby_progress_interval = max(0.0, float(getattr(self.args, "standby_progress_interval", 1.5) or 0.0))
         audio_queue: queue.Queue = queue.Queue(maxsize=max_queue_chunks)
         callback_state = {"dropped_chunks": 0}
 
@@ -3135,23 +3865,50 @@ class WakeVolumeRecorder:
 
                 if state == "waiting_wake":
                     score = self.wake_score(audio_16k_int16)
-                    if self.args.listen_debug or volume > self.args.idle_volume_print_min:
-                        print(f"vol={volume:5d} | wake={score:.3f} | standby", end="\r", file=sys.stderr)
+                    recent_wake_volumes.append(volume)
+                    if len(recent_wake_volumes) > wake_volume_window_chunks:
+                        del recent_wake_volumes[: len(recent_wake_volumes) - wake_volume_window_chunks]
+                    wake_gate_volume = max(recent_wake_volumes) if recent_wake_volumes else volume
+                    wake_noise_floor, wake_volume_threshold = adaptive_wake_volume_threshold(
+                        self.args,
+                        ambient_volumes,
+                        fallback_volume=volume,
+                    )
+                    if self.args.listen_debug:
+                        print(
+                            f"vol={volume:5d} | recent_peak={wake_gate_volume:5d} | wake={score:.3f} | "
+                            f"wake_vol>={wake_volume_threshold} | standby",
+                            end="\r",
+                            file=sys.stderr,
+                        )
+                    elif (
+                        standby_progress_interval > 0.0
+                        and now - last_standby_progress_log_at >= standby_progress_interval
+                        and (volume >= self.args.idle_volume_print_min or score >= 0.1)
+                    ):
+                        print(
+                            "Standby audio: "
+                            f"volume={volume}, recent_peak={wake_gate_volume}, wake={score:.3f}, "
+                            f"wake_volume_threshold={wake_volume_threshold}, noise_floor={wake_noise_floor}"
+                        )
+                        last_standby_progress_log_at = now
 
-                    if score >= self.args.wake_threshold and volume < self.args.wake_volume_min:
+                    if score >= self.args.wake_threshold and wake_gate_volume < wake_volume_threshold:
                         if now - last_ignored_wake_at >= 2.0:
                             print(
-                                f"\nLow-volume wake-like score ignored: score={score:.2f}, volume={volume} "
-                                f"< wake_volume_min={self.args.wake_volume_min}. "
-                                "Speak a little closer or lower --wake-volume-min if this was really you."
+                                f"\nLow-volume wake-like score ignored: score={score:.2f}, "
+                                f"volume={volume}, recent_peak={wake_gate_volume} "
+                                f"< dynamic_wake_volume_threshold={wake_volume_threshold} "
+                                f"(noise_floor={wake_noise_floor}). "
+                                "Speak closer, lower --wake-volume-ratio, or increase --wake-volume-window-seconds if this was really you."
                             )
                             last_ignored_wake_at = now
 
-                    if score >= self.args.wake_threshold and volume >= self.args.wake_volume_min:
+                    if score >= self.args.wake_threshold and wake_gate_volume >= wake_volume_threshold:
                         noise_floor, speech_start_threshold, silence_base_threshold = adaptive_recording_thresholds(
                             self.args,
                             ambient_volumes,
-                            fallback_volume=volume,
+                            fallback_volume=wake_gate_volume,
                         )
                         wake_detected_at = now
                         wake_score_at_start = score
@@ -3170,6 +3927,8 @@ class WakeVolumeRecorder:
                             f"noise_floor={noise_floor}, "
                             f"speech_start_threshold={speech_start_threshold}, "
                             f"silence_base_threshold={silence_base_threshold}, "
+                            f"wake_volume_threshold={wake_volume_threshold}, "
+                            f"wake_gate_volume={wake_gate_volume}, "
                             f"adaptive={'off' if self.args.no_adaptive_volume else 'on'}"
                         )
                         if self.wake_hook is not None:
@@ -3375,6 +4134,8 @@ class WakeVolumeRecorder:
             f"noise_floor={noise_floor}, "
             f"speech_start_threshold={speech_start_threshold}, "
             f"silence_base_threshold={silence_base_threshold}, "
+            f"speech_ratio={float(getattr(self.args, 'speech_start_ratio', 1.25) or 0.0):g}, "
+            f"silence_noise_ratio={float(getattr(self.args, 'silence_noise_ratio', 1.15) or 0.0):g}, "
             f"adaptive={'off' if self.args.no_adaptive_volume else 'on'}"
         )
 
@@ -3897,7 +4658,11 @@ def wait_for_tts_job(job_id: str, args: argparse.Namespace, *, timeout_sec: floa
 
         last_result = status.get("last_result") if isinstance(status.get("last_result"), dict) else {}
         if last_result.get("job_id") == job_id:
-            print(f"TTS finished: job_id={job_id}")
+            if getattr(args, "tts_debug", False):
+                playback = last_result.get("playback") if isinstance(last_result.get("playback"), dict) else {}
+                print(f"TTS finished: job_id={job_id}, playback_volume_gain={playback.get('volume_gain', 'unknown')}")
+            else:
+                print(f"TTS finished: job_id={job_id}")
             return True
         current = status.get("current") if isinstance(status.get("current"), dict) else {}
         if current.get("id") == job_id:
@@ -4029,8 +4794,16 @@ def run_self_test() -> int:
         raise AssertionError("--disable-head-motor should override --enable-head-motor")
     if not robot.send_uart_command("Thinking", 0, 0, reason="self-test"):
         raise AssertionError("Thinking dry-run failed")
+    if not robot.send_uart_command("Music", 0, 0, reason="self-test"):
+        raise AssertionError("Music dry-run failed")
+    if not robot.send_uart_command("Focus", 0, 0, reason="self-test"):
+        raise AssertionError("Focus dry-run failed")
     if robot.send_uart_command("UnknownCommand", 0, 0, reason="self-test"):
         raise AssertionError("unknown UART command should be rejected")
+    if robot.send_uart_command("Happy", 0, 0, reason="self-test"):
+        raise AssertionError("old emotion screen commands should be rejected")
+    if robot._validate_command("Speaking", 9, 0) != ("Speaking", 5, 0):
+        raise AssertionError("Speaking emotion code clamp failed")
     if robot._validate_command("MotorPitch", 999, 0) != ("MotorPitch", MOTOR_PITCH_MAX, 0):
         raise AssertionError("MotorPitch clamp failed")
     if robot._validate_command("MotorYaw", -99, 0) != ("MotorYaw", MOTOR_YAW_MIN, 0):
@@ -4045,6 +4818,59 @@ def run_self_test() -> int:
         raise AssertionError("MotorYaw wire format should use one argument")
     if format_uart_wire_command("Thinking", 0, 0) != "Thinking 0 0":
         raise AssertionError("screen command wire format should keep two arguments")
+    if format_uart_wire_command("Speaking", 3, 0) != "Speaking 3":
+        raise AssertionError("Speaking should carry one 0..5 emotion-code argument")
+    expected_emotion_codes = {
+        "neutral": 0,
+        "concerned": 1,
+        "angry": 2,
+        "sad": 3,
+        "happy": 4,
+        "curious": 5,
+        "excited": 4,
+        "confused": 5,
+        "sleepy": 3,
+    }
+    for emotion, expected_code in expected_emotion_codes.items():
+        if speaking_code_for_emotion(emotion) != expected_code:
+            raise AssertionError(f"emotion to Speaking code mapping failed: {emotion}")
+        if head_motion_for_emotion(emotion) != EMOTION_TO_HEAD_MOTION[emotion]:
+            raise AssertionError(f"emotion to head motion mapping failed: {emotion}")
+    alias_cases = {
+        "surprised": ("excited", 4),
+        "sad": ("sad", 3),
+        "angry": ("angry", 2),
+        "anxious": ("concerned", 1),
+        "tired": ("sleepy", 3),
+        "unsure": ("confused", 5),
+    }
+    for raw_emotion, (expected_emotion, expected_code) in alias_cases.items():
+        if normalize_emotion_name(raw_emotion) != expected_emotion:
+            raise AssertionError(f"emotion alias normalization failed: {raw_emotion}")
+        if speaking_code_for_emotion(raw_emotion) != expected_code:
+            raise AssertionError(f"emotion alias Speaking code failed: {raw_emotion}")
+    alias_control = normalize_control({"transcript": "我有點擔心", "control": {"emotion": "anxious"}})
+    if alias_control["emotion"] != "concerned" or alias_control["head_motion"] != "gentle_nod":
+        raise AssertionError(f"emotion alias control failed: {alias_control}")
+    angry_control = normalize_control({"transcript": "我操你妈的！", "control": {"emotion": "concerned"}})
+    if angry_control["emotion"] != "angry" or speaking_code_for_emotion(angry_control["emotion"]) != 2:
+        raise AssertionError(f"angry transcript should override concerned to Speaking 2: {angry_control}")
+    if detect_focus_mode_intent("回來") is not None:
+        raise AssertionError("plain return intent should not look like focus stop unless focus is active")
+    if detect_persistent_state_intent("回來") != "normal":
+        raise AssertionError("plain return intent should restore normal mode")
+    if detect_focus_mode_intent("停止專注") != "stop":
+        raise AssertionError("explicit focus stop should still be detected")
+    if not conversation_should_end_after_sleep_control(
+        {"control": {"persistent_state": "sleep", "screen_mode": "sleep"}},
+        argparse.Namespace(conversation_mode=True),
+    ):
+        raise AssertionError("sleep control should end conversation mode")
+    if conversation_should_end_after_sleep_control(
+        {"control": {"persistent_state": "sleep", "screen_mode": "sleep"}},
+        argparse.Namespace(conversation_mode=False),
+    ):
+        raise AssertionError("sleep control should not end non-conversation mode")
     if motor_ack_problem("MotorPitch", 90, ["Motor Pitch = 90"]):
         raise AssertionError("valid MotorPitch ACK should not trip safety")
     if not motor_ack_problem("MotorPitch", 90, ["Motor Pitch = 537190203"]):
@@ -4098,6 +4924,40 @@ def run_self_test() -> int:
     task = extract_focus_task("開始專心工作 25 分鐘 寫 UART 報告")
     if "UART" not in task:
         raise AssertionError(f"focus task extraction failed: {task!r}")
+    if detect_todo_intent("新增待辦 寫 UART 報告") != "add":
+        raise AssertionError("to-do add intent detection failed")
+    if detect_todo_intent("列出待辦清單") != "list":
+        raise AssertionError("to-do list intent detection failed")
+    if detect_todo_intent("完成待辦 1") != "done":
+        raise AssertionError("to-do done intent detection failed")
+    if extract_todo_add_text("幫我記一個待辦：整理投影片") != "整理投影片":
+        raise AssertionError("to-do add text extraction failed")
+    if extract_todo_add_text("把買牛奶加入待辦") != "買牛奶":
+        raise AssertionError("to-do trailing add text extraction failed")
+    if extract_todo_done_number("完成第二項待辦") != 2:
+        raise AssertionError("to-do Chinese ordinal parsing failed")
+
+    todo_test_path = Path(f"/tmp/wake_bridge_todo_self_test_{uuid.uuid4().hex}.json")
+    todo_args = argparse.Namespace(no_todo_list=False, todo_list_path=str(todo_test_path), todo_debug=False)
+    todo = TodoListManager(todo_args)
+    try:
+        add_result = todo.handle_transcript("新增待辦 寫 UART 報告")
+        if not add_result or not add_result.get("ok"):
+            raise AssertionError(f"to-do add failed: {add_result}")
+        list_result = todo.handle_transcript("列出待辦")
+        if not list_result or "寫 UART 報告" not in str(list_result.get("reply", "")):
+            raise AssertionError(f"to-do list failed: {list_result}")
+        done_result = todo.handle_transcript("完成待辦 1")
+        if not done_result or not done_result.get("ok"):
+            raise AssertionError(f"to-do done failed: {done_result}")
+        empty_result = todo.handle_transcript("列出待辦")
+        if not empty_result or "沒有未完成" not in str(empty_result.get("reply", "")):
+            raise AssertionError(f"to-do empty list failed: {empty_result}")
+    finally:
+        try:
+            todo_test_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     gate_args = argparse.Namespace(
         volume_min=700,
@@ -4105,6 +4965,8 @@ def run_self_test() -> int:
         noise_floor_percentile=75.0,
         speech_start_margin=350,
         silence_margin=500,
+        speech_start_ratio=1.25,
+        silence_noise_ratio=1.15,
         silence_peak_ratio=0.35,
     )
     noise_floor, start_threshold, silence_base = adaptive_recording_thresholds(
@@ -4117,6 +4979,37 @@ def run_self_test() -> int:
     silence_threshold = adaptive_silence_threshold(gate_args, silence_base, peak_volume=4000)
     if silence_threshold < silence_base:
         raise AssertionError("adaptive silence threshold below base")
+    wake_noise_floor, wake_volume_threshold = adaptive_wake_volume_threshold(
+        argparse.Namespace(
+            wake_volume_min=350,
+            wake_volume_ratio=1.35,
+            wake_volume_margin=1200,
+            no_adaptive_volume=False,
+            noise_floor_percentile=75.0,
+        ),
+        [9000, 10000, 10500, 11000, 11500],
+        fallback_volume=10000,
+    )
+    if wake_noise_floor <= 0 or wake_volume_threshold < 14000:
+        raise AssertionError(f"adaptive wake gate too low for noisy room: {wake_noise_floor}, {wake_volume_threshold}")
+
+    noisy_args = argparse.Namespace(
+        volume_min=1100,
+        no_adaptive_volume=False,
+        noise_floor_percentile=75.0,
+        speech_start_margin=750,
+        silence_margin=900,
+        speech_start_ratio=1.45,
+        silence_noise_ratio=1.30,
+        silence_peak_ratio=0.35,
+    )
+    noisy_floor, noisy_start, noisy_silence_base = adaptive_recording_thresholds(
+        noisy_args,
+        [9000, 10000, 10500, 11000, 11500],
+        fallback_volume=10000,
+    )
+    if noisy_start <= noisy_floor or noisy_start >= 19000 or noisy_silence_base >= noisy_start:
+        raise AssertionError(f"noisy adaptive thresholds look wrong: {noisy_floor}, {noisy_start}, {noisy_silence_base}")
 
     music_args = argparse.Namespace(
         no_music=False,
@@ -4136,6 +5029,12 @@ def run_self_test() -> int:
     resume_route = detect_music_route({"transcript": "繼續播放音樂"}, music_args)
     if resume_route.get("action") != "resume":
         raise AssertionError(f"music resume detection failed: {resume_route}")
+    audio_complaint_route = detect_music_route({"transcript": "為什麼沒聲音，因為我聽到聲音超小"}, music_args)
+    if audio_complaint_route.get("intent"):
+        raise AssertionError(f"audio complaint was misdetected as music: {audio_complaint_route}")
+    audio_volume_route = detect_music_route({"transcript": "我聽到聲音超小，幫我調大音量"}, music_args)
+    if audio_volume_route.get("intent"):
+        raise AssertionError(f"volume complaint was misdetected as music: {audio_volume_route}")
 
     weather_args = argparse.Namespace(
         no_weather=False,
@@ -4186,6 +5085,7 @@ def speak_reply_and_wait(response: dict[str, Any], args: argparse.Namespace) -> 
         print()
         print("TTS:")
         print(f"  url          : {args.tts_url}")
+        print(f"  request_gain : {payload.get('volume_gain', 'none')}")
         print(f"  post_ms      : {post_ms}")
         print(f"  queued       : {result.get('queued', False)}")
         if job_id:
@@ -4208,6 +5108,7 @@ def print_control_summary(control: dict[str, str]) -> None:
     print()
     print("AI control:")
     print(f"  persistent_state : {control.get('persistent_state')}")
+    print(f"  screen_mode      : {control.get('screen_mode')}")
     print(f"  emotion          : {control.get('emotion')}")
     print(f"  head_motion      : {control.get('head_motion')}")
     print(f"  reason           : {control.get('reason')}")
@@ -4234,16 +5135,9 @@ def restore_after_conversation_end(
     robot: RobotUartController,
     timing: TimingLogger | None,
 ) -> None:
-    if getattr(args, "no_sleep_on_conversation_end", False):
-        robot.restore_persistent_screen_state()
-        if timing is not None:
-            timing.mark("conversation ended; persistent state restored")
-        return
-
-    robot.set_persistent_state("sleep")
-    robot.restore_persistent_screen_state()
+    robot.set_screen_mode("normal", reason="conversation ended")
     if timing is not None:
-        timing.mark("conversation ended; sleep restored")
+        timing.mark("conversation ended; Normal restored")
 
 
 def conversation_music_end_action(response: dict[str, Any], args: argparse.Namespace) -> str:
@@ -4258,17 +5152,85 @@ def conversation_music_end_action(response: dict[str, Any], args: argparse.Names
     return action
 
 
+def conversation_should_end_after_sleep_control(response: dict[str, Any], args: argparse.Namespace) -> bool:
+    if not getattr(args, "conversation_mode", False):
+        return False
+    control = response.get("control") if isinstance(response.get("control"), dict) else {}
+    persistent_state = str(control.get("persistent_state", "") or "").strip().lower()
+    screen_mode = str(control.get("screen_mode", "") or "").strip().lower()
+    return persistent_state == "sleep" or screen_mode == "sleep"
+
+
+def set_post_reply_screen(
+    args: argparse.Namespace,
+    robot: RobotUartController,
+    timing: TimingLogger | None,
+    *,
+    control: dict[str, str] | None = None,
+    music_action: str = "",
+    focus_running: bool = False,
+    focus_stopped: bool = False,
+    reason: str = "post reply",
+) -> None:
+    control = control or {}
+    screen_mode = str(control.get("screen_mode", "unchanged") or "unchanged").strip().lower()
+    persistent_state = str(control.get("persistent_state", "unchanged") or "unchanged").strip().lower()
+    music_action = str(music_action or "").strip().lower()
+
+    if music_action in {"play", "resume"}:
+        robot.set_screen_mode("music", reason=f"{reason}; music {music_action}")
+        if timing is not None:
+            timing.mark("UART Music sent")
+        return
+    if music_action in {"pause", "stop"}:
+        robot.set_screen_mode("normal", reason=f"{reason}; music {music_action}")
+        if timing is not None:
+            timing.mark("UART Normal sent after music stop/pause")
+        return
+    if focus_stopped:
+        robot.set_screen_mode("normal", reason=f"{reason}; focus stopped")
+        if timing is not None:
+            timing.mark("UART Normal sent after focus stop")
+        return
+    if focus_running:
+        robot.set_screen_mode("focus", reason=f"{reason}; focus running")
+        if timing is not None:
+            timing.mark("UART Focus sent")
+        return
+    if screen_mode in {"normal", "sleep", "music", "focus"}:
+        robot.set_screen_mode(screen_mode, reason=f"{reason}; control screen_mode")
+        if timing is not None:
+            timing.mark(f"UART {SCREEN_MODE_TO_COMMAND.get(screen_mode, screen_mode)} sent")
+        return
+    if persistent_state in {"normal", "sleep"}:
+        robot.set_screen_mode(persistent_state, reason=f"{reason}; persistent_state")
+        if timing is not None:
+            timing.mark(f"UART {SCREEN_MODE_TO_COMMAND.get(persistent_state, persistent_state)} sent")
+        return
+    if getattr(args, "conversation_mode", False):
+        robot.set_screen_mode("thinking", reason=f"{reason}; waiting for follow-up")
+        if timing is not None:
+            timing.mark("UART Thinking sent for follow-up")
+        return
+
+    robot.restore_persistent_screen_state()
+    if timing is not None:
+        timing.mark("UART persistent screen state sent")
+
+
 def emotion_summary_from_control(control: dict[str, str]) -> dict[str, Any]:
     primary = control.get("emotion", "neutral")
     if primary not in VALID_EMOTIONS:
         primary = "neutral"
     presets = {
         "neutral": (0.25, 0.0, 0.25, False, "自然中性互動。"),
+        "concerned": (0.65, -0.35, 0.35, True, "使用者可能需要關心。"),
+        "angry": (0.90, -0.85, 0.90, False, "使用者明顯生氣或挫折。"),
+        "sad": (0.70, -0.65, 0.25, True, "使用者情緒低落或難過。"),
         "happy": (0.65, 0.65, 0.55, False, "回覆語氣偏愉快。"),
         "curious": (0.45, 0.10, 0.45, False, "正在回答問題或分析畫面。"),
         "excited": (0.80, 0.75, 0.80, False, "互動能量較高。"),
         "confused": (0.55, -0.15, 0.45, False, "資訊不清楚或判斷不確定。"),
-        "concerned": (0.65, -0.35, 0.35, True, "使用者可能需要關心。"),
         "sleepy": (0.50, -0.05, 0.15, False, "進入休息或睡眠互動。"),
     }
     intensity, valence, arousal, support_needed, summary = presets[primary]
@@ -4292,6 +5254,13 @@ def handle_focus_mode_response(
     transcript = str(response.get("transcript", "") or "").strip()
     focus_manager.poll()
     intent = detect_focus_mode_intent(transcript)
+    state_intent = detect_persistent_state_intent(transcript)
+    if intent is None and state_intent == "sleep":
+        if focus_manager.is_running():
+            focus_manager.stop()
+        return None
+    if intent is None and focus_manager.is_running() and state_intent == "normal":
+        intent = "stop"
     if intent is None and not focus_manager.is_running():
         return None
 
@@ -4311,6 +5280,7 @@ def handle_focus_mode_response(
 
     control = {
         "persistent_state": "unchanged",
+        "screen_mode": "focus" if intent != "stop" else "normal",
         "emotion": emotion,
         "head_motion": head_motion,
         "reason": f"focus mode {intent or 'active'}",
@@ -4339,12 +5309,80 @@ def handle_focus_mode_response(
     if timing is not None:
         timing.mark("TTS finished or estimated finished")
 
-    if intent == "stop":
-        robot.restore_persistent_screen_state()
-    elif focus_manager.is_running():
-        robot.set_screen_state("Thinking")
+    set_post_reply_screen(
+        args,
+        robot,
+        timing,
+        control=control,
+        focus_running=focus_manager.is_running(),
+        focus_stopped=intent == "stop",
+        reason="focus mode reply complete",
+    )
+    return tts_ok or not getattr(args, "require_tts", False)
+
+
+def handle_todo_response(
+    response: dict[str, Any],
+    args: argparse.Namespace,
+    robot: RobotUartController,
+    timing: TimingLogger | None,
+    todo_manager: TodoListManager,
+) -> bool | None:
+    transcript = str(response.get("transcript", "") or "").strip()
+    result = todo_manager.handle_transcript(transcript)
+    if result is None:
+        return None
+
+    ok = bool(result.get("ok", False))
+    action = str(result.get("action", "") or "")
+    if action == "list":
+        emotion = "curious"
+        head_motion = "look_around"
+    elif ok:
+        emotion = "happy"
+        head_motion = "nod"
     else:
-        robot.restore_persistent_screen_state()
+        emotion = "confused"
+        head_motion = "shake"
+    control = {
+        "persistent_state": "unchanged",
+        "screen_mode": "unchanged",
+        "emotion": emotion,
+        "head_motion": head_motion,
+        "reason": f"local todo list {action}",
+    }
+    reply = str(result.get("reply", "") or "").strip()
+    response["reply"] = reply
+    response["control"] = control
+    response["emotion"] = emotion_summary_from_control(control)
+    response["todo"] = result
+
+    if getattr(args, "quiet_dialog", False):
+        print_quiet_turn_summary(response)
+    else:
+        print()
+        print("To-do list:")
+        print(f"  action : {action}")
+        print(f"  ok     : {ok}")
+        print(f"  path   : {result.get('path')}")
+        print_control_summary(control)
+        print(f"parsed reply: {reply}")
+        print(f"parsed control: {json.dumps(control, ensure_ascii=False)}")
+        voice_chat.print_result(response, verbose_debug=args.debug)
+
+    robot.send_speaking_and_emotion(emotion)
+    head_thread, head_stop = robot.start_speaking_head_motion(head_motion)
+    if timing is not None:
+        timing.mark("to-do list command handled")
+
+    try:
+        tts_ok = speak_reply_and_wait(response, args)
+    finally:
+        robot.stop_speaking_head_motion(head_thread, head_stop, reason="speaking_head_motion todo stop reset")
+    if timing is not None:
+        timing.mark("TTS finished or estimated finished")
+
+    set_post_reply_screen(args, robot, timing, control=control, reason="to-do reply complete")
     return tts_ok or not getattr(args, "require_tts", False)
 
 
@@ -4354,7 +5392,13 @@ def handle_wake_chat_response(
     robot: RobotUartController,
     timing: TimingLogger | None,
     focus_manager: FocusModeManager | None = None,
+    todo_manager: TodoListManager | None = None,
 ) -> bool:
+    if todo_manager is not None:
+        handled = handle_todo_response(response, args, robot, timing, todo_manager)
+        if handled is not None:
+            return handled
+
     if focus_manager is not None:
         handled = handle_focus_mode_response(response, args, robot, timing, focus_manager)
         if handled is not None:
@@ -4392,7 +5436,7 @@ def handle_wake_chat_response(
 
     head_thread, head_stop = robot.start_speaking_head_motion(control["head_motion"])
     if timing is not None:
-        timing.mark("UART Speaking/emotion sent")
+        timing.mark("UART Speaking emotion code sent")
 
     try:
         tts_ok = speak_reply_and_wait(response, args)
@@ -4406,9 +5450,15 @@ def handle_wake_chat_response(
         if timing is not None:
             timing.mark("music triggered")
 
-    robot.restore_persistent_screen_state()
-    if timing is not None:
-        timing.mark("UART Normal/Sleep sent")
+    set_post_reply_screen(
+        args,
+        robot,
+        timing,
+        control=control,
+        music_action=str(music_route.get("action", "") or ""),
+        focus_running=focus_manager.is_running() if focus_manager is not None else False,
+        reason="chat reply complete",
+    )
     return tts_ok or not getattr(args, "require_tts", False)
 
 
@@ -4421,6 +5471,7 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
     text_url = voice_chat.endpoint_url(args.server_url, "/text-chat")
     robot = RobotUartController(args)
     focus_manager = FocusModeManager(args, None)
+    todo_manager = TodoListManager(args)
     timing = TimingLogger()
     try:
         print(f"POST text to {text_url}")
@@ -4441,7 +5492,7 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
         raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
         if raw_preview:
             print(f"AI raw response preview: {raw_preview}")
-        return 0 if handle_wake_chat_response(response, args, robot, timing, focus_manager) else 1
+        return 0 if handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager) else 1
     finally:
         focus_manager.shutdown()
 
@@ -4495,7 +5546,7 @@ def run_head_motion_test(args: argparse.Namespace) -> int:
 
     if requested_emotion:
         if requested_emotion == "all":
-            emotions = ["neutral", "happy", "curious", "excited", "confused", "concerned", "sleepy"]
+            emotions = ["neutral", "concerned", "angry", "sad", "happy", "curious", "excited", "confused", "sleepy"]
         else:
             emotions = [requested_emotion]
         motion_plan = [(f"emotion:{emotion}", head_motion_for_emotion(emotion)) for emotion in emotions]
@@ -4634,6 +5685,7 @@ def send_and_handle_audio_turn(
     camera_manager: CameraManager | None,
     robot: RobotUartController,
     focus_manager: FocusModeManager | None,
+    todo_manager: TodoListManager | None,
     turn_state: dict[str, Any],
     audio: np.ndarray,
     meta: dict[str, Any],
@@ -4734,9 +5786,9 @@ def send_and_handle_audio_turn(
             else:
                 voice_chat.print_result(response, verbose_debug=args.debug)
                 response_vision_summary(response)
-            print(f"Conversation end keyword detected ({end_keyword}); entering sleep and returning to wake-only standby.")
+            print(f"Conversation end keyword detected ({end_keyword}); returning to Normal and wake-only standby.")
             if getattr(args, "speak_end_reply", False):
-                ok = handle_wake_chat_response(response, args, robot, timing, focus_manager)
+                ok = handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager)
                 restore_after_conversation_end(args, robot, timing)
                 recorder.reset_wake()
                 return ok, True
@@ -4745,7 +5797,11 @@ def send_and_handle_audio_turn(
             recorder.reset_wake()
             return True, True
 
-        ok = handle_wake_chat_response(response, args, robot, timing, focus_manager)
+        ok = handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager)
+        if conversation_should_end_after_sleep_control(response, args):
+            print("Sleep mode requested; returning to wake-only standby so the next command requires Hey Jarvis.")
+            recorder.reset_wake()
+            return ok, True
         if focus_manager is not None and should_end_conversation_after_focus_turn(
             args,
             focus_intent=focus_intent,
@@ -4761,8 +5817,6 @@ def send_and_handle_audio_turn(
                 f"Music control action ({music_end_action}) handled; "
                 "returning to wake-only standby so the next music command requires Hey Jarvis."
             )
-            if music_end_action in {"play", "resume"}:
-                restore_after_conversation_end(args, robot, timing)
             recorder.reset_wake()
             post_music_standby_cooldown(args, music_end_action)
             return ok, True
@@ -4838,6 +5892,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
 
     robot = RobotUartController(args)
     focus_manager = FocusModeManager(args, camera_manager)
+    todo_manager = TodoListManager(args)
     turn_state: dict[str, Any] = {}
     recorder = WakeVolumeRecorder(
         args,
@@ -4872,7 +5927,9 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         f"{'off' if args.no_adaptive_volume else 'on'}, "
         f"noise_p{args.noise_floor_percentile:g}, "
         f"speech_margin={args.speech_start_margin}, "
+        f"speech_ratio={args.speech_start_ratio:g}, "
         f"silence_margin={args.silence_margin}, "
+        f"silence_noise_ratio={args.silence_noise_ratio:g}, "
         f"peak_ratio={args.silence_peak_ratio:g}"
     )
     print(
@@ -4890,13 +5947,29 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         print("After an end phrase, wake-only standby is restored and normal speech is ignored until Hey Jarvis.")
     else:
         print("Conversation mode: disabled (classic one wake per turn).")
-    beep_desc = "disabled" if args.no_beep else f"{args.beep_frequency:g} Hz, {args.beep_duration_ms} ms, device={args.beep_device if args.beep_device is not None else 'default'}"
+    beep_desc = (
+        "disabled"
+        if args.no_beep
+        else (
+            f"{args.beep_frequency:g} Hz, {args.beep_duration_ms} ms, "
+            f"volume={args.beep_volume:g}, device={args.beep_device if args.beep_device is not None else 'default'}"
+        )
+    )
     print(f"Recording beep: {beep_desc}")
     vision_mode = "off" if args.no_vision else ("force" if args.force_vision else "auto")
     print(f"Vision mode: {vision_mode}")
     print(f"Camera: {'disabled' if args.no_camera or args.no_vision else f'{args.camera_id}, {args.camera_width}x{args.camera_height}, jpeg_quality={args.camera_jpeg_quality}'}")
-    focus_desc = "disabled" if args.no_focus_mode else f"enabled, script={args.focus_script}, interval={args.focus_interval_sec:g}s, duration_default={args.focus_duration_min:g}min"
+    focus_desc = (
+        "disabled"
+        if args.no_focus_mode
+        else (
+            f"enabled, script={args.focus_script}, interval={args.focus_interval_sec:g}s, "
+            f"duration_default={args.focus_duration_min:g}min, notify={args.focus_notify_mode}"
+        )
+    )
     print(f"Focus work mode: {focus_desc}")
+    todo_desc = "disabled" if args.no_todo_list else f"enabled, path={args.todo_list_path}"
+    print(f"To-do list: {todo_desc}")
     print(
         "Recording cues: start beep before each turn; "
         f"speech-end beep + image capture before upload (delay={args.speech_end_image_delay:g}s)"
@@ -4930,7 +6003,11 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         f"stop_timeout={robot.motor_stop_timeout():g}s, "
         f"join_timeout={args.motor_join_timeout:g}s"
     )
-    print(f"TTS queue polling: every {args.tts_poll_interval:g}s, playback_timeout={args.tts_playback_timeout:g}s")
+    print(
+        f"TTS queue polling: every {args.tts_poll_interval:g}s, "
+        f"playback_timeout={args.tts_playback_timeout:g}s, "
+        f"volume_gain={getattr(args, 'tts_volume_gain', 1.0):g}"
+    )
     if args._manual_input_device:
         print("WARNING: --device pins a numeric microphone index. Omit --device and use --mic-keyword for USB replug recovery.")
     if args._manual_beep_device:
@@ -4942,6 +6019,11 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         f"camera={'disabled' if args.no_camera or args.no_vision else str(args.camera_id)}; "
         f"FRDM UART={args.uart_port}"
     )
+    boot_delay = max(0.0, float(getattr(args, "boot_normal_delay", 2.0) or 0.0))
+    if boot_delay > 0:
+        print(f"Boot screen settle: waiting {boot_delay:g}s, then sending Normal.")
+        time.sleep(boot_delay)
+    robot.set_screen_mode("normal", reason="startup boot screen complete")
     print("Press Ctrl+C to quit.")
 
     try:
@@ -4966,6 +6048,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                     camera_manager=camera_manager,
                     robot=robot,
                     focus_manager=focus_manager,
+                    todo_manager=todo_manager,
                     turn_state=turn_state,
                     audio=audio,
                     meta=meta,
@@ -4984,6 +6067,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                 max_session_turns = max(1, int(args.max_session_turns or 1))
                 if max_session_turns <= 1:
                     print("Max conversation turns reached (1); returning to wake-only standby.")
+                    robot.set_screen_mode("normal", reason="conversation max turns reached")
                     print("Wake-only standby restored. Say Hey Jarvis before speaking again.")
                     continue
 
@@ -4995,6 +6079,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                         followup_timeout = min(float(args.turn_listen_timeout), remaining_idle)
                     if followup_timeout <= 0:
                         print("Conversation idle timeout reached; returning to wake-only standby.")
+                        robot.set_screen_mode("normal", reason="conversation idle timeout")
                         break
 
                     followup_context = build_conversation_turn_context(
@@ -5017,7 +6102,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                     )
                     if followup_audio is None:
                         print(f"No follow-up send: {followup_meta.get('reason', 'unknown')}.")
-                        robot.restore_persistent_screen_state()
+                        robot.set_screen_mode("normal", reason="conversation follow-up timeout")
                         break
                     followup_meta["wake_context"] = followup_context
 
@@ -5027,6 +6112,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                         camera_manager=camera_manager,
                         robot=robot,
                         focus_manager=focus_manager,
+                        todo_manager=todo_manager,
                         turn_state=turn_state,
                         audio=followup_audio,
                         meta=followup_meta,
@@ -5041,6 +6127,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                         break
                 else:
                     print(f"Max conversation turns reached ({args.max_session_turns}); returning to wake-only standby.")
+                    robot.set_screen_mode("normal", reason="conversation max turns reached")
 
                 print("Wake-only standby restored. Say Hey Jarvis before speaking again.")
             except KeyboardInterrupt:
@@ -5064,6 +6151,18 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     safety_group.add_argument("--instance-lock", default=os.getenv("WAKE_BRIDGE_LOCK", DEFAULT_INSTANCE_LOCK))
     safety_group.add_argument("--no-instance-lock", action="store_true", help="Allow multiple bridge processes. Not recommended for demos.")
     safety_group.add_argument("--self-test", action="store_true", help="Run parser/UART/TTS timing dry-run checks and exit without hardware.")
+    safety_group.add_argument("--test-beep", action="store_true", help="Play the recording cue beep once and exit.")
+    safety_group.add_argument(
+        "--noisy-room",
+        action="store_true",
+        help="Apply louder beep and stricter adaptive recording defaults for noisy demo rooms.",
+    )
+    safety_group.add_argument(
+        "--boot-normal-delay",
+        type=float,
+        default=_env_float("BOOT_NORMAL_DELAY", 2.0),
+        help="Seconds to keep the FRDM boot screen before sending Normal at startup. Set 0 to skip.",
+    )
     safety_group.add_argument("--no-device-preflight", action="store_true", help="Do not release stale demo processes/device owners before opening mic/camera/UART.")
     safety_group.add_argument("--device-preflight-only", action="store_true", help="Run startup device preflight and exit without opening the bridge.")
     safety_group.add_argument("--device-preflight-dry-run", action="store_true", help="Print which processes would be stopped, but do not kill them.")
@@ -5120,11 +6219,47 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--wake-listen-timeout", type=float, default=_env_float("WAKE_LISTEN_TIMEOUT", 6.0))
     group.add_argument("--wake-chunk-ms", type=int, default=_env_int("WAKE_CHUNK_MS", 80))
     group.add_argument("--idle-volume-print-min", type=int, default=_env_int("IDLE_VOLUME_PRINT_MIN", 100))
+    group.add_argument(
+        "--standby-progress-interval",
+        type=float,
+        default=_env_float("STANDBY_PROGRESS_INTERVAL", 1.5),
+        help="Seconds between concise standby audio logs. Set 0 to hide standby volume logs unless --listen-debug is used.",
+    )
     group.add_argument("--listen-debug", action="store_true", help="Print standby/recording volume on every chunk.")
     group.add_argument("--no-adaptive-volume", action="store_true", help="Disable adaptive noise-floor based speech/silence thresholds.")
     group.add_argument("--noise-floor-percentile", type=float, default=_env_float("NOISE_FLOOR_PERCENTILE", 75.0))
+    group.add_argument(
+        "--wake-volume-ratio",
+        type=float,
+        default=_env_float("WAKE_VOLUME_RATIO", 1.15),
+        help="Adaptive wake volume gate as noise_floor * ratio. Useful when background is very loud.",
+    )
+    group.add_argument(
+        "--wake-volume-margin",
+        type=int,
+        default=_env_int("WAKE_VOLUME_MARGIN", 0),
+        help="Adaptive wake volume gate also requires noise_floor + this margin.",
+    )
+    group.add_argument(
+        "--wake-volume-window-seconds",
+        type=float,
+        default=_env_float("WAKE_VOLUME_WINDOW_SECONDS", 1.0),
+        help="Recent-volume peak window used when accepting delayed wake-word scores.",
+    )
     group.add_argument("--speech-start-margin", type=int, default=_env_int("SPEECH_START_MARGIN", 350))
     group.add_argument("--silence-margin", type=int, default=_env_int("SILENCE_MARGIN", 650))
+    group.add_argument(
+        "--speech-start-ratio",
+        type=float,
+        default=_env_float("SPEECH_START_RATIO", 1.25),
+        help="Adaptive speech-start gate also requires noise_floor * this ratio.",
+    )
+    group.add_argument(
+        "--silence-noise-ratio",
+        type=float,
+        default=_env_float("SILENCE_NOISE_RATIO", 1.15),
+        help="Adaptive silence gate also allows end-of-speech below noise_floor * this ratio.",
+    )
     group.add_argument("--silence-peak-ratio", type=float, default=_env_float("SILENCE_PEAK_RATIO", 0.35))
     group.add_argument("--pre-speech-seconds", type=float, default=_env_float("PRE_SPEECH_SECONDS", 0.35))
 
@@ -5145,12 +6280,12 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     conversation_group.add_argument(
         "--speak-end-reply",
         action="store_true",
-        help="In conversation mode, speak the AI farewell reply before entering sleep and returning to wake-only standby.",
+        help="In conversation mode, speak the AI farewell reply before returning to Normal and wake-only standby.",
     )
     conversation_group.add_argument(
         "--no-sleep-on-conversation-end",
         action="store_true",
-        help="Do not send Sleep when an end phrase closes conversation mode; restore the existing persistent screen state instead.",
+        help="Legacy compatibility flag. End phrases now return to Normal by default.",
     )
     conversation_group.add_argument(
         "--keep-conversation-after-music-control",
@@ -5181,9 +6316,9 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     beep_group = parser.add_argument_group("recording cue beep")
     beep_group.add_argument("--no-beep", action="store_true", help="Disable the short beep after wake detection.")
-    beep_group.add_argument("--beep-duration-ms", type=int, default=_env_int("BEEP_DURATION_MS", 120))
-    beep_group.add_argument("--beep-frequency", type=float, default=_env_float("BEEP_FREQUENCY", 880.0))
-    beep_group.add_argument("--beep-volume", type=float, default=_env_float("BEEP_VOLUME", 0.14))
+    beep_group.add_argument("--beep-duration-ms", type=int, default=_env_int("BEEP_DURATION_MS", 180))
+    beep_group.add_argument("--beep-frequency", type=float, default=_env_float("BEEP_FREQUENCY", 1320.0))
+    beep_group.add_argument("--beep-volume", type=float, default=_env_float("BEEP_VOLUME", 0.55))
     beep_group.add_argument("--beep-device", type=int, default=None, help="Optional sounddevice output device index for the beep.")
     beep_group.add_argument("--beep-keyword", default=os.getenv("BEEP_KEYWORD", "UACDemo"), help="Output-device keyword used when --beep-device is omitted.")
     beep_group.add_argument("--beep-retry-delay", type=float, default=_env_float("BEEP_RETRY_DELAY", 0.12))
@@ -5222,12 +6357,25 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     focus_group.add_argument("--no-focus-mode", action="store_true", help="Disable voice-triggered focus work mode start/stop.")
     focus_group.add_argument("--focus-script", default=str(DEFAULT_FOCUS_SCRIPT), help="Path to focus_work_mode.py.")
     focus_group.add_argument("--focus-server-url", default=os.getenv("FOCUS_SERVER_URL", ""), help="Optional /focus-check URL. Defaults to the current server base.")
-    focus_group.add_argument("--focus-interval-sec", type=float, default=_env_float("FOCUS_INTERVAL_SEC", 180.0))
+    focus_group.add_argument("--focus-interval-sec", type=float, default=_env_float("FOCUS_INTERVAL_SEC", 60.0))
     focus_group.add_argument("--focus-duration-min", type=float, default=_env_float("FOCUS_DURATION_MIN", 0.0), help="Default auto-stop duration. 0 means wait for voice stop.")
     focus_group.add_argument("--focus-log-root", default=os.getenv("FOCUS_LOG_ROOT", str(THIS_DIR / "logs" / "focus_sessions")))
     focus_group.add_argument("--focus-task", default=os.getenv("FOCUS_TASK", ""), help="Default focus task if the start command does not include one.")
     focus_group.add_argument("--focus-alert-threshold", type=int, default=_env_int("FOCUS_ALERT_THRESHOLD", 2))
     focus_group.add_argument("--focus-save-images", action="store_true", help="Debug only: let focus_work_mode.py save sampled images.")
+    focus_group.add_argument("--focus-notify-mode", choices=["none", "discord"], default=os.getenv("FOCUS_NOTIFY_MODE", "none"))
+    focus_group.add_argument("--focus-discord-webhook-url", default=default_discord_webhook_url())
+    focus_group.add_argument("--focus-notify-timeout", type=float, default=_env_float("FOCUS_NOTIFY_TIMEOUT", 8.0))
+    focus_group.add_argument("--focus-notify-dry-run", action="store_true", help="Print focus notification payload without sending it.")
+
+    todo_group = parser.add_argument_group("local to-do list")
+    todo_group.add_argument("--no-todo-list", action="store_true", help="Disable local voice-triggered to-do list commands.")
+    todo_group.add_argument(
+        "--todo-list-path",
+        default=os.getenv("TODO_LIST_PATH", str(DEFAULT_TODO_LIST_PATH)),
+        help="JSON file for local to-do list state. Default: frdm_uart_context_sender/logs/todo_list.json.",
+    )
+    todo_group.add_argument("--todo-debug", action="store_true", help="Print local to-do intent parsing details.")
 
     music_group = parser.add_argument_group("music tool routing")
     music_group.add_argument("--no-music", action="store_true", help="Disable local Music Web Player sidecar routing.")
@@ -5328,7 +6476,7 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--motor-join-timeout",
         type=float,
         default=_env_float("MOTOR_JOIN_TIMEOUT_SEC", MOTOR_JOIN_TIMEOUT_SEC),
-        help="Maximum seconds to wait after TTS for the head motion thread to finish resetting before restoring Normal/Sleep.",
+        help="Maximum seconds to wait after TTS for the head motion thread to finish resetting before changing the next FRDM screen.",
     )
     motor_group.add_argument(
         "--test-head-motion",
@@ -5371,7 +6519,7 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--tts-playback-timeout",
         type=float,
         default=_env_float("TTS_PLAYBACK_TIMEOUT", 45.0),
-        help="Maximum seconds to wait for /speak_async queue completion before restoring Normal/Sleep.",
+        help="Maximum seconds to wait for /speak_async queue completion before changing the next FRDM screen.",
     )
     tts_timing_group.add_argument(
         "--tts-poll-interval",
@@ -5446,6 +6594,45 @@ def apply_conversation_latency_preset(args: argparse.Namespace) -> None:
     )
 
 
+def apply_noisy_room_preset(args: argparse.Namespace) -> None:
+    if not getattr(args, "noisy_room", False):
+        return
+
+    noisy_defaults = {
+        "wake_threshold": 0.75,
+        "wake_volume_min": 500,
+        "wake_volume_ratio": 1.35,
+        "wake_volume_margin": 1200,
+        "wake_volume_window_seconds": 1.0,
+        "standby_progress_interval": 1.5,
+        "volume_min": 1100,
+        "speech_start_margin": 750,
+        "speech_start_ratio": 1.45,
+        "silence_margin": 900,
+        "silence_noise_ratio": 1.30,
+        "beep_volume": 0.70,
+        "beep_duration_ms": 220,
+        "beep_frequency": 1500.0,
+    }
+    for attr, noisy_value in noisy_defaults.items():
+        if getattr(args, f"_manual_{attr}", False):
+            continue
+        current_value = getattr(args, attr, 0)
+        if isinstance(noisy_value, int):
+            setattr(args, attr, max(int(current_value or 0), noisy_value))
+        else:
+            setattr(args, attr, max(float(current_value or 0.0), float(noisy_value)))
+    print(
+        "Noisy-room preset enabled: "
+        f"wake_threshold={args.wake_threshold:g}, wake_volume_min={args.wake_volume_min}, "
+        f"wake_ratio={args.wake_volume_ratio:g}, volume_min={args.volume_min}, "
+        f"speech_margin={args.speech_start_margin}, speech_ratio={args.speech_start_ratio:g}, "
+        f"silence_margin={args.silence_margin}, silence_noise_ratio={args.silence_noise_ratio:g}, "
+        f"beep={args.beep_frequency:g}Hz/"
+        f"{args.beep_duration_ms}ms/vol={args.beep_volume:g}."
+    )
+
+
 def validate_runtime_args(args: argparse.Namespace) -> bool:
     if getattr(args, "conversation_mode", False) and getattr(args, "no_wake_word", False):
         print("ERROR: --conversation-mode requires wake word standby. Remove --no-wake-word.")
@@ -5472,6 +6659,24 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
     if float(getattr(args, "post_music_standby_cooldown", 0.0) or 0.0) < 0.0:
         print("ERROR: --post-music-standby-cooldown must be >= 0.")
         return False
+    for attr, flag in (
+        ("wake_volume_ratio", "--wake-volume-ratio"),
+        ("speech_start_ratio", "--speech-start-ratio"),
+        ("silence_noise_ratio", "--silence-noise-ratio"),
+        ("silence_peak_ratio", "--silence-peak-ratio"),
+    ):
+        if float(getattr(args, attr, 0.0) or 0.0) <= 0.0:
+            print(f"ERROR: {flag} must be > 0.")
+            return False
+    if int(getattr(args, "wake_volume_margin", 0) or 0) < 0:
+        print("ERROR: --wake-volume-margin must be >= 0.")
+        return False
+    if float(getattr(args, "wake_volume_window_seconds", 0.0) or 0.0) <= 0.0:
+        print("ERROR: --wake-volume-window-seconds must be > 0.")
+        return False
+    if float(getattr(args, "standby_progress_interval", 0.0) or 0.0) < 0.0:
+        print("ERROR: --standby-progress-interval must be >= 0.")
+        return False
     if not getattr(args, "no_focus_mode", False):
         if float(getattr(args, "focus_interval_sec", 0.0) or 0.0) <= 0.0:
             print("ERROR: --focus-interval-sec must be > 0.")
@@ -5486,8 +6691,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return add_wake_args(bridge.build_arg_parser())
 
 
+def cli_option_present(flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in sys.argv[1:])
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
+    manual_env_map = {
+        "wake_threshold": ("--wake-threshold", "WAKE_THRESHOLD"),
+        "wake_volume_min": ("--wake-volume-min", "WAKE_VOLUME_MIN"),
+        "wake_volume_ratio": ("--wake-volume-ratio", "WAKE_VOLUME_RATIO"),
+        "wake_volume_margin": ("--wake-volume-margin", "WAKE_VOLUME_MARGIN"),
+        "wake_volume_window_seconds": ("--wake-volume-window-seconds", "WAKE_VOLUME_WINDOW_SECONDS"),
+        "standby_progress_interval": ("--standby-progress-interval", "STANDBY_PROGRESS_INTERVAL"),
+        "volume_min": ("--volume-min", "VOLUME_MIN"),
+        "speech_start_margin": ("--speech-start-margin", "SPEECH_START_MARGIN"),
+        "speech_start_ratio": ("--speech-start-ratio", "SPEECH_START_RATIO"),
+        "silence_margin": ("--silence-margin", "SILENCE_MARGIN"),
+        "silence_noise_ratio": ("--silence-noise-ratio", "SILENCE_NOISE_RATIO"),
+        "beep_volume": ("--beep-volume", "BEEP_VOLUME"),
+        "beep_duration_ms": ("--beep-duration-ms", "BEEP_DURATION_MS"),
+        "beep_frequency": ("--beep-frequency", "BEEP_FREQUENCY"),
+    }
+    for attr, (flag, env_name) in manual_env_map.items():
+        setattr(args, f"_manual_{attr}", cli_option_present(flag) or env_name in os.environ)
     args._manual_input_device = args.device is not None
     args._manual_beep_device = args.beep_device is not None
     args.server_url = voice_chat.normalize_server_url(args.server_url)
@@ -5495,6 +6722,8 @@ def main() -> int:
     args.music_url = normalize_music_url(args.music_url)
     args.weather_url = normalize_weather_url(args.weather_url)
     bridge.apply_default_tts_voice(args)
+    if getattr(args, "tts_volume_gain", None) is None:
+        args.tts_volume_gain = _env_float("TTS_VOLUME_GAIN", 2.25)
     args.tts_interrupt = not args.tts_no_interrupt
     args.tts_stream = False if args.tts_file_playback else None
 
@@ -5508,6 +6737,11 @@ def main() -> int:
         return 0
     if args.self_test:
         return run_self_test()
+    if args.test_beep:
+        apply_noisy_room_preset(args)
+        args.beep_device = select_beep_output_device(args)
+        ok = play_recording_cue(args, label="Test")
+        return 0 if ok else 1
     if args.test_head_motion or args.test_head_emotion or args.test_speaking_head_motion:
         return run_head_motion_test(args)
     if args.device_preflight_only:
@@ -5518,6 +6752,7 @@ def main() -> int:
     if args.text:
         return run_wake_text_mode(args)
     apply_conversation_latency_preset(args)
+    apply_noisy_room_preset(args)
     if not validate_runtime_args(args):
         return 2
     return run_wake_voice_loop(args)

@@ -24,6 +24,11 @@ class SpeakRequest(BaseModel):
     noise_scale: float | None = None
     noise_w: float | None = None
     stream: bool | None = None
+    volume_gain: float | None = Field(default=None, ge=0.05, le=8.0)
+
+
+def _request_volume_gain(request: SpeakRequest, settings: Settings) -> float:
+    return request.volume_gain if request.volume_gain is not None else settings.default_volume_gain
 
 
 def _configure_logging(level: str) -> None:
@@ -96,6 +101,7 @@ def create_app(
                 noise_scale=request.noise_scale,
                 noise_w=request.noise_w,
                 stream=request.stream,
+                volume_gain=_request_volume_gain(request, settings),
             )
         except PiperError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -111,6 +117,7 @@ def create_app(
             noise_scale=request.noise_scale,
             noise_w=request.noise_w,
             stream=request.stream,
+            volume_gain=_request_volume_gain(request, settings),
         )
         return {"queued": True, "job_id": job.id, "queue": worker.status()}
 

@@ -17,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--length-scale", type=float, help="Piper length_scale. Lower is faster.")
     parser.add_argument("--noise-scale", type=float, help="Piper noise_scale.")
     parser.add_argument("--noise-w", type=float, help="Piper noise_w.")
+    parser.add_argument("--volume-gain", type=float, help="Raw/WAV playback gain. Try 4.0-6.0 for noisy rooms.")
     parser.add_argument("--device", help="ALSA device, e.g. default or plughw:1,0.")
     parser.add_argument("--stream", action="store_true", default=None, help="Stream raw PCM directly to aplay.")
     parser.add_argument("--file-playback", action="store_true", help="Synthesize WAV files before playback.")
@@ -40,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         length_scale=args.length_scale,
         noise_scale=args.noise_scale,
         noise_w=args.noise_w,
+        volume_gain=args.volume_gain,
         stream=False if args.file_playback else args.stream,
     )
 

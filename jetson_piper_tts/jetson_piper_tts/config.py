@@ -57,6 +57,7 @@ class Settings:
     default_length_scale: float
     default_noise_scale: float
     default_noise_w: float
+    default_volume_gain: float
     max_text_chars: int
     max_chunk_chars: int
     enable_traditional_to_simplified: bool
@@ -96,6 +97,7 @@ class Settings:
             default_length_scale=_env_float("DEFAULT_LENGTH_SCALE", 0.90),
             default_noise_scale=_env_float("DEFAULT_NOISE_SCALE", 0.667),
             default_noise_w=_env_float("DEFAULT_NOISE_W", 0.8),
+            default_volume_gain=_env_float("DEFAULT_VOLUME_GAIN", 1.0),
             max_text_chars=_env_int("MAX_TEXT_CHARS", 600),
             max_chunk_chars=_env_int("MAX_CHUNK_CHARS", 70),
             enable_traditional_to_simplified=_env_bool("ENABLE_TRADITIONAL_TO_SIMPLIFIED", True),
@@ -147,6 +149,7 @@ class Settings:
             "default_length_scale": self.default_length_scale,
             "default_noise_scale": self.default_noise_scale,
             "default_noise_w": self.default_noise_w,
+            "default_volume_gain": self.default_volume_gain,
             "enable_cache": self.enable_cache,
             "enable_stream_playback": self.enable_stream_playback,
             "enable_inprocess_piper": self.enable_inprocess_piper,

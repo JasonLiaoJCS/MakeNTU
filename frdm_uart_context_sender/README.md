@@ -1,4 +1,4 @@
-# FRDM Wake Bridge + Vision + Focus + Music + Weather
+# FRDM Wake Bridge + Vision + Focus + To-Do + Music + Weather
 
 這個資料夾是 MakeNTU 桌上寵物機器人的 Jetson 整合層。正式操作請先看 [QUICK_START.md](QUICK_START.md)；本 README 用來理解架構、資料流、控制格式與除錯。
 
@@ -6,8 +6,9 @@
 
 ```text
 只想啟動 demo        -> 看 QUICK_START.md 的「0. 一頁照貼版」
-要理解架構          -> 看本 README 的 What This Does / Data Flow
+要理解架構          -> 看本 README 的 What This Does / FRDM State Machine
 要改 prompt/control  -> 看 Structured Reply And Control
+要確認 FRDM 狀態機    -> 看 FRDM State Machine
 要修 FRDM 行為       -> 看 FRDM UART Timing / Emotion And Head Motion
 要修 camera/vision   -> 看 Vision Routing / Camera And Image Storage
 要排錯              -> 看 Debug Log Guide / Troubleshooting
@@ -20,49 +21,129 @@ model                 : qwen35-fast:latest
 server                : http://100.108.141.26:8766/voice-chat
 wake                  : hey_jarvis, threshold=0.75
 recording             : adaptive gate + callback audio queue
+boot normal delay     : 2 seconds, then Normal 0 0
 max_speech_seconds    : 5
 max_recording_seconds : 7
 audio_read_timeout    : 0.75
 camera                : auto, 320x240, JPEG quality 70, memory-only
 image_capture         : after end-of-speech beep, before upload
 uart                  : auto, 115200, CRLF
-tts                   : local Piper /speak_async, AUDIO_DEVICE=auto:UACDemo
+tts                   : local Piper /speak_async, AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+tts volume            : --tts-volume-gain 2.25, server accepts volume_gain 0.05..8.0
 music/weather         : local tool server on 127.0.0.1:8788, mpv + Open-Meteo
+to-do list            : local JSON voice tool, frdm_uart_context_sender/logs/todo_list.json
 focus work mode       : voice-triggered start/stop, periodic /focus-check, JSONL log + Markdown report
 ```
 
 不要固定 USB 數字 index。重插 USB 後 `--device 25`、`--beep-device 24`、`--camera-id 0` 都可能失效；正式 demo 用 keyword 和 auto。
 
+目前現場音量採保守值，避免 TTS 或 beep 嚇到旁邊的人：
+
+```text
+TTS .env default      : DEFAULT_VOLUME_GAIN=2.25
+Wake Bridge default   : --tts-volume-gain 2.25
+PulseAudio USB sink   : about 80%
+Too loud              : try 2.0 and --beep-volume 0.35
+Too quiet             : try 3.0 before going higher
+```
+
+改過這份 repo 後，最容易忘記的是重啟哪個 terminal：
+
+```text
+Windows server / prompt / emotion 改了    -> 重啟 Windows Terminal 1
+TTS server / volume_gain 改了             -> 重啟 Jetson Terminal 2
+Wake Bridge / UART / routing / docs 改了  -> 重啟 Jetson Terminal 3
+Music/weather intent 改了                 -> 重啟 Jetson Terminal 4
+```
+
 ## What This Does
 
 ```text
+Bridge process starts
+-> FRDM startup waits 2 seconds, then Normal 0 0
 Hey Jarvis wake word
 -> short beep
+-> Thinking 0 0
 -> record speech until silence
 -> end-of-speech beep + camera JPEG capture in memory
 -> POST audio + optional image to Windows /voice-chat
 -> Windows ASR transcript
+-> Jetson local to-do list if transcript asks for it
 -> Jetson local tool routing for music/weather if transcript asks for it
 -> focus work mode start/stop if transcript asks for work mode
 -> rule-based vision intent routing
 -> qwen35-fast:latest text or vision response
 -> Jetson parses reply/control
+-> Speaking <emotion_code>
 -> TTS speaks natural reply
--> FRDM UART controls screen/emotion/head motion
+-> head motor motion runs while TTS speaks
+-> next FRDM mode: Thinking / Normal / Sleep / Music / Focus
 ```
 
-Focus work mode is a side mode. When the transcript is a work-mode command, the wake bridge starts `focus_work_mode.py` as a separate process, periodically samples the camera, posts each image to Windows `/focus-check`, writes `focus_log.jsonl`, and generates `focus_report.md` when the session ends. Photos are memory-only by default; use `--focus-save-images` only for debugging.
+Focus work mode is a side mode. When the transcript is a work-mode command, the wake bridge starts `focus_work_mode.py` as a separate process, samples the camera every 60 seconds by default, posts each image to Windows `/focus-check`, writes `focus_log.jsonl`, then generates `focus_summary.json` and `focus_report.md` when the session ends. Photos are memory-only by default; use `--focus-save-images` only for debugging.
 
 不使用 Gemini、OpenAI 或雲端 API。ASR 與 Ollama 在 Windows 桌機本機；wake word、camera、TTS、UART 在 Jetson 本機。
 天氣查詢使用 Jetson 本地 tool server 呼叫 Open-Meteo；這不是 LLM 猜測，也不需要 API key。音樂串流使用 Jetson 本地 `mpv`/`yt-dlp`，不經 Windows 桌機。
+
+## FRDM State Machine
+
+目前 FRDM firmware 只需要支援這些 command：
+
+```text
+Sleep
+Normal
+Thinking
+Speaking
+Music
+Focus
+ShowNum
+MotorPitch
+MotorYaw
+```
+
+Wake Bridge 會拒絕舊版情緒畫面 command，例如 `Happy 0 0`、`Curious 0 0`。情緒統一改塞進 `Speaking` 的第一個參數。
+
+```text
+bridge startup        -> wait 2s -> Normal 0 0
+Hey Jarvis detected   -> Thinking 0 0
+AI/TTS starts         -> Speaking <0..5>
+TTS speaking          -> MotorPitch <angle>, MotorYaw <angle>
+follow-up listening   -> Thinking 0 0
+掰掰/拜拜/再見        -> Normal 0 0, then wake-only standby
+睡覺/休息/晚安        -> Sleep 0 0, then wake-only standby
+播放/繼續音樂         -> Music 0 0, then wake-only standby
+暫停/停止音樂         -> Normal 0 0, then wake-only standby
+專注/專心/工作模式    -> Focus 0 0, then wake-only standby
+回來/回到正常         -> Normal 0 0
+```
+
+`Speaking`、`MotorPitch`、`MotorYaw` 都是單參數 wire format：
+
+```text
+Speaking 2
+MotorPitch 90
+MotorYaw 90
+```
+
+其他畫面 command 保留兩個參數：
+
+```text
+Thinking 0 0
+Normal 0 0
+Sleep 0 0
+Music 0 0
+Focus 0 0
+```
 
 ## Table Of Contents
 
 ```text
 Files
 Standard Startup
+FRDM State Machine
 Music Routing And Playback
 Weather Routing
+To-Do List
 Focus Work Mode
 Windows Server
 Structured Reply And Control
@@ -118,15 +199,18 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
   --beep-keyword UACDemo \
+  --noisy-room \
+  --tts-volume-gain 2.25 \
   --uart-port auto \
   --uart-baudrate 115200 \
   --enable-head-motor \
+  --boot-normal-delay 2.0 \
   --wake-threshold 0.75 \
-  --wake-volume-min 350 \
-  --volume-min 900 \
-  --speech-start-margin 550 \
+  --wake-volume-min 500 \
+  --volume-min 1100 \
+  --speech-start-margin 750 \
   --silence-duration 1.2 \
-  --silence-margin 650 \
+  --silence-margin 900 \
   --max-speech-seconds 5 \
   --max-recording-seconds 7 \
   --audio-read-timeout 0.75 \
@@ -143,10 +227,13 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --camera-frame-max-age 2.0 \
   --focus-script /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py \
   --focus-server-url http://100.108.141.26:8766/focus-check \
-  --focus-interval-sec 180 \
+  --focus-interval-sec 60 \
   --focus-duration-min 0 \
   --focus-log-root /tmp/focus_voice_test \
   --focus-alert-threshold 2 \
+  --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
+  --focus-notify-mode discord \
+  --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
   --music-timeout 5 \
   --music-wake-pause-timeout 0.6 \
@@ -170,19 +257,43 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --uart-debug
 ```
 
-這是完整功能版：wake word、conversation mode、speech-end 拍照、FRDM UART、TTS、Music、Weather、Focus Work Mode 都會開。第一次 `Hey Jarvis` 後會連續聽 follow-up；說 `byebye / 掰掰 / 拜拜 / 再見`、音樂控制結束、或 focus mode 指令處理完後，會回到 wake-only standby。
+這是完整功能版：wake word、conversation mode、speech-end 拍照、FRDM UART、TTS、To-Do、Music、Weather、Focus Work Mode 都會開。第一次 `Hey Jarvis` 後會連續聽 follow-up；說 `byebye / 掰掰 / 拜拜 / 再見`、叫它睡覺、音樂控制結束、或 focus mode 指令處理完後，會回到 wake-only standby。
 
 如果只想一問一答，把 `--conversation-mode`、`--turn-listen-timeout`、`--session-idle-timeout`、`--max-session-turns` 拿掉。若想再壓低延遲，可以額外加 `--ultra-response`；如果講話中間常停頓被太早切句，改用比較保守的 `--turbo-response`。
 
 `fast_reply / num_predict` 需要 Windows Terminal 1 也使用最新版 `desktop_fast_chat_server.py` 並重啟；如果 Windows 還是舊 server，只會套用 Jetson 端的錄音/TTS/camera 加速。
 
-流程會變成：第一次 `Hey Jarvis` 喚醒，後續 follow-up 不需要再說喚醒詞；每次準備收下一句前會先 beep 讓你知道可以講話，判定你講完時會再 beep 一聲，並在那一刻抓一張照片，跟該輪語音一起送到 Windows。若上一輪正在播音樂，wake 後會先 pause 音樂、稍微等音訊裝置穩定，再播開始收音 beep；如果 UACDemo output 被 mpv 暫時佔住，會自動用 default output 重試 beep。說 `byebye / 掰掰 / 拜拜 / 再見` 後會送 `Sleep 0 0` 進入睡覺模式，並回到 wake-only standby。follow-up timeout 只會回到 standby，不會主動送睡覺。回到 standby 後，一般講話不會送 ASR/Ollama，必須重新說 `Hey Jarvis`。
+流程會變成：啟動後 FRDM 先顯示開機畫面，預設等 2 秒送 `Normal 0 0`；第一次 `Hey Jarvis` 喚醒後送 `Thinking 0 0`，後續 follow-up 不需要再說喚醒詞。每次準備收下一句前會先 beep 讓你知道可以講話，判定你講完時會再 beep 一聲，並在那一刻抓一張照片，跟該輪語音一起送到 Windows。開始 TTS 前會送 `Speaking <emotion_code>`，TTS 期間依情緒跑頭部馬達，TTS 結束後若仍在連續對話會回 `Thinking 0 0` 等下一句。說 `byebye / 掰掰 / 拜拜 / 再見` 後會送 `Normal 0 0`，並回到 wake-only standby。follow-up timeout 也會回 `Normal 0 0`。回到 standby 後，一般講話不會送 ASR/Ollama，必須重新說 `Hey Jarvis`。
 
-音樂控制也會自動結束 conversation mode：播音樂或繼續播放後會進入 Sleep 並回到 wake-only standby；暫停或停止處理完也會回到 wake-only standby。所以下次要暫停、停止或換歌，都必須先說 `Hey Jarvis`。如果要保留舊行為，可以加 `--keep-conversation-after-music-control`。
+現場吵雜時保留 `--noisy-room`。它會把 beep 調成更大聲、更長，並提高 speech/silence gate。TTS 太小聲時保留 `--tts-volume-gain 2.25`；若仍偏大降到 `2.0`，仍太小再回到 `3.0`。只測 beep 可跑：
+
+```bash
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --noisy-room --test-beep
+```
+
+若背景音量平均約 `10000`、講話約 `19000`，`--noisy-room` 會自動讓門檻接近：
+
+```text
+wake accept volume >= 13500
+speech start       >= 14500
+speech end/silence <= 13000
+```
+
+這組是刻意讓背景聲低於 speech start，但仍高於 silence end 的可結束區間。
+
+openWakeWord 的 score 有時會比音量峰值晚幾個 chunk 才出現，所以 wake gate 不是只看當下 `volume`，而是看最近 1 秒的 `recent_peak`。如果 standby log 太多，可以加：
+
+```bash
+--standby-progress-interval 0
+```
+
+音樂控制也會自動結束 conversation mode：播音樂或繼續播放後會送 `Music 0 0` 並回到 wake-only standby；暫停或停止處理完會送 `Normal 0 0`。所以下次要暫停、停止或換歌，都必須先說 `Hey Jarvis`。如果要保留舊行為，可以加 `--keep-conversation-after-music-control`。
 
 Focus Work Mode 指令也會自動結束 conversation mode，避免工作模式啟動後還一直收 follow-up。開始後會立刻拍第一張工作狀態照片，之後每 `--focus-interval-sec` 秒取樣一次；照片預設只在記憶體中，判斷完即丟棄。`--focus-duration-min 0` 代表不自動結束，要再說「結束工作 / 停止專心 / 下班」才會停。
 
-如果只想結束對話但不要送 Sleep，可以加 `--no-sleep-on-conversation-end`。`--conversation-mode` 不要和 `--no-wake-word` 同時使用，程式會直接拒絕啟動，避免結束後仍然不用喚醒詞就錄音。
+To-Do List 是 normal mode 的本機工具，不需要 Windows server 額外 endpoint 支援。明確說「新增待辦、列出待辦、完成待辦」時，Wake Bridge 會直接更新本機 JSON，預設路徑是 `frdm_uart_context_sender/logs/todo_list.json`。它不會自動啟動或停止 focus work mode；若 focus mode 正在跑，明確的待辦指令仍會先被處理。
+
+`--no-sleep-on-conversation-end` 現在只保留相容舊指令；新版結束對話預設就是送 `Normal 0 0`。`--conversation-mode` 不要和 `--no-wake-word` 同時使用，程式會直接拒絕啟動，避免結束後仍然不用喚醒詞就錄音。
 
 正式 demo 不要固定 USB index：
 
@@ -198,11 +309,12 @@ Focus Work Mode 指令也會自動結束 conversation mode，避免工作模式�
 ```text
 mic       : --mic-keyword UACDemo
 beep      : --beep-keyword UACDemo
-TTS audio : AUDIO_DEVICE=auto:UACDemo
+TTS audio : AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
 camera    : --camera-id auto
 FRDM      : --uart-port auto
 music     : --music-backend mpv
 weather   : --weather-default-location Taipei
+todo      : --todo-list-path frdm_uart_context_sender/logs/todo_list.json
 ```
 
 音樂功能是 sidecar，不會接管主流程：
@@ -262,12 +374,14 @@ speech_start_threshold = max(volume_min, noise_floor + speech_start_margin)
 silence_threshold      = max(volume_min, noise_floor + silence_margin, peak_volume * silence_peak_ratio)
 ```
 
-預設值：
+正式現場 `--noisy-room` 值：
 
 ```text
-volume_min=900
-speech_start_margin=550
-silence_margin=650
+volume_min=1100
+speech_start_margin=750
+speech_start_ratio=1.45
+silence_margin=900
+silence_noise_ratio=1.30
 silence_peak_ratio=0.35
 pre_speech_seconds=0.35
 max_speech_seconds=5
@@ -282,9 +396,10 @@ tts_poll_interval=0.75
 吵場地調參順序：
 
 ```text
-一直錄到 max_speech_seconds -> 先加 --silence-margin 800
-背景音直接觸發 Speech started -> 加 --speech-start-margin 650
-你講話也進不了 Speech started -> 降 --speech-start-margin 250
+先加 noisy-room preset       -> --noisy-room
+一直錄到 max_speech_seconds -> 先加 --silence-noise-ratio 1.4
+背景音直接觸發 Speech started -> 加 --speech-start-ratio 1.55
+你講話也進不了 Speech started -> 降 --speech-start-ratio 1.35
 demo 要更快回覆 -> 降 --max-speech-seconds 4
 現場太吵導致等待/錄音像卡住 -> 降 --max-recording-seconds 7 或 6
 完全停在 Recording. Speak now -> 降 --audio-read-timeout 0.75，並讓 bridge 重開 stream
@@ -471,9 +586,61 @@ Open-Meteo 連不到    -> TTS 說「我剛剛連不到本地天氣工具或天�
 intent 沒命中        -> 不查天氣，走原本桌機 AI 回覆
 ```
 
+## To-Do List
+
+To-Do List 是 Wake Bridge 內建的本機 voice tool。它只在 transcript 明確提到待辦時觸發，不呼叫額外 server endpoint、不使用相機，也不會改變 focus work mode 狀態。
+
+資料存在本機 JSON：
+
+```text
+default path -> frdm_uart_context_sender/logs/todo_list.json
+format       -> version, next_id, items[]
+privacy      -> only task text + timestamps; no photo/audio
+```
+
+常用語句：
+
+```text
+Hey Jarvis，新增待辦 寫報告
+Hey Jarvis，幫我記一個待辦：整理投影片
+Hey Jarvis，把買牛奶加入待辦
+Hey Jarvis，列出待辦
+Hey Jarvis，我的待辦清單
+Hey Jarvis，完成待辦 1
+Hey Jarvis，完成第二項待辦
+Hey Jarvis，完成待辦 寫報告
+Hey Jarvis，清除已完成待辦
+Hey Jarvis，清空待辦
+```
+
+處理順序：
+
+```text
+Windows ASR transcript
+-> local to-do intent
+-> if matched: update JSON, override reply/control locally, TTS speaks result
+-> if not matched: continue focus/music/weather/general AI path
+```
+
+這個功能放在 normal mode，但明確待辦指令會優先於 focus mode 的「工作中保護回覆」。也就是 focus mode 跑著時，你仍然可以說「新增待辦 XXX」先記下來；但一般聊天仍會被 focus mode 擋住，避免工作時一直互動。
+
+相關參數：
+
+```text
+--todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json
+--no-todo-list
+--todo-debug
+```
+
+快速檢查 JSON：
+
+```bash
+cat /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json
+```
+
 ## Focus Work Mode
 
-Focus work mode 用來偵測使用者是否仍在專心工作，或是離席、看手機、睡覺、分心。它和 normal mode 分開運作：
+Focus work mode 用來偵測使用者是否仍在專心工作，或是離席、看手機、睡覺、分心。預設每 60 秒取樣一次。它和 normal mode 分開運作：
 
 ```text
 Hey Jarvis
@@ -482,7 +649,8 @@ Hey Jarvis
 -> focus_work_mode.py 每 N 秒拍一張照片
 -> POST image to Windows /focus-check
 -> append focus_log.jsonl
--> session 結束時寫 focus_report.md
+-> session 結束時寫 focus_summary.json + focus_report.md
+-> optional Discord webhook notification
 -> 結束工作 / 停止專心 / 下班
 -> Wake Bridge 停止 focus process，回到 normal mode
 ```
@@ -525,14 +693,29 @@ error       錯誤
 --no-focus-mode
 --focus-script /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py
 --focus-server-url http://100.108.141.26:8766/focus-check
---focus-interval-sec 180
+--focus-interval-sec 60
 --focus-duration-min 0
 --focus-log-root /tmp/focus_voice_test
 --focus-alert-threshold 2
+--todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json
+--focus-notify-mode discord
+--focus-discord-webhook-url "$DISCORD_WEBHOOK_URL"
+--focus-notify-dry-run
 --focus-save-images
 ```
 
 `--focus-duration-min 0` 代表不自動結束，要再說「結束工作」或「停止專心」才會切回 normal mode。
+
+結束時會產生兩份報告：
+
+```text
+focus_summary.json  給後續手機通知、email、Discord 或前端讀取的結構化資料
+focus_report.md     給人看的 Markdown 專心報告
+```
+
+整合報告會讀同一份 to-do JSON，列出專注期間完成的待辦、結束後仍剩下的待辦、專注時間、分心時間、專注分數與建議。Discord webhook 是 best-effort：有 `DISCORD_WEBHOOK_URL` 就送，送失敗不會讓 focus session 結束流程失敗。
+
+Discord API request 會帶 `User-Agent: DiscordBot (...)`。如果手動測 webhook 時看到 `HTTP 403 error code: 1010`，通常不是 webhook 權限，而是 request 被 Cloudflare 擋掉；請確認測試指令也有帶 `User-Agent`。
 
 手動安全測試，先不用相機/server：
 
@@ -569,18 +752,13 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 
 Windows server 必須有 `/focus-check`。如果 `/debug` routes 裡沒有 `/focus-check`，同步正式 Windows bundle 到桌面後重啟 server。
 
-Focus mode 會送的 UART screen command：
+Focus mode 主要會送的 UART screen command：
 
 ```text
-session start  -> Thinking
-focused        -> Thinking
-away           -> Sleep
-phone          -> Concerned
-sleeping       -> Sleepy
-distracted     -> Concerned
-uncertain      -> Confused
-error          -> Confused
-session end    -> Normal
+start focus    -> Focus 0 0
+during reply   -> Speaking <emotion_code> + MotorPitch/MotorYaw
+still focusing -> Focus 0 0
+stop/return    -> Normal 0 0
 ```
 
 `--focus-alert-threshold 2` 代表非專心狀態要連續出現兩次才切表情，避免單張照片誤判。
@@ -676,7 +854,8 @@ Windows `qwen35-fast:latest` 被要求只回傳一個 JSON object：
   "reply": "自然語言回覆，給 TTS 播放。不可提到 JSON、UART、MotorPitch、MotorYaw 或內部控制欄位。",
   "control": {
     "persistent_state": "normal | sleep | unchanged",
-    "emotion": "neutral | happy | curious | excited | confused | concerned | sleepy",
+    "screen_mode": "normal | sleep | music | focus | thinking | unchanged",
+    "emotion": "neutral | concerned | angry | sad | happy | curious | excited | confused | sleepy",
     "head_motion": "none | nod | double_nod | look_around | shake | gentle_nod | sleepy_drop",
     "reason": "簡短內部理由，不給使用者播放"
   }
@@ -684,6 +863,29 @@ Windows `qwen35-fast:latest` 被要求只回傳一個 JSON object：
 ```
 
 Jetson robust parser：
+
+### FRDM Speaking 表情不變
+
+如果 log 長這樣：
+
+```text
+FRDM UART TX: Speaking 4
+FRDM UART RX: Speaking 4
+FRDM UART RX: switch to SPEAKINGemotion: neutral
+```
+
+代表 Jetson 有送到、FRDM 有收到，但 FRDM `SpeakingGui(char *pValue)` 沒把參數解析成數字。請把 FRDM 端 `sscanf(pValue, "%u", &value)` 換成 [speaking_gui_emotion_fix.c](/home/asrlab-yian/MakeNTU/emotion_robot_controller/frdm_firmware/patches/speaking_gui_emotion_fix.c) 裡的 `ReadSpeakingEmotionOrNeutral()`。
+
+目前對表：
+
+```text
+Speaking 0 -> neutral
+Speaking 1 -> concerned
+Speaking 2 -> angry
+Speaking 3 -> sad
+Speaking 4 -> happy
+Speaking 5 -> confused
+```
 
 ```text
 合法 JSON                  -> 使用 reply/control
@@ -695,26 +897,40 @@ parse 失敗                -> 自然 fallback reply + neutral/none/unchanged
 
 `reply` 永遠是給使用者聽的自然語言；`control` 永遠是內部控制。
 
+控制優先順序：
+
+```text
+1. 明確本機工具意圖：to-do / focus / music / weather
+2. 明確 conversation 結束詞：掰掰、拜拜、再見 -> Normal 0 0
+3. 明確睡覺/休息意圖 -> Sleep 0 0，並結束連續聆聽
+4. 明確回來/正常意圖 -> Normal 0 0
+5. 一般回答 -> Speaking <emotion_code>，TTS 後在 conversation mode 回 Thinking 0 0
+```
+
+`screen_mode` 是給 Jetson 的模式提示，不會給使用者聽。若 server 沒回、回錯、或 reply 裡混入 JSON，Jetson 端會用 transcript 的本機關鍵字規則補救。
+
 ## FRDM UART Timing
 
 正式時序：
 
 ```text
+Bridge process starts
+-> wait 2 seconds for FRDM boot screen
+-> Normal 0 0
 Wake detected
 -> beep
 -> Thinking 0 0
 -> user speech / recording
 -> end-of-speech beep + image capture / upload / ASR / Ollama
 -> receive reply/control
--> Speaking 0 0
--> emotion screen command, e.g. Happy 0 0
+-> Speaking <emotion_code>
 -> TTS starts
 -> head motion thread starts
 -> TTS finishes or estimated finished
--> restore Normal 0 0 or Sleep 0 0
+-> Thinking 0 0 for the next follow-up, or mode command such as Normal/Music/Focus/Sleep
 ```
 
-Jetson 會把 `Speaking 0 0` 和 emotion command 合併在同一次 serial session 送出，降低 TTS 前的 UART 等待；motor 動作仍在獨立 thread 執行，不阻塞 TTS。
+新版 FRDM 不再接收 `Happy 0 0`、`Curious 0 0` 這種舊情緒畫面指令。Jetson 會把情緒轉成單參數 `Speaking 0-5`，motor 動作仍在獨立 thread 執行，不阻塞 TTS。
 
 Persistent state：
 
@@ -727,7 +943,20 @@ Temporary screen state：
 
 ```text
 Thinking
-Speaking
+Speaking <0..5>
+Music
+Focus
+```
+
+Mode command examples：
+
+```text
+Normal 0 0     # default face / wake-only standby
+Thinking 0 0   # listening, ASR/LLM thinking, or waiting for follow-up
+Speaking 2     # TTS speaking with angry emotion
+Music 0 0      # music playback screen
+Focus 0 0      # focus work mode screen
+Sleep 0 0      # sleep/rest screen
 ```
 
 Sleep intent examples：
@@ -758,37 +987,68 @@ normal
 
 ## Emotion And Head Motion
 
-Wake Bridge 會分開控制「臉部表情」和「頭部馬達」：
+Wake Bridge 會分開控制「說話情緒碼」和「頭部馬達」：
 
 ```text
-emotion      -> FRDM screen command, e.g. Happy 0 0
+emotion      -> Speaking 0..5
 head_motion  -> MotorPitch / MotorYaw continuous sequence
 ```
 
 Windows server 可以在 `control.head_motion` 明確指定頭部動作；如果 server 沒給、給空字串、或給 `none`，Jetson 會用 `emotion` 自動選一個 fallback motion。這樣一般聊天只要判斷情緒，頭就會跟著動；特殊情境仍可由 server 指定更精準的 motion。
 
-Emotion screen command mapping：
+Emotion speaking-code mapping：
 
 ```text
-neutral   -> Neutral 0 0
-happy     -> Happy 0 0
-curious   -> Curious 0 0
-excited   -> Excited 0 0
-confused  -> Confused 0 0
-concerned -> Concerned 0 0
-sleepy    -> Sleepy 0 0
+neutral   -> Speaking 0
+concerned -> Speaking 1
+angry     -> Speaking 2
+sad       -> Speaking 3
+happy     -> Speaking 4
+curious   -> Speaking 5   # FRDM has no separate curious face; use confused face
+excited   -> Speaking 4   # FRDM has no separate excited face; use happy face
+confused  -> Speaking 5
+sleepy    -> Speaking 3   # FRDM has no separate sleepy face; use sad face
 ```
 
 Emotion to head motion fallback：
 
 ```text
 neutral   -> none
+concerned -> gentle_nod
+angry     -> shake
+sad       -> gentle_nod
 happy     -> nod
 curious   -> look_around
 excited   -> double_nod
 confused  -> shake
-concerned -> gentle_nod
 sleepy    -> sleepy_drop
+```
+
+常見模型輸出的 emotion alias 會先正規化，再送 FRDM：
+
+```text
+calm / normal / 中性              -> neutral
+joy / joyful / positive / 開心    -> happy
+interested / thinking / 好奇      -> curious
+surprised / amazed / 興奮         -> excited
+unsure / uncertain / puzzled      -> confused
+anxious / worried / 急 / 擔心     -> concerned
+angry / 生氣 / 火大 / 操你媽      -> angry
+sad / 難過 / 沮喪                 -> sad
+tired / drowsy / 想睡 / 疲累      -> sleepy
+```
+
+本地 fallback 也會處理常見語句：
+
+```text
+我操你媽的                 -> angry, shake, Speaking 2
+我很難過                   -> sad, gentle_nod, Speaking 3
+太酷了我超期待             -> excited, double_nod, Speaking 4
+這個結果怪怪的我看不懂     -> confused, shake, Speaking 5
+我有點擔心                 -> concerned, gentle_nod, Speaking 1
+我好睏想睡                 -> sleepy, sleepy_drop, Speaking 3
+為什麼會這樣               -> curious, look_around, Speaking 5
+太好了很棒                 -> happy, nod, Speaking 4
 ```
 
 Sleep / wake intent has higher priority than normal emotion fallback：
@@ -808,7 +1068,7 @@ Terminal 3 的完整 Hey Jarvis 指令預設會送 `MotorPitch` / `MotorYaw`。�
 --enable-head-motor \
 ```
 
-若 FRDM parser 正在 debug、需要暫時關閉頭部馬達，把 `--enable-head-motor` 改成 `--disable-head-motor`。完整 Hey Jarvis 流程仍會送表情/狀態 UART，例如 `Thinking 0 0`、`Speaking 0 0`、`Normal 0 0`。
+若 FRDM parser 正在 debug、需要暫時關閉頭部馬達，把 `--enable-head-motor` 改成 `--disable-head-motor`。完整 Hey Jarvis 流程仍會送畫面 UART，例如 `Thinking 0 0`、`Speaking 2`、`Music 0 0`、`Focus 0 0`、`Normal 0 0`。
 
 啟動 log 必須看到：
 
@@ -960,7 +1220,7 @@ MotorPitch 90
 MotorYaw 90
 ```
 
-正式對話不會跑完整一次性 motion table。TTS 開始時會啟動 speaking motion loop，TTS 還在播就持續循環短動作；TTS 結束後會送 stop event，motion thread 立刻回中心並退出，再送 `Normal 0 0` 或 `Sleep 0 0`。
+正式對話不會跑完整一次性 motion table。TTS 開始時會啟動 speaking motion loop，TTS 還在播就持續循環短動作；TTS 結束後會送 stop event，motion thread 立刻回中心並退出，再依狀態送 `Thinking 0 0`、`Normal 0 0`、`Sleep 0 0`、`Music 0 0` 或 `Focus 0 0`。
 
 `--uart-debug` 會同時印出 keyframe 和展開後的 UART 序列：
 
@@ -979,7 +1239,7 @@ head motion expanded: MotorPitch:90 -> MotorPitch:98 -> MotorPitch:106 -> MotorP
 一次性測試太慢              -> --motor-step-delay 0.6
 偶爾沒有回正                -> --motor-reset-repeats 5
 回正指令太密或 FRDM 吃不穩   -> --motor-reset-delay 0.45
-TTS 結束後太早切 Normal/Sleep -> --motor-join-timeout 8
+TTS 結束後太早切下一個畫面      -> --motor-join-timeout 8
 只想看會送什麼              -> 加 --uart-dry-run --uart-debug
 ```
 
@@ -1205,7 +1465,7 @@ http://127.0.0.1:8777/speak_async
 POST /speak_async -> get job_id
 poll /queue until job_id appears in last_result
 if queue status unavailable -> estimate by reply length
-restore Normal/Sleep after TTS finished or estimated finished
+send next FRDM screen after TTS finished or estimated finished
 ```
 
 可調 timeout 與 polling 頻率：
@@ -1215,12 +1475,13 @@ restore Normal/Sleep after TTS finished or estimated finished
 --tts-poll-interval 0.75
 ```
 
-`--tts-poll-interval` 預設 0.75 秒，避免 TTS server terminal 因每 0.2 秒 `/queue` access log 而洗版。若想更安靜可調到 `1.0`，若想更快恢復 Normal/Sleep 可調到 `0.5`。
+`--tts-poll-interval` 預設 0.75 秒，避免 TTS server terminal 因每 0.2 秒 `/queue` access log 而洗版。若想更安靜可調到 `1.0`，若想更快切回下一個 FRDM 畫面可調到 `0.5`。
 
 TTS `.env` 建議：
 
 ```text
-AUDIO_DEVICE=auto:UACDemo
+AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+DEFAULT_VOLUME_GAIN=2.25
 ENABLE_STREAM_PLAYBACK=true
 ```
 
@@ -1295,6 +1556,24 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --motor-reset-delay 0.02 \
   --test-head-gap 0
 ```
+
+Music intent self-test：
+
+```bash
+python3 music_web_player/music_web_player.py --self-test
+```
+
+這會確認「我想聽歌」仍會觸發音樂，但「為什麼沒聲音、我聽到聲音超小」不會被誤判成點歌。
+
+TTS volume API smoke test：
+
+```bash
+curl -X POST http://127.0.0.1:8777/speak_async \
+  -H "Content-Type: application/json" \
+  -d '{"text":"音量測試，現在應該比較大聲。","interrupt":true,"volume_gain":2.25}'
+```
+
+如果回 `422` 或 `volume_gain` 不被接受，重啟 Jetson Terminal 2 的 `jetson_piper_tts.server`。
 
 Focus work mode self-test：
 
@@ -1381,8 +1660,7 @@ UART timing：
 
 ```text
 FRDM UART TX: Thinking 0 0
-FRDM UART TX: Speaking 0 0
-FRDM UART TX: Happy 0 0
+FRDM UART TX: Speaking 2
 FRDM UART TX: MotorPitch ...
 FRDM UART TX: Normal 0 0
 ```
@@ -1409,9 +1687,10 @@ No microphone matching UACDemo
 -> Jetson 沒看到 USB mic。跑 lsusb / --list-mics；若 lsusb 看不到 UACDemo，跑 ./recover_demo_usb.sh。
 
 Recording 後像卡住
--> 如果顯示 phase=waiting_speech，代表還沒高過 start threshold；可把 --speech-start-margin 550 降到 300 或 250。
--> 如果已經 Speech started 但停不下來，可把 --silence-margin 650 提到 800，或把 --max-speech-seconds 5 降到 4。
--> 如果現場一直有風扇/人聲，直接用 --speech-start-margin 550 --silence-margin 650 --max-speech-seconds 5 --max-recording-seconds 7 --audio-read-timeout 0.75 --recording-progress-interval 1.0。
+-> 如果顯示 phase=waiting_speech，代表還沒高過 start threshold；先把 --speech-start-ratio 1.45 降到 1.35，再視情況降 --speech-start-margin。
+-> 如果已經 Speech started 但停不下來，可把 --silence-noise-ratio 1.30 提到 1.40，或把 --max-speech-seconds 5 降到 4。
+-> 如果現場一直有風扇/人聲，優先加 `--noisy-room`；背景約 10000、講話約 19000 時，重點看 log 裡 `speech_start_threshold` 是否約 14500、`silence_threshold` 是否約 13000。
+-> 如果 `wake` 很高但被 Low-volume 忽略，先看 `recent_peak`；如果 recent_peak 仍低於門檻，可試 `--wake-volume-ratio 1.25` 或 `--wake-volume-window-seconds 1.5`。
 -> `--max-speech-seconds` 只在 Speech started 後生效；要防止整輪卡住請用 `--max-recording-seconds`。
 -> 如果完全沒有 Recording progress，代表舊版 blocking read 卡住或 USB mic stream 停吐；新版會印 WARNING 並退出當輪。
 
@@ -1419,7 +1698,7 @@ Recording 後像卡住
 -> 指令打錯。改成 --tts-poll-interval 0.75、--tts-debug、--uart-debug 三行。
 
 Wake 被 ignore
--> 低音量保護。正式用 --wake-volume-min 350；仍漏叫可降到 200。
+-> 低音量保護。正式用 --wake-volume-min 500；仍漏叫可降到 200。
 
 Camera timeout
 -> 不會 crash。跑 lsusb / ls -l /dev/video* / ./recover_demo_usb.sh。
@@ -1435,7 +1714,18 @@ debug_version 不是 11
 -> 重新 scp 同步 Windows bundle，關掉舊 server，重開。
 
 TTS ready 但沒聲音
--> curl /health，確認 AUDIO_DEVICE=auto:UACDemo 和 audio.device 是 UACDemo；重開 TTS。
+-> curl /health，確認 AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0 和 audio.device 是 UACDemo；重開 TTS。
+
+TTS 有聲音但超小
+-> Terminal 3 加 `--tts-volume-gain 2.25` 後重啟 Wake Bridge；這會送 `volume_gain` 給新版 TTS server，只放大 raw playback，不改 ALSA 系統音量。
+-> 若 curl /speak_async 帶 `volume_gain` 回 422，代表 Terminal 2 還是舊 server，重啟 TTS server。
+
+說「為什麼沒聲音」卻跑去播音樂
+-> 重啟 Terminal 4 music tool 和 Terminal 3 bridge；最新版會把「沒聲音 / 聲音太小 / 音量 / 聽到聲音」當成 audio complaint，不會因單字 `聽` 觸發 play。
+
+情緒表情不對
+-> 先看 Windows debug 裡 `control.emotion` 和 Terminal 3 的 `FRDM UART TX: Speaking N`。目前正規化後應是：`angry -> Speaking 2`、`concerned -> 1`、`happy/excited -> 4`、`confused/curious -> 5`、`sad/sleepy -> 3`。如果 Terminal 3 還印 `concerned code 4`，代表舊 bridge 還活著，先 `pkill -9 -f wake_voice_chat_frdm_bridge.py` 再重啟。
+-> 如果 FRDM RX 有 `Speaking N` 但仍印 `emotion: neutral`，問題在 FRDM `SpeakingGui(char *pValue)` parser，套用 `emotion_robot_controller/frdm_firmware/patches/speaking_gui_emotion_fix.c`。
 
 音樂 pause/resume 沒反應
 -> 確認 Terminal 4 `music_web_player.py --backend mpv` 開著，`curl http://127.0.0.1:8788/health` 裡 active/paused 合理。browser backend 不能可靠 pause/resume。

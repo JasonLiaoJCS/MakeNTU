@@ -274,6 +274,8 @@ def build_tts_payload(reply: str, args: argparse.Namespace) -> dict[str, Any]:
         payload["voice"] = args.tts_voice
     if args.tts_length_scale is not None:
         payload["length_scale"] = args.tts_length_scale
+    if getattr(args, "tts_volume_gain", None) is not None:
+        payload["volume_gain"] = args.tts_volume_gain
     if args.tts_stream is not None:
         payload["stream"] = args.tts_stream
     return payload
@@ -300,6 +302,7 @@ def speak_reply(response: dict[str, Any], args: argparse.Namespace) -> dict[str,
         print()
         print("TTS:")
         print(f"  url          : {args.tts_url}")
+        print(f"  request_gain : {payload.get('volume_gain', 'none')}")
         print(f"  post_ms      : {elapsed}")
         print(f"  queued       : {result.get('queued', False)}")
         if "job_id" in result:
@@ -405,6 +408,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tts-no-interrupt", action="store_true", help="Queue replies instead of interrupting current TTS playback.")
     parser.add_argument("--tts-voice", help="Optional Piper voice name, e.g. zh_CN-xiao_ya-medium.")
     parser.add_argument("--tts-length-scale", type=float, default=None, help="Optional Piper length_scale. Lower is faster.")
+    parser.add_argument("--tts-volume-gain", type=float, default=None, help="Optional raw playback gain sent to jetson_piper_tts. Try 4.0-6.0 for noisy rooms.")
     parser.add_argument("--tts-file-playback", action="store_true", help="Ask TTS server to use WAV/file playback instead of raw streaming.")
     parser.add_argument("--tts-debug", action="store_true", help="Print TTS enqueue/playback debug summary.")
     return parser

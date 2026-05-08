@@ -17,6 +17,22 @@ emotion_robot_controller/voice_stt_remote/windows_desktop_server_bundle/desktop_
 
 正式測試請優先看 `frdm_uart_context_sender/README.md` 的 Focus Work Mode 和 Windows Server 段落。
 
+To-Do List 功能也已加在主專案的 `frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py`，不是放在這個 staging 資料夾。它是 normal mode 的本機 JSON voice tool，預設寫到：
+
+```text
+frdm_uart_context_sender/logs/todo_list.json
+```
+
+常用語句：
+
+```text
+Hey Jarvis，新增待辦 寫報告
+Hey Jarvis，列出待辦
+Hey Jarvis，完成待辦 1
+```
+
+待辦功能不會啟動或停止 focus work mode；但 focus mode 執行中如果明確講「新增待辦 / 列出待辦 / 完成待辦」，Wake Bridge 會先處理待辦，避免臨時想到事情時沒地方記。
+
 ## 功能概要
 
 `focus_work_mode.py` 是新的專心工作模式主程式：
@@ -26,7 +42,9 @@ emotion_robot_controller/voice_stt_remote/windows_desktop_server_bundle/desktop_
 - 將照片送到桌面端 `/focus-check` 判斷使用者狀態。
 - 預設不保存照片，判斷完成後只保留結果。
 - 將每次判斷結果寫入 `focus_log.jsonl`。
-- 結束 session 後產生 `focus_report.md`。
+- 結束 session 後產生 `focus_summary.json` 與 `focus_report.md`。
+- 報告會整合 to-do list：專注期間完成的待辦、剩餘待辦、鼓勵與下一步建議。
+- 可選擇用 Discord webhook 送出短摘要。
 - 結束時送 FRDM UART 回 `Normal`。
 
 目前狀態分類：
@@ -166,12 +184,15 @@ emotion_robot_controller/voice_stt_remote/windows_desktop_server_bundle/desktop_
 
 ```bash
 python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
-  --focus-interval-sec 180 \
+  --focus-interval-sec 60 \
   --focus-duration-min 0 \
-  --focus-server-url http://100.108.141.26:8766/focus-check
+  --focus-server-url http://100.108.141.26:8766/focus-check \
+  --focus-notify-mode discord \
+  --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL"
 ```
 
 `--focus-duration-min 0` 代表不自動結束，要再用語音指令「結束工作」或「停止專心」切回一般模式。
+結束後會產生 `focus_summary.json` 與 `focus_report.md`；若有設定 Discord webhook，會送出一則短摘要。
 
 ### Terminal 手動測試
 
@@ -239,6 +260,7 @@ Terminal 3 看 log/report：
 ```bash
 find /tmp/focus_voice_test -type f | sort
 tail -f /tmp/focus_voice_test/focus_*/focus_log.jsonl
+sed -n '1,220p' /tmp/focus_voice_test/focus_*/focus_summary.json
 sed -n '1,180p' /tmp/focus_voice_test/focus_*/focus_report.md
 ```
 
@@ -253,7 +275,7 @@ sed -n '1,180p' /tmp/focus_voice_test/focus_*/focus_report.md
 
 `focus_work_mode.py`：
 
-- `--interval-sec 180`：取樣間隔，預設 180 秒。
+- `--interval-sec 60`：取樣間隔，預設 60 秒。
 - `--duration-min 25`：自動結束時間，不填則直到手動停止。
 - `--once`：只取樣一次後產生報告。
 - `--mock-state phone`：不用相機/server，直接模擬狀態。
@@ -261,15 +283,22 @@ sed -n '1,180p' /tmp/focus_voice_test/focus_*/focus_report.md
 - `--no-uart`：完全不送 UART。
 - `--save-images`：debug 用，保存取樣照片。
 - `--log-root PATH`：指定 log/report 輸出資料夾。
+- `--todo-list-path PATH`：讀取 Wake Bridge to-do JSON，整合完成/剩餘待辦。
+- `--notify-mode none|discord`：結束後通知方式。
+- `--discord-webhook-url URL`：Discord webhook URL。
+- `--notify-dry-run`：印出通知內容但不送出。
 
 `wake_voice_chat_frdm_bridge.py`：
 
 - `--no-focus-mode`：關閉語音觸發 work mode。
 - `--focus-script PATH`：指定要啟動的 `focus_work_mode.py`。
 - `--focus-server-url URL`：指定 `/focus-check`。
-- `--focus-interval-sec 180`：work mode 取樣間隔。
+- `--focus-interval-sec 60`：work mode 取樣間隔。
 - `--focus-duration-min 0`：預設自動結束時間，0 表示手動結束。
 - `--focus-log-root PATH`：work mode log/report 輸出位置。
+- `--todo-list-path PATH`：傳給 focus script，用於報告整合 to-do。
+- `--focus-notify-mode none|discord`：focus 結束後通知方式。
+- `--focus-discord-webhook-url URL`：Discord webhook URL。
 - `--focus-save-images`：讓 focus script 保存照片，僅 debug 使用。
 
 ## 注意事項

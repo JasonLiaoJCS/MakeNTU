@@ -79,7 +79,8 @@ DEFAULT_MAX_IMAGE_BYTES = 2_000_000
 DEBUG_VERSION = 11
 
 CONTROL_PERSISTENT_STATES = {"normal", "sleep", "unchanged"}
-CONTROL_EMOTIONS = {"neutral", "happy", "curious", "excited", "confused", "concerned", "sleepy"}
+CONTROL_SCREEN_MODES = {"unchanged", "normal", "sleep", "music", "focus", "thinking"}
+CONTROL_EMOTIONS = {"neutral", "concerned", "angry", "sad", "happy", "curious", "excited", "confused", "sleepy"}
 CONTROL_HEAD_MOTIONS = {"none", "nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop"}
 FOCUS_STATES = {"focused", "away", "phone", "sleeping", "distracted", "uncertain", "error"}
 
@@ -87,12 +88,72 @@ EMOTIONS = sorted(CONTROL_EMOTIONS)
 
 EMOTION_TO_HEAD_MOTION = {
     "neutral": "none",
+    "concerned": "gentle_nod",
+    "angry": "shake",
+    "sad": "gentle_nod",
     "happy": "nod",
     "curious": "look_around",
     "excited": "double_nod",
     "confused": "shake",
-    "concerned": "gentle_nod",
     "sleepy": "sleepy_drop",
+}
+
+CONTROL_EMOTION_ALIASES = {
+    "calm": "neutral",
+    "normal": "neutral",
+    "中性": "neutral",
+    "joy": "happy",
+    "joyful": "happy",
+    "positive": "happy",
+    "開心": "happy",
+    "开心": "happy",
+    "interested": "curious",
+    "thinking": "curious",
+    "questioning": "curious",
+    "好奇": "curious",
+    "surprised": "excited",
+    "surprise": "excited",
+    "energetic": "excited",
+    "amazed": "excited",
+    "興奮": "excited",
+    "兴奋": "excited",
+    "unsure": "confused",
+    "uncertain": "confused",
+    "puzzled": "confused",
+    "confusing": "confused",
+    "困惑": "confused",
+    "angry": "angry",
+    "mad": "angry",
+    "furious": "angry",
+    "生氣": "angry",
+    "生气": "angry",
+    "火大": "angry",
+    "憤怒": "angry",
+    "愤怒": "angry",
+    "sad": "sad",
+    "down": "sad",
+    "depressed": "sad",
+    "難過": "sad",
+    "难过": "sad",
+    "沮喪": "sad",
+    "沮丧": "sad",
+    "anxious": "concerned",
+    "worried": "concerned",
+    "frustrated": "concerned",
+    "upset": "concerned",
+    "急": "concerned",
+    "急躁": "concerned",
+    "擔心": "concerned",
+    "担心": "concerned",
+    "焦慮": "concerned",
+    "焦虑": "concerned",
+    "tired": "sleepy",
+    "drowsy": "sleepy",
+    "sleep": "sleepy",
+    "asleep": "sleepy",
+    "睏": "sleepy",
+    "困": "sleepy",
+    "疲累": "sleepy",
 }
 
 SLEEP_INTENT_KEYWORDS = (
@@ -100,16 +161,26 @@ SLEEP_INTENT_KEYWORDS = (
     "去睡觉",
     "睡覺吧",
     "睡觉吧",
+    "睡一下",
+    "想睡",
+    "先睡",
     "休息一下",
+    "休眠",
+    "休息模式",
     "晚安",
     "進入睡眠模式",
     "进入睡眠模式",
     "安靜一下",
     "安静一下",
+    "安靜模式",
+    "安静模式",
     "不要吵我",
+    "先不要聽",
+    "先不要听",
     "sleep",
     "go to sleep",
     "standby",
+    "quiet mode",
 )
 
 WAKE_INTENT_KEYWORDS = (
@@ -118,28 +189,40 @@ WAKE_INTENT_KEYWORDS = (
     "醒来",
     "回來",
     "回来",
+    "回來了",
+    "回来了",
+    "回來工作",
+    "回来工作",
+    "繼續工作",
+    "继续工作",
+    "開始工作",
+    "开始工作",
     "回到正常",
+    "正常模式",
+    "一般模式",
     "不要睡了",
     "回來陪我",
     "回来陪我",
     "wake up",
     "come back",
     "normal",
+    "back to work",
     "don't sleep",
     "do not sleep",
 )
 
 SYSTEM_PROMPT = """
-你是桌上寵物機器人的自然聊天大腦。輸入是語音轉文字，可能有錯字、口頭禪或重複詞。
+你是桌上寵物機器人的自然聊天大腦。輸入是語音轉文字，可能有錯字、台式口語、半句話、重複詞或背景噪音。
 
 你必須只輸出一個 JSON object，不要 markdown，不要 code fence，不要額外文字。
 
 JSON schema:
 {
-  "reply": "自然語言回覆，給 TTS 播放。不可提到 JSON、UART、command、emotion、head_motion、persistent_state、MotorPitch、MotorYaw、內部理由。",
+  "reply": "自然語言回覆，給 TTS 播放。不可提到 JSON、UART、command、emotion、head_motion、persistent_state、screen_mode、MotorPitch、MotorYaw、內部理由。",
   "control": {
     "persistent_state": "normal | sleep | unchanged",
-    "emotion": "neutral | happy | curious | excited | confused | concerned | sleepy",
+    "screen_mode": "normal | sleep | music | focus | thinking | unchanged",
+    "emotion": "neutral | concerned | angry | sad | happy | curious | excited | confused | sleepy",
     "head_motion": "none | nod | double_nod | look_around | shake | gentle_nod | sleepy_drop",
     "reason": "簡短內部理由，不給使用者播放"
   }
@@ -148,31 +231,36 @@ JSON schema:
 reply 規則：
 - reply 必須像正常聊天一樣自然、親切、可愛、流暢。
 - reply 使用使用者同一種語言或口吻。
-- reply 控制在 1 到 3 句。
-- reply 不可以包含 JSON、欄位名稱、UART 指令或內部控制說明。
+- reply 控制在 1 到 3 句；能短就短，適合現場即時互動。
+- reply 不可以包含 JSON、欄位名稱、UART 指令、數字狀態碼或內部控制說明。
 
 control 規則：
-- 一般聊天 persistent_state="unchanged"。
-- 使用者叫你睡覺、休息、晚安、安靜、standby 時：persistent_state="sleep", emotion="sleepy", head_motion="sleepy_drop"。
-- 使用者叫你起床、醒來、回來、normal、come back 時：persistent_state="normal", emotion 可用 "happy" 或 "neutral", head_motion 可用 "nod" 或 "none"。
-- 問問題或要求辨識/分析時 emotion 通常是 "curious"。
+- 一般聊天：persistent_state="unchanged", screen_mode="unchanged"。
+- 使用者叫你睡覺、休息、晚安、安靜、standby，即使講得很口語：persistent_state="sleep", screen_mode="sleep", emotion="sleepy", head_motion="sleepy_drop"。
+- 使用者叫你起床、醒來、回來、回到正常、回來工作、normal、come back：persistent_state="normal", screen_mode="normal", emotion 可用 "happy" 或 "neutral", head_motion 可用 "nod" 或 "none"。
+- 使用者要求播放音樂、放歌、來點音樂、繼續音樂：screen_mode="music"；emotion 通常 "happy" 或 "excited"。
+- 使用者要求專注、專心、工作模式、番茄鐘：screen_mode="focus"；emotion 通常 "curious" 或 "happy"。
+- 使用者說停止專注、回來、回到一般、開始正常工作：screen_mode="normal"。
+- 問問題、分析、思考、辨識時 emotion 通常是 "curious"。
 - 稱讚、完成任務、愉快對話用 "happy"。
 - 高能量好消息或興奮情境用 "excited"。
 - 不確定、資訊模糊、看不清楚用 "confused"。
-- 使用者疲憊、沮喪、焦慮、需要關心時用 "concerned"。
+- 使用者憤怒或強烈髒話用 "angry"；使用者難過沮喪用 "sad"；焦慮擔心、需要關心時用 "concerned"。
+- 你不用輸出馬達角度；Jetson 會根據 emotion/head_motion 自動送 MotorPitch/MotorYaw。
 """.strip()
 
 VISION_SYSTEM_PROMPT = """
-你是桌上寵物機器人的自然聊天大腦，而且可以看使用者剛剛拍下的相機畫面。
+你是桌上寵物機器人的自然聊天大腦，而且可以看使用者剛剛拍下的相機畫面。輸入可能有語音辨識錯字或口語省略。
 
 你必須只輸出一個 JSON object，不要 markdown，不要 code fence，不要額外文字。
 
 JSON schema:
 {
-  "reply": "自然語言回覆，給 TTS 播放。不可提到 JSON、UART、command、emotion、head_motion、persistent_state、MotorPitch、MotorYaw、內部理由。",
+  "reply": "自然語言回覆，給 TTS 播放。不可提到 JSON、UART、command、emotion、head_motion、persistent_state、screen_mode、MotorPitch、MotorYaw、內部理由。",
   "control": {
     "persistent_state": "normal | sleep | unchanged",
-    "emotion": "neutral | happy | curious | excited | confused | concerned | sleepy",
+    "screen_mode": "normal | sleep | music | focus | thinking | unchanged",
+    "emotion": "neutral | concerned | angry | sad | happy | curious | excited | confused | sleepy",
     "head_motion": "none | nod | double_nod | look_around | shake | gentle_nod | sleepy_drop",
     "reason": "簡短內部理由，不給使用者播放"
   }
@@ -183,13 +271,14 @@ reply 規則：
 - 如果使用者問表情、手上拿什麼、桌上有什麼、螢幕上寫什麼，直接描述你能看出的內容。
 - 不要編造看不到的細節；不確定時自然說可能是什麼。
 - reply 使用使用者同一種語言或口吻，控制在 1 到 3 句。
-- reply 不可以包含 JSON、欄位名稱、UART 指令或內部控制說明。
+- reply 不可以包含 JSON、欄位名稱、UART 指令、數字狀態碼或內部控制說明。
 
 control 規則：
-- 視覺辨識、看物品、看桌面、看螢幕通常 emotion="curious", head_motion="look_around"。
+- 視覺辨識、看物品、看桌面、看螢幕通常 emotion="curious", head_motion="look_around", screen_mode="unchanged"。
 - 使用者問自己是否疲憊、表情是否不好、狀態是否低落時，若畫面合理可用 emotion="concerned", head_motion="gentle_nod"。
 - 看不清楚、無法判斷時 emotion="confused", head_motion="shake"。
-- 睡覺/起床意圖仍依照 persistent_state 規則處理。
+- 睡覺/起床/回來/音樂/專注意圖仍依照一般 prompt 的 persistent_state 與 screen_mode 規則處理。
+- 你不用輸出馬達角度；Jetson 會根據 emotion/head_motion 自動送 MotorPitch/MotorYaw。
 """.strip()
 
 FOCUS_SYSTEM_PROMPT = """
@@ -381,6 +470,14 @@ def has_any(text: str, words: list[str]) -> bool:
     return any(word in text for word in words)
 
 
+def normalize_control_emotion(value: Any, *, default: str = "neutral") -> str:
+    raw = str(value or "").strip().lower()
+    normalized = CONTROL_EMOTION_ALIASES.get(raw, raw)
+    if normalized in CONTROL_EMOTIONS:
+        return normalized
+    return default if default in CONTROL_EMOTIONS else "neutral"
+
+
 def normalize_vision_intent_text(text: str) -> str:
     text = str(text or "").lower().strip()
     return re.sub(r"[\s，。！？!?、,.：:；;「」『』\"'`]+", "", text)
@@ -444,6 +541,7 @@ def local_control(transcript: str, *, used_vision: bool = False, reason: str = "
     if state_intent == "sleep":
         return {
             "persistent_state": "sleep",
+            "screen_mode": "sleep",
             "emotion": "sleepy",
             "head_motion": "sleepy_drop",
             "reason": "sleep intent",
@@ -451,6 +549,7 @@ def local_control(transcript: str, *, used_vision: bool = False, reason: str = "
     if state_intent == "normal":
         return {
             "persistent_state": "normal",
+            "screen_mode": "normal",
             "emotion": "happy",
             "head_motion": "nod",
             "reason": "wake/normal intent",
@@ -463,6 +562,7 @@ def local_control(transcript: str, *, used_vision: bool = False, reason: str = "
         emotion = "curious"
     return {
         "persistent_state": "unchanged",
+        "screen_mode": "unchanged",
         "emotion": emotion,
         "head_motion": EMOTION_TO_HEAD_MOTION.get(emotion, "none"),
         "reason": reason,
@@ -477,8 +577,12 @@ def normalize_control(raw: Any, transcript: str, *, used_vision: bool = False) -
     if persistent_state not in CONTROL_PERSISTENT_STATES:
         persistent_state = fallback["persistent_state"]
 
-    emotion = str(source.get("emotion", fallback["emotion"])).strip().lower()
-    if emotion not in CONTROL_EMOTIONS:
+    screen_mode = str(source.get("screen_mode", fallback["screen_mode"])).strip().lower()
+    if screen_mode not in CONTROL_SCREEN_MODES:
+        screen_mode = fallback["screen_mode"]
+
+    emotion = normalize_control_emotion(source.get("emotion", fallback["emotion"]), default=fallback["emotion"])
+    if fallback["emotion"] in {"angry", "sad"} and emotion in {"neutral", "concerned"}:
         emotion = fallback["emotion"]
 
     head_motion = str(source.get("head_motion", "")).strip().lower()
@@ -490,19 +594,24 @@ def normalize_control(raw: Any, transcript: str, *, used_vision: bool = False) -
     state_intent = detect_persistent_state_intent(transcript)
     if state_intent == "sleep":
         persistent_state = "sleep"
+        screen_mode = "sleep"
         emotion = "sleepy"
         head_motion = "sleepy_drop"
         reason = "sleep intent"
     elif state_intent == "normal":
         persistent_state = "normal"
-        if emotion in {"sleepy", "concerned", "confused"}:
+        screen_mode = "normal"
+        if emotion in {"sleepy", "concerned", "angry", "sad", "confused"}:
             emotion = "happy"
         if head_motion in {"sleepy_drop", "shake"}:
             head_motion = "nod"
         reason = "wake/normal intent"
+    elif persistent_state in {"normal", "sleep"} and screen_mode == "unchanged":
+        screen_mode = persistent_state
 
     return {
         "persistent_state": persistent_state,
+        "screen_mode": screen_mode,
         "emotion": emotion,
         "head_motion": head_motion,
         "reason": reason,
@@ -511,17 +620,17 @@ def normalize_control(raw: Any, transcript: str, *, used_vision: bool = False) -
 
 def emotion_from_control(control: dict[str, str], transcript: str) -> dict[str, Any]:
     base = analyze_emotion_local(transcript)
-    primary = control.get("emotion", "neutral")
-    if primary not in CONTROL_EMOTIONS:
-        primary = "neutral"
+    primary = normalize_control_emotion(control.get("emotion", "neutral"), default=base.get("primary", "neutral"))
 
     presets = {
         "neutral": (0.25, 0.0, 0.25, False, "自然中性互動。"),
+        "concerned": (0.65, -0.35, 0.35, True, "使用者可能需要關心或溫和支持。"),
+        "angry": (0.90, -0.85, 0.90, False, "使用者明顯生氣或挫折。"),
+        "sad": (0.70, -0.65, 0.25, True, "使用者情緒低落或難過。"),
         "happy": (0.65, 0.65, 0.55, False, "使用者情境偏正向或回覆語氣愉快。"),
         "curious": (0.45, 0.10, 0.45, False, "正在回答問題或分析畫面，帶有好奇。"),
         "excited": (0.8, 0.75, 0.8, False, "情境能量較高，偏興奮。"),
         "confused": (0.55, -0.15, 0.45, False, "資訊不清楚或判斷不確定。"),
-        "concerned": (0.65, -0.35, 0.35, True, "使用者可能需要關心或溫和支持。"),
         "sleepy": (0.5, -0.05, 0.15, False, "使用者要求休息或睡眠模式。"),
     }
     intensity, valence, arousal, support_needed, summary = presets.get(primary, presets["neutral"])
@@ -544,6 +653,7 @@ def content_looks_internal(text: str) -> bool:
             '"reply"',
             '"control"',
             "persistent_state",
+            "screen_mode",
             "head_motion",
             "motorpitch",
             "motoryaw",
@@ -585,24 +695,30 @@ def analyze_emotion_local(transcript: str) -> dict[str, Any]:
     summary = "語氣接近中性，沒有明顯強烈情緒。"
 
     if has_any(text, ["操你媽", "操你妈", "幹你娘", "干你娘", "媽的", "妈的", "靠北", "靠邀", "fuck", "shit"]):
-        primary = "concerned"
+        primary = "angry"
         intensity = 0.9
         valence = -0.85
         arousal = 0.9
         summary = "使用者使用強烈髒話，情緒明顯偏憤怒或強烈挫折。"
     elif has_any(text, ["生氣", "生气", "很氣", "很气", "氣死", "气死", "火大", "憤怒", "愤怒"]):
-        primary = "concerned"
+        primary = "angry"
         intensity = 0.82
         valence = -0.75
         arousal = 0.82
         summary = "使用者明確表達生氣或火大，情緒偏高強度負向。"
     elif has_any(text, ["太慢", "很慢", "慢", "爛", "烂", "鳥", "鸟", "蠢", "笨", "智障", "不聰明", "不聪明", "聰明一點", "聪明一点", "不爽", "煩", "烦", "敷衍", "罐頭", "罐头", "迂迴", "迂回", "不夠親近", "不够亲近", "不像人", "像客服", "太官方"]):
-        primary = "concerned"
+        primary = "angry"
         intensity = 0.75
         valence = -0.55
         arousal = 0.7
         summary = "使用者明顯對速度或品質不滿，帶有挫折和急迫感。"
-    elif has_any(text, ["累", "撐不下", "撑不下", "疲", "睏", "困"]):
+    elif has_any(text, ["想睡", "好睏", "好困", "睏了", "困了", "睡意", "昏昏欲睡"]):
+        primary = "sleepy"
+        intensity = 0.62
+        valence = -0.1
+        arousal = 0.15
+        summary = "使用者語氣低能量或想睡，適合 sleepy 表情。"
+    elif has_any(text, ["累", "撐不下", "撑不下", "疲"]):
         primary = "concerned"
         intensity = 0.68
         valence = -0.45
@@ -622,12 +738,24 @@ def analyze_emotion_local(transcript: str) -> dict[str, Any]:
         valence = 0.65
         arousal = 0.55
         summary = "使用者情緒偏正向，可能感到開心或滿意。"
+    elif has_any(text, ["太酷", "酷", "哇", "wow", "期待", "衝了", "冲了", "太神", "太強", "太强", "興奮", "兴奋"]):
+        primary = "excited"
+        intensity = 0.78
+        valence = 0.72
+        arousal = 0.78
+        summary = "使用者語氣高能量且正向，適合 excited 表情。"
     elif has_any(text, ["為什麼", "为什么", "怎麼", "怎么", "看法", "覺得", "觉得"]):
         primary = "curious"
         intensity = 0.45
         valence = 0.05
         arousal = 0.4
         summary = "使用者在詢問或評估狀況，帶有好奇或思考。"
+    elif has_any(text, ["不懂", "看不懂", "聽不懂", "听不懂", "搞不懂", "怪怪", "奇怪", "不對", "不对", "錯了", "错了"]):
+        primary = "confused"
+        intensity = 0.55
+        valence = -0.15
+        arousal = 0.45
+        summary = "使用者表達不理解或覺得結果不對，適合 confused 表情。"
 
     return {
         "primary": primary,
@@ -947,6 +1075,7 @@ class FastChatEmotionEngine:
                     "reply_chars": len(reply),
                     "emotion_primary": emotion.get("primary"),
                     "persistent_state": control.get("persistent_state"),
+                    "screen_mode": control.get("screen_mode"),
                     "head_motion": control.get("head_motion"),
                 }
             )
@@ -1058,6 +1187,7 @@ class FastChatEmotionEngine:
                     "reply_chars": len(reply),
                     "emotion_primary": emotion.get("primary"),
                     "persistent_state": control.get("persistent_state"),
+                    "screen_mode": control.get("screen_mode"),
                     "head_motion": control.get("head_motion"),
                 }
             )
@@ -1254,8 +1384,8 @@ def normalize_emotion(raw: Any, transcript: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return fallback
 
-    primary = str(raw.get("primary", fallback["primary"])).strip().lower()
-    if primary not in EMOTIONS:
+    primary = normalize_control_emotion(raw.get("primary", fallback["primary"]), default=fallback["primary"])
+    if fallback["primary"] in {"angry", "sad"} and primary in {"neutral", "concerned"}:
         primary = fallback["primary"]
 
     return {
@@ -1442,6 +1572,56 @@ def run_self_test() -> int:
             raise AssertionError(f"reply leaked internal content for {transcript!r}: {reply!r} status={status}")
         if control["persistent_state"] != state or control["emotion"] != emotion:
             raise AssertionError(f"bad control for {transcript!r}: {control}")
+
+    expected_head_motions = {
+        "neutral": "none",
+        "concerned": "gentle_nod",
+        "angry": "shake",
+        "sad": "gentle_nod",
+        "happy": "nod",
+        "curious": "look_around",
+        "excited": "double_nod",
+        "confused": "shake",
+        "sleepy": "sleepy_drop",
+    }
+    for emotion, head_motion in expected_head_motions.items():
+        control = normalize_control({"emotion": emotion}, "測試情緒")
+        if control["emotion"] != emotion or control["head_motion"] != head_motion:
+            raise AssertionError(f"bad emotion/head motion mapping for {emotion}: {control}")
+        summary = emotion_from_control(control, "測試情緒")
+        if summary["primary"] != emotion:
+            raise AssertionError(f"bad emotion summary for {emotion}: {summary}")
+
+    alias_cases = {
+        "surprised": "excited",
+        "sad": "sad",
+    "down": "sad",
+    "depressed": "sad",
+    "難過": "sad",
+    "难过": "sad",
+    "沮喪": "sad",
+    "沮丧": "sad",
+        "anxious": "concerned",
+        "tired": "sleepy",
+        "unsure": "confused",
+    }
+    for raw_emotion, expected_emotion in alias_cases.items():
+        control = normalize_control({"emotion": raw_emotion}, "測試情緒")
+        if control["emotion"] != expected_emotion:
+            raise AssertionError(f"bad emotion alias for {raw_emotion}: {control}")
+
+    local_emotion_cases = {
+        "太酷了我超期待": "excited",
+        "這個結果怪怪的我看不懂": "confused",
+        "我好睏想睡": "sleepy",
+        "我有點擔心": "concerned",
+        "為什麼會這樣": "curious",
+        "太好了很棒": "happy",
+    }
+    for transcript, expected_emotion in local_emotion_cases.items():
+        local = analyze_emotion_local(transcript)
+        if local["primary"] != expected_emotion:
+            raise AssertionError(f"bad local emotion for {transcript!r}: {local}")
 
     unavailable = prefix_vision_unavailable(
         {"reply": "我先照你說的回答。", "control": {"persistent_state": "unchanged", "emotion": "curious"}},

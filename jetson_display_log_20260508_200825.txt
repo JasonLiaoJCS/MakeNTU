@@ -1,0 +1,34 @@
+Jetson display diagnosis log
+Log file: jetson_display_log_20260508_200825.txt
+
+==== Date And Time ====
+Fri May  8 08:08:25 PM CST 2026
+
+==== Environment ====
+Original DISPLAY=
+Effective DISPLAY=:0
+Effective XAUTHORITY=/home/asrlab-yian/.Xauthority
+
+==== xrandr --query ====
+Authorization required, but no authorization protocol specified
+Can't open display :0
+
+==== Connected Outputs ====
+Could not detect connected outputs because xrandr failed with status 1.
+
+==== Preferred Output ====
+Preferred output: none
+
+==== Supported Modes For Preferred Output ====
+No preferred output was found, so no mode list can be shown.
+
+==== DRM Connector Status ====
+/sys/class/drm/card1-DP-1/status: disconnected
+
+==== DPMS And Screen Saver Status ====
+Authorization required, but no authorization protocol specified
+xset:  unable to open display ":0"
+xset q failed. DISPLAY may be wrong or the X session may not be available.
+
+==== Display Connection Summary ====
+Display connection could not be determined because xrandr did not run successfully.

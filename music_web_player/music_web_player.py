@@ -87,7 +87,7 @@ RESUME_PATTERNS = (
 
 CN_PLAY_PATTERNS = (
     r"(?:請|请|麻煩你|麻烦你|可以)?(?:幫我|帮我)?(?:播放|播一下|播|波一下|波|放一下|放|放首|放一首)\s*(?P<query>.+)",
-    r"(?:我想要聽|我想要听|想要聽|想要听|我想聽|我想听|想聽|想听|我要聽|我要听|聽一下|听一下|聽|听)\s*(?P<query>.+)",
+    r"(?:我想要聽|我想要听|想要聽|想要听|我想聽|我想听|想聽|想听|我要聽|我要听|聽一下|听一下)\s*(?P<query>.+)",
     r"(?:換成|换成|換一首|换一首|改播|切到|換歌成|换歌成)\s*(?P<query>.+)",
     r"(?:來一首|来一首|放點|放点)\s*(?P<query>.*)",
 )
@@ -120,6 +120,44 @@ TRAILING_FILLERS = (
     "謝謝",
     "谢谢",
     "please",
+)
+
+AUDIO_COMPLAINT_WORDS = (
+    "沒聲音",
+    "没声音",
+    "沒有聲音",
+    "没有声音",
+    "聲音太小",
+    "声音太小",
+    "聲音很小",
+    "声音很小",
+    "聲音超小",
+    "声音超小",
+    "小聲",
+    "小声",
+    "音量",
+    "聽不到",
+    "听不到",
+    "聽到聲音",
+    "听到声音",
+)
+
+EXPLICIT_MUSIC_REQUEST_WORDS = (
+    "播放音樂",
+    "播放音乐",
+    "播放歌曲",
+    "播音樂",
+    "播音乐",
+    "播歌",
+    "放音樂",
+    "放音乐",
+    "放歌",
+    "聽歌",
+    "听歌",
+    "點歌",
+    "点歌",
+    "play music",
+    "play song",
 )
 
 WEATHER_KEYWORDS = (
@@ -298,6 +336,13 @@ def clean_query(query: str) -> str:
     return value
 
 
+def looks_like_audio_complaint(text: str) -> bool:
+    lowered = text.lower()
+    if any(word in lowered for word in EXPLICIT_MUSIC_REQUEST_WORDS):
+        return False
+    return any(word in lowered for word in AUDIO_COMPLAINT_WORDS)
+
+
 def detect_music_intent(text: str | None) -> MusicIntent:
     normalized = strip_wake_words(text or "")
     lowered = normalized.lower()
@@ -315,6 +360,9 @@ def detect_music_intent(text: str | None) -> MusicIntent:
     for pattern in RESUME_PATTERNS:
         if re.search(pattern, lowered, flags=re.IGNORECASE):
             return MusicIntent(True, action="resume", reason=f"resume:{pattern}", normalized_text=normalized)
+
+    if looks_like_audio_complaint(normalized):
+        return MusicIntent(False, reason="audio_complaint_not_music", normalized_text=normalized)
 
     for pattern in CN_PLAY_PATTERNS + EN_PLAY_PATTERNS:
         match = re.search(pattern, normalized, flags=re.IGNORECASE)
@@ -1172,6 +1220,7 @@ def run_self_test() -> int:
     cases = [
         ("Hey Jarvis 幫我播放周杰倫 稻香", True, "play", "周杰倫 稻香"),
         ("我想聽告白氣球這首歌", True, "play", "告白氣球"),
+        ("我想聽歌", True, "play", "music"),
         ("我想要听《告白气球》。", True, "play", "告白气球"),
         ("幫我波 稻香", True, "play", "稻香"),
         ("換成 七里香", True, "play", "七里香"),
@@ -1181,6 +1230,8 @@ def run_self_test() -> int:
         ("繼續播放音樂", True, "resume", ""),
         ("resume music", True, "resume", ""),
         ("今天幾號", False, "none", ""),
+        ("為什麼沒聲音，因為我聽到聲音超小", False, "none", ""),
+        ("我聽到聲音超小，幫我調大音量", False, "none", ""),
     ]
     for text, expected_intent, expected_action, expected_query in cases:
         intent = detect_music_intent(text)

@@ -21,6 +21,7 @@ class TTSJob:
     noise_scale: float | None = None
     noise_w: float | None = None
     stream: bool | None = None
+    volume_gain: float | None = None
     voice: str | None = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     created_at: float = field(default_factory=time.time)
@@ -49,6 +50,7 @@ class TTSQueueWorker:
         noise_scale: float | None = None,
         noise_w: float | None = None,
         stream: bool | None = None,
+        volume_gain: float | None = None,
         voice: str | None = None,
     ) -> TTSJob:
         if interrupt:
@@ -63,6 +65,7 @@ class TTSQueueWorker:
             noise_scale=noise_scale,
             noise_w=noise_w,
             stream=stream,
+            volume_gain=volume_gain,
             voice=voice,
         )
         self._queue.put((-priority, next(self._counter), job))
@@ -88,6 +91,7 @@ class TTSQueueWorker:
                     noise_scale=job.noise_scale,
                     noise_w=job.noise_w,
                     stream=job.stream,
+                    volume_gain=job.volume_gain,
                 )
                 with self._lock:
                     self._last_result = {"job_id": job.id, **result}
