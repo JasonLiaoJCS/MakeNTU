@@ -620,6 +620,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-duration-min 0 \
   --focus-log-root /tmp/focus_voice_test \
   --focus-alert-threshold 2 \
+  --focus-alert-cooldown-sec 90 \
   --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
   --focus-notify-mode discord \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
@@ -698,7 +699,9 @@ speech end/silence <= 13000
 
 Focus Work Mode 指令也會自動結束 conversation mode，避免進入工作模式後還一直收 follow-up。開始後會立刻拍第一張工作狀態照片，之後每 `--focus-interval-sec 60` 秒取樣一次；照片預設只存在記憶體，判斷完就丟掉。`--focus-duration-min 0` 代表不自動結束，要再說「結束工作 / 停止專心 / 下班」才會停。
 
-Wake Bridge 啟動 focus mode 時，FRDM 畫面順序是 `Speaking <emotion>` 回覆你，TTS/頭部動作結束後一定送 `Focus 0 0`。背景的 `focus_work_mode.py` 只送 `Focus active/focused/idle` dashboard raw data，不會在 active 期間搶送 `Thinking` 或其他螢幕狀態；如果是設定分鐘數自動結束，子程序最後仍會送 `Normal 0 0`。
+Wake Bridge 啟動 focus mode 時，FRDM 畫面順序必須是 `Speaking <emotion>` 回覆你，TTS/頭部動作結束後才送 `Focus 0 0`。背景的 `focus_work_mode.py` 會被 UART gate 擋住，在 Speaking 期間完全不送 `Focus active/focused/idle` 或 `Thinking`；Wake Bridge 送完 `Focus 0 0` 後才打開 gate，讓背景程序繼續同步 `Focus ...` dashboard raw data。如果是設定分鐘數自動結束，子程序最後仍會送 `Normal 0 0`。
+
+Focus 取樣判斷為 `focused` 時，背景程序會保持安靜，不再重送 `Focus focused,...`，倒數也會照原本時間繼續。若連續達到 `--focus-alert-threshold 2` 次判斷為 `distracted / phone / away / sleeping`，背景程序會送 `Speaking 2`、用 TTS 嚴厲提醒回到工作、跑一段 `MotorYawPitch` 警告動作，然後回到 `Focus <state>,<remaining>,<streak>`；有設定自動結束時間時，倒數會從該次分心重新計時。預設兩次 spoken alert 至少間隔 `--focus-alert-cooldown-sec 90` 秒，避免每張照片都罵一次；倒數重設仍會照 confirmed distraction 執行。
 
 Focus 結束時會寫 `focus_summary.json` 和 `focus_report.md`，內容會整合專注時間、分心時間、專注分數、建議，以及這段期間完成/剩下的 To-Do。報告標題會使用「專心報告：YYYY/MM/DD/HH 開始的專注時段」，同時寫進 `focus_summary.json` 的 `report_title`，Discord 第一行也會使用同一個標題。若有設定 `DISCORD_WEBHOOK_URL`，會透過 Discord webhook 送一則短摘要；沒設 webhook 時只會留下檔案。
 
@@ -711,7 +714,7 @@ To-Do List 是本機 JSON 功能，不需要 Terminal 4 或 Windows server 額�
 Terminal 3 看到這些就可以開始說 `Hey Jarvis`：
 
 ```text
-Client version: wake_voice_chat_frdm_bridge_vision_conversation_motor_natural_v5
+Client version: wake_voice_chat_frdm_bridge_vision_conversation_motor_natural_v6
 Server health: debug_version=13, chat_ready=True, asr_loaded=True
 TTS health: ready=True
 Selected input device ... by keyword 'UACDemo'
@@ -1151,6 +1154,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-duration-min 0 \
   --focus-log-root /tmp/focus_voice_test \
   --focus-alert-threshold 2 \
+  --focus-alert-cooldown-sec 90 \
   --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
   --focus-notify-mode discord \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \

@@ -36,6 +36,7 @@ DEFAULT_FOCUS_URL = os.getenv("FOCUS_SERVER_URL", "http://100.108.141.26:8766/fo
 DEFAULT_LOG_ROOT = THIS_DIR / "logs" / "focus_sessions"
 DEFAULT_TODO_LIST_PATH = THIS_DIR / "logs" / "todo_list.json"
 DEFAULT_INTERVAL_SEC = 60.0
+DEFAULT_TTS_URL = os.getenv("FOCUS_ALERT_TTS_URL", os.getenv("FOCUS_TTS_URL", "http://127.0.0.1:8777/speak_async"))
 DEFAULT_DISCORD_WEBHOOK_FILE = Path(os.getenv("DISCORD_WEBHOOK_FILE", "~/.config/makentu/discord_webhook_url")).expanduser()
 DISCORD_USER_AGENT = "DiscordBot (https://github.com/asrlab-yian/MakeNTU, 0.1)"
 UART_PREFERRED_KEYWORDS = (
@@ -49,6 +50,7 @@ UART_PREFERRED_KEYWORDS = (
     "mbed",
 )
 FOCUS_STATES = {"focused", "away", "phone", "sleeping", "distracted", "uncertain", "error"}
+DISTRACTION_STATES = {"away", "phone", "sleeping", "distracted"}
 STATE_UART_COMMANDS = {
     "focused": "Thinking",
     "away": "Sleep",
@@ -137,6 +139,82 @@ def normalize_focus_url(raw_url: str) -> str:
         path = path.rsplit("/", 1)[0]
     path = path.rstrip("/") + "/focus-check"
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
+def normalize_tts_url(raw_url: str) -> str:
+    raw_url = str(raw_url or "").strip() or DEFAULT_TTS_URL
+    parsed = urllib.parse.urlsplit(raw_url)
+    if not parsed.scheme or not parsed.netloc:
+        return raw_url
+    path = parsed.path.rstrip("/")
+    if path in {"", "/"}:
+        path = "/speak_async"
+    elif path == "/speak":
+        path = "/speak_async"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def tts_base_url(tts_url: str) -> str:
+    parsed = urllib.parse.urlsplit(tts_url)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def tts_queue_url(tts_url: str) -> str:
+    return urllib.parse.urljoin(tts_base_url(tts_url) + "/", "queue")
+
+
+def post_json(url: str, payload: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request_obj = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request_obj, timeout=timeout_sec) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {short_text(raw, 500)}") from exc
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"POST {url} did not return a JSON object")
+    return parsed
+
+
+def get_json(url: str, timeout_sec: float) -> dict[str, Any]:
+    request_obj = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request_obj, timeout=timeout_sec) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {short_text(raw, 500)}") from exc
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"GET {url} did not return a JSON object")
+    return parsed
+
+
+def estimate_tts_seconds(text: str) -> float:
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    english_words = len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
+    other_chars = max(0, len(text.strip()) - cjk_chars)
+    estimate = cjk_chars / 4.5 + english_words / 2.6 + other_chars / 18.0 + 0.5
+    return max(1.2, min(16.0, estimate))
+
+
+def build_focus_alert_message(state: str, task: str = "") -> str:
+    task_hint = f"你的任務是「{short_text(task, 36)}」。" if str(task or "").strip() else ""
+    messages = {
+        "phone": "現在不是滑手機的時間。立刻把手機放下，視線回到工作，這一輪我重新計時。",
+        "away": "人都離開座位了，這不算專注。立刻回來坐好，從現在重新開始計時。",
+        "sleeping": "不要在專注模式睡著。坐好、醒一醒，回到工作，這一輪重新計時。",
+        "distracted": "你已經分心了。不要東摸西看，眼睛回到任務，手回到鍵盤滑鼠，現在重新計時。",
+    }
+    message = messages.get(state, "你現在沒有在專心。立刻回到工作，這一輪重新計時。")
+    return f"{message}{task_hint}"
 
 
 def parse_camera_id(raw: str) -> str | int:
@@ -954,6 +1032,12 @@ class FocusSession:
         self.streak_state = ""
         self.streak_count = 0
         self.deadline_monotonic: float | None = None
+        self.duration_sec: float | None = None
+        self.timer_started_at: datetime | None = None
+        self.timer_reset_count = 0
+        self.last_timer_reset_at = ""
+        self.last_alert_monotonic = 0.0
+        self.uart_gate_file = Path(str(args.uart_gate_file)).expanduser() if str(getattr(args, "uart_gate_file", "") or "").strip() else None
         self.camera = OneShotCamera(
             camera_id=parse_camera_id(args.camera_id),
             width=args.camera_width,
@@ -993,6 +1077,8 @@ class FocusSession:
                     "todo_list_path": str(self.todo_list_path),
                     "todo_open_count_at_start": len([item for item in start_todos if item.get("status") == "open"]),
                     "notify_mode": self.args.notify_mode,
+                    "focused_sample_uart": "silent",
+                    "distraction_policy": "alert and reset timer after alert_threshold consecutive distracted samples",
                     "privacy": "images are memory-only unless --save-images is set",
                 },
                 ensure_ascii=False,
@@ -1015,25 +1101,24 @@ class FocusSession:
             print("Type q + Enter to end the session.")
 
         self._send_uart("Thinking", reason="focus session start", force=True)
-        deadline = (
-            time.monotonic() + max(0.0, float(self.args.duration_min)) * 60.0
-            if self.args.duration_min is not None
-            else None
+        self.duration_sec = (
+            max(0.0, float(self.args.duration_min)) * 60.0 if self.args.duration_min is not None else None
         )
-        self.deadline_monotonic = deadline
+        self.timer_started_at = started_at
+        self.deadline_monotonic = time.monotonic() + self.duration_sec if self.duration_sec is not None else None
         self._send_focus_dashboard("active", streak=0, reason="focus session start")
 
         sample_index = 0
         try:
             while not self.stop_requested:
-                if deadline is not None and time.monotonic() >= deadline:
+                if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
                     print("Duration reached; ending focus session.")
                     break
                 sample_index += 1
                 self._run_sample(sample_index, focus_url)
                 if self.args.once:
                     break
-                if not self._sleep_until_next_sample(deadline):
+                if not self._sleep_until_next_sample():
                     break
         finally:
             ended_at = now_local()
@@ -1053,6 +1138,11 @@ class FocusSession:
                 todo_list_path=self.todo_list_path,
             )
             summary["summary_file"] = str(self.summary_file)
+            summary["timer_reset_count"] = self.timer_reset_count
+            summary["last_timer_reset_at"] = self.last_timer_reset_at
+            summary["effective_timer_started_at"] = (
+                self.timer_started_at.isoformat(timespec="seconds") if self.timer_started_at is not None else ""
+            )
             self.summary_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             report = build_report(summary=summary, entries=self.entries)
             self.report_file.write_text(report, encoding="utf-8")
@@ -1150,31 +1240,162 @@ class FocusSession:
             f"confidence={entry['confidence']:.2f} attention={entry['attention_score']:.2f} "
             f"{entry['summary']}"
         )
-        self._maybe_update_uart(str(entry["state"]))
+        self._maybe_update_uart(entry)
 
-    def _maybe_update_uart(self, state: str) -> None:
+    def _maybe_update_uart(self, entry: dict[str, Any]) -> None:
+        state = str(entry.get("state", "uncertain") or "uncertain")
         if state == self.streak_state:
             self.streak_count += 1
         else:
             self.streak_state = state
             self.streak_count = 1
 
-        self._send_focus_dashboard(state, streak=self.streak_count, reason=f"{state} dashboard")
-
         if state == "focused":
-            self._send_uart("Thinking", reason="focused")
+            print(f"Focus sample is focused; keeping timer running and sending no UART update (streak={self.streak_count}).")
             return
+
+        if state not in DISTRACTION_STATES:
+            print(f"Focus sample is {state}; no distraction alert, no timer reset.")
+            return
+
         if self.streak_count < self.args.alert_threshold:
+            print(
+                f"Focus distraction candidate: {state} streak={self.streak_count}/"
+                f"{self.args.alert_threshold}; waiting for confirmation."
+            )
             return
-        self._send_uart(STATE_UART_COMMANDS.get(state, "Confused"), reason=f"{state} streak={self.streak_count}")
+
+        self._reset_focus_timer(reason=f"{state} streak={self.streak_count}")
+        entry["timer_reset"] = True
+        entry["timer_reset_count"] = self.timer_reset_count
+        entry["effective_timer_started_at"] = (
+            self.timer_started_at.isoformat(timespec="seconds") if self.timer_started_at is not None else ""
+        )
+        self._maybe_send_distraction_alert(state)
+        self._send_focus_dashboard(state, streak=self.streak_count, reason=f"{state} confirmed distraction")
+
+    def _reset_focus_timer(self, *, reason: str) -> None:
+        self.timer_reset_count += 1
+        self.timer_started_at = now_local()
+        self.last_timer_reset_at = self.timer_started_at.isoformat(timespec="seconds")
+        if self.duration_sec is not None:
+            self.deadline_monotonic = time.monotonic() + self.duration_sec
+            print(
+                f"Focus timer reset ({reason}); remaining reset to "
+                f"{int((self.duration_sec + 59.0) // 60.0)} min."
+            )
+        else:
+            print(f"Focus timer reset marker recorded ({reason}); this session has no auto-stop duration.")
+
+    def _maybe_send_distraction_alert(self, state: str) -> None:
+        cooldown = max(0.0, float(getattr(self.args, "alert_cooldown_sec", 0.0) or 0.0))
+        elapsed = time.monotonic() - self.last_alert_monotonic if self.last_alert_monotonic else cooldown
+        if self.last_alert_monotonic and elapsed < cooldown:
+            print(f"Focus alert suppressed by cooldown: {elapsed:.1f}s/{cooldown:.1f}s.")
+            return
+
+        self.last_alert_monotonic = time.monotonic()
+        message = build_focus_alert_message(state, self.args.task)
+        print(f"Focus distraction alert: {message}")
+        self._send_raw_uart_line("Speaking 2", reason=f"focus distraction alert {state}")
+        tts_started, job_id = self._speak_focus_alert(message)
+        self._send_focus_alert_motion(state)
+        if tts_started:
+            self._wait_for_focus_alert_tts(job_id, message)
+
+    def _speak_focus_alert(self, message: str) -> tuple[bool, str]:
+        if getattr(self.args, "no_alert_tts", False):
+            print("Focus alert TTS skipped by --no-alert-tts.")
+            return False, ""
+        payload: dict[str, Any] = {
+            "text": message,
+            "interrupt": not bool(getattr(self.args, "alert_tts_no_interrupt", False)),
+            "volume_gain": float(getattr(self.args, "alert_volume_gain", 2.25) or 2.25),
+        }
+        try:
+            result = post_json(
+                self.args.alert_tts_url,
+                payload,
+                timeout_sec=max(0.1, float(getattr(self.args, "alert_tts_timeout", 5.0) or 5.0)),
+            )
+        except Exception as exc:
+            print(f"WARNING: focus alert TTS failed: {exc}")
+            return False, ""
+        job_id = str(result.get("job_id", "") or "")
+        print(f"Focus alert TTS queued: job_id={job_id or '(none)'}")
+        return True, job_id
+
+    def _wait_for_focus_alert_tts(self, job_id: str, message: str) -> None:
+        timeout_sec = max(0.1, float(getattr(self.args, "alert_tts_wait_timeout", 16.0) or 16.0))
+        if not job_id:
+            time.sleep(min(timeout_sec, estimate_tts_seconds(message)))
+            return
+
+        queue_url = tts_queue_url(self.args.alert_tts_url)
+        deadline = time.monotonic() + timeout_sec
+        poll_interval = max(0.1, min(float(getattr(self.args, "alert_tts_poll_interval", 0.5) or 0.5), 2.0))
+        saw_current_job = False
+        while time.monotonic() < deadline:
+            try:
+                status = get_json(queue_url, timeout_sec=min(float(getattr(self.args, "alert_tts_timeout", 5.0)), 2.0))
+            except Exception:
+                time.sleep(poll_interval)
+                continue
+            last_result = status.get("last_result") if isinstance(status.get("last_result"), dict) else {}
+            if last_result.get("job_id") == job_id:
+                print(f"Focus alert TTS finished: job_id={job_id}")
+                return
+            current = status.get("current") if isinstance(status.get("current"), dict) else {}
+            if current.get("id") == job_id:
+                saw_current_job = True
+            last_error = str(status.get("last_error", "") or "").strip()
+            if last_error and saw_current_job and not status.get("running"):
+                print(f"WARNING: focus alert TTS worker error for job_id={job_id}: {last_error}")
+                return
+            time.sleep(poll_interval)
+        print(f"WARNING: focus alert TTS wait timed out after {timeout_sec:.1f}s for job_id={job_id}.")
+
+    def _send_focus_alert_motion(self, state: str) -> None:
+        if getattr(self.args, "no_alert_motion", False):
+            return
+        if state == "sleeping":
+            sequence = [
+                ("MotorYawPitch 90 65", 0.22),
+                ("MotorYawPitch 72 88", 0.18),
+                ("MotorYawPitch 108 88", 0.18),
+                ("MotorYawPitch 90 90", 0.18),
+            ]
+        else:
+            sequence = [
+                ("MotorYawPitch 72 82", 0.16),
+                ("MotorYawPitch 108 82", 0.16),
+                ("MotorYawPitch 60 94", 0.15),
+                ("MotorYawPitch 120 94", 0.15),
+                ("MotorYawPitch 90 74", 0.22),
+                ("MotorYawPitch 90 90", 0.18),
+            ]
+        for line, delay in sequence:
+            self._send_raw_uart_line(line, reason=f"focus alert motion {state}")
+            time.sleep(max(0.0, delay))
+
+    def _send_raw_uart_line(self, line: str, *, reason: str) -> None:
+        if not self._uart_gate_open():
+            return
+        self.uart.send_raw_line(line, reason=reason)
 
     def _send_uart(self, command: str, *, reason: str, force: bool = False) -> None:
+        if not self._uart_gate_open():
+            return
         if getattr(self.args, "no_active_screen_uart", False) and str(command or "").strip() != "Normal":
             return
         if not force and command == self.last_uart_command:
             return
         if self.uart.send(command, reason=reason):
             self.last_uart_command = command
+
+    def _uart_gate_open(self) -> bool:
+        gate_file = self.uart_gate_file
+        return gate_file is None or gate_file.exists()
 
     def _remaining_minutes(self) -> int:
         deadline = self.deadline_monotonic
@@ -1191,6 +1412,8 @@ class FocusSession:
         streak: int = 0,
         reason: str,
     ) -> None:
+        if not self._uart_gate_open():
+            return
         normalized = str(state or "idle").strip().lower()
         if normalized not in FOCUS_STATES and normalized not in {"active", "idle"}:
             normalized = "uncertain"
@@ -1198,11 +1421,11 @@ class FocusSession:
         streak_count = max(0, int(streak))
         self.uart.send_raw_line(f"Focus {normalized},{remaining},{streak_count}", reason=reason)
 
-    def _sleep_until_next_sample(self, deadline: float | None) -> bool:
+    def _sleep_until_next_sample(self) -> bool:
         wait_sec = max(0.0, float(self.args.interval_sec))
         end_at = time.monotonic() + wait_sec
         while not self.stop_requested and time.monotonic() < end_at:
-            if deadline is not None and time.monotonic() >= deadline:
+            if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
                 return False
             if stdin_requested_stop():
                 print("Stop command received from terminal.")
@@ -1252,7 +1475,7 @@ def run_self_test() -> int:
         task="test task",
         started_at=started,
         ended_at=ended,
-        interval_sec=60,
+        interval_sec=20,
         entries=entries,
         log_file=Path("/tmp/focus_self_test.jsonl"),
         report_file=Path("/tmp/focus_self_test.md"),
@@ -1270,6 +1493,10 @@ def run_self_test() -> int:
         raise AssertionError("discord summary message failed")
     if not normalize_focus_url("http://host:8766").endswith("/focus-check"):
         raise AssertionError("focus URL normalization failed")
+    if not normalize_tts_url("http://127.0.0.1:8777/speak").endswith("/speak_async"):
+        raise AssertionError("TTS URL normalization failed")
+    if "重新計時" not in build_focus_alert_message("phone", "整理 demo 指令"):
+        raise AssertionError("focus alert message generation failed")
     print("focus_work_mode self-test OK")
     return 0
 
@@ -1310,6 +1537,7 @@ def build_parser() -> argparse.ArgumentParser:
     uart.add_argument("--uart-baudrate", type=int, default=int(os.getenv("FOCUS_UART_BAUDRATE", "115200")))
     uart.add_argument("--uart-timeout", type=float, default=float(os.getenv("FOCUS_UART_TIMEOUT", "0.08")))
     uart.add_argument("--uart-line-ending", choices=["lf", "crlf"], default=os.getenv("FOCUS_UART_LINE_ENDING", "crlf"))
+    uart.add_argument("--uart-gate-file", default=os.getenv("FOCUS_UART_GATE_FILE", ""), help="If set, send no UART until this file exists.")
     uart.add_argument(
         "--no-active-screen-uart",
         action="store_true",
@@ -1321,7 +1549,23 @@ def build_parser() -> argparse.ArgumentParser:
         dest="no_active_screen_uart",
         help="Compatibility alias for --no-active-screen-uart.",
     )
-    uart.add_argument("--alert-threshold", type=int, default=int(os.getenv("FOCUS_ALERT_THRESHOLD", "2")), help="Non-focused streak before changing robot state.")
+    uart.add_argument(
+        "--alert-threshold",
+        type=int,
+        default=int(os.getenv("FOCUS_ALERT_THRESHOLD", "2")),
+        help="Consecutive distracted samples before scolding and resetting the focus timer.",
+    )
+
+    alert = parser.add_argument_group("focus distraction alert")
+    alert.add_argument("--no-alert-tts", action="store_true", help="Do not speak the distraction warning.")
+    alert.add_argument("--no-alert-motion", action="store_true", help="Do not send MotorYawPitch distraction motions.")
+    alert.add_argument("--alert-tts-url", default=DEFAULT_TTS_URL, help="Jetson Piper TTS /speak_async endpoint for distraction warnings.")
+    alert.add_argument("--alert-tts-timeout", type=float, default=float(os.getenv("FOCUS_ALERT_TTS_TIMEOUT", "5.0")))
+    alert.add_argument("--alert-tts-wait-timeout", type=float, default=float(os.getenv("FOCUS_ALERT_TTS_WAIT_TIMEOUT", "16.0")))
+    alert.add_argument("--alert-tts-poll-interval", type=float, default=float(os.getenv("FOCUS_ALERT_TTS_POLL_INTERVAL", "0.5")))
+    alert.add_argument("--alert-tts-no-interrupt", action="store_true", help="Queue focus warnings instead of interrupting current TTS.")
+    alert.add_argument("--alert-volume-gain", type=float, default=float(os.getenv("FOCUS_ALERT_VOLUME_GAIN", "2.25")))
+    alert.add_argument("--alert-cooldown-sec", type=float, default=float(os.getenv("FOCUS_ALERT_COOLDOWN_SEC", "90.0")), help="Minimum seconds between spoken distraction warnings. The timer still resets on confirmed distraction.")
 
     parser.add_argument("--self-test", action="store_true", help="Run local parser/report tests and exit.")
     return parser
@@ -1336,6 +1580,17 @@ def main() -> int:
         parser.error("--interval-sec must be > 0")
     if args.alert_threshold < 1:
         parser.error("--alert-threshold must be >= 1")
+    if args.alert_cooldown_sec < 0:
+        parser.error("--alert-cooldown-sec must be >= 0")
+    if args.alert_tts_timeout <= 0:
+        parser.error("--alert-tts-timeout must be > 0")
+    if args.alert_tts_wait_timeout <= 0:
+        parser.error("--alert-tts-wait-timeout must be > 0")
+    if args.alert_tts_poll_interval <= 0:
+        parser.error("--alert-tts-poll-interval must be > 0")
+    if args.alert_volume_gain <= 0:
+        parser.error("--alert-volume-gain must be > 0")
+    args.alert_tts_url = normalize_tts_url(args.alert_tts_url)
 
     session = FocusSession(args)
     signal.signal(signal.SIGINT, session.request_stop)

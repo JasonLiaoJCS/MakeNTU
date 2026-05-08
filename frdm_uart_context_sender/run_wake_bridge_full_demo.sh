@@ -50,6 +50,7 @@ cmd=(
   --focus-duration-min 0
   --focus-log-root /tmp/focus_voice_test
   --focus-alert-threshold 2
+  --focus-alert-cooldown-sec 90
   --todo-list-path "$ROOT_DIR/frdm_uart_context_sender/logs/todo_list.json"
   --focus-notify-mode discord
   --music-backend mpv

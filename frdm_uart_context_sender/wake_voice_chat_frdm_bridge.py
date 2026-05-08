@@ -3960,6 +3960,7 @@ class FocusModeManager:
         self.dashboard_state = "idle"
         self.dashboard_remaining_min = 0
         self.dashboard_streak = 0
+        self.uart_gate_file: Path | None = None
 
     def is_enabled(self) -> bool:
         return not bool(getattr(self.args, "no_focus_mode", False))
@@ -3979,6 +3980,7 @@ class FocusModeManager:
         self.dashboard_state = "idle"
         self.dashboard_remaining_min = 0
         self.dashboard_streak = 0
+        self._clear_uart_gate_file()
         self._restart_camera_after_focus()
 
     def _terminate_process(self, *, graceful_timeout: float, kill_timeout: float) -> None:
@@ -3998,7 +4000,42 @@ class FocusModeManager:
                 except subprocess.TimeoutExpired:
                     print("WARNING: focus work mode did not exit after kill; continuing cleanup.")
         self.process = None
+        self._clear_uart_gate_file()
         self._restart_camera_after_focus()
+
+    def _new_uart_gate_file(self) -> Path:
+        gate_dir = Path(os.getenv("WAKE_FOCUS_UART_GATE_DIR", "/tmp")).expanduser()
+        return gate_dir / f"wake_focus_uart_gate_{uuid.uuid4().hex}.ready"
+
+    def close_uart_gate(self) -> None:
+        gate_file = self.uart_gate_file
+        if gate_file is None:
+            return
+        try:
+            gate_file.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"WARNING: could not close focus UART gate {gate_file}: {exc}")
+
+    def open_uart_gate(self) -> None:
+        gate_file = self.uart_gate_file
+        if gate_file is None:
+            return
+        try:
+            gate_file.parent.mkdir(parents=True, exist_ok=True)
+            gate_file.touch()
+            print(f"Focus mode UART gate opened: {gate_file}")
+        except OSError as exc:
+            print(f"WARNING: could not open focus UART gate {gate_file}: {exc}")
+
+    def _clear_uart_gate_file(self) -> None:
+        gate_file = self.uart_gate_file
+        self.uart_gate_file = None
+        if gate_file is None:
+            return
+        try:
+            gate_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def start(self, transcript: str) -> tuple[bool, str]:
         if not self.is_enabled():
@@ -4020,6 +4057,8 @@ class FocusModeManager:
         if not focus_server_url:
             focus_server_url = voice_chat.endpoint_url(self.args.server_url, "/focus-check")
 
+        self.uart_gate_file = self._new_uart_gate_file()
+        self.close_uart_gate()
         self._release_camera_for_focus()
         command = [
             sys.executable,
@@ -4052,12 +4091,22 @@ class FocusModeManager:
             str(getattr(self.args, "uart_line_ending", "crlf")),
             "--alert-threshold",
             str(getattr(self.args, "focus_alert_threshold", 2)),
+            "--alert-cooldown-sec",
+            str(getattr(self.args, "focus_alert_cooldown_sec", 90.0)),
+            "--alert-tts-url",
+            str(getattr(self.args, "tts_url", "http://127.0.0.1:8777/speak_async")),
+            "--alert-tts-timeout",
+            str(getattr(self.args, "tts_timeout", 5.0)),
+            "--alert-volume-gain",
+            str(getattr(self.args, "tts_volume_gain", 2.25)),
             "--todo-list-path",
             str(getattr(self.args, "todo_list_path", THIS_DIR / "logs" / "todo_list.json")),
             "--notify-mode",
             str(getattr(self.args, "focus_notify_mode", "none")),
             "--notify-timeout",
             str(getattr(self.args, "focus_notify_timeout", 8.0)),
+            "--uart-gate-file",
+            str(self.uart_gate_file),
         ]
         discord_webhook_url = str(getattr(self.args, "focus_discord_webhook_url", "") or "").strip()
         if discord_webhook_url:
@@ -4072,6 +4121,10 @@ class FocusModeManager:
             command.append("--uart-dry-run")
         if getattr(self.args, "uart_debug", False):
             command.append("--uart-debug")
+        if getattr(self.args, "no_tts", False) or getattr(self.args, "no_focus_alert_tts", False):
+            command.append("--no-alert-tts")
+        if getattr(self.args, "no_focus_alert_motion", False):
+            command.append("--no-alert-motion")
         command.append("--no-active-screen-uart")
         if getattr(self.args, "focus_save_images", False):
             command.append("--save-images")
@@ -4088,6 +4141,7 @@ class FocusModeManager:
                 env=child_env,
             )
         except Exception as exc:
+            self._clear_uart_gate_file()
             self._restart_camera_after_focus()
             return False, f"專心工作模式啟動失敗：{exc}"
 
@@ -7014,6 +7068,8 @@ def handle_focus_mode_response(
         intent = "stop"
     if intent is None and not focus_manager.is_running():
         return None
+    if focus_manager.is_running():
+        focus_manager.close_uart_gate()
 
     if intent == "start":
         ok, reply = focus_manager.start(transcript)
@@ -7029,9 +7085,10 @@ def handle_focus_mode_response(
         emotion = "curious"
         head_motion = "gentle_nod"
 
+    focus_should_show = intent != "stop" and ok and focus_manager.is_running()
     control = {
         "persistent_state": "unchanged",
-        "screen_mode": "focus" if intent != "stop" else "normal",
+        "screen_mode": "normal" if intent == "stop" else ("focus" if focus_should_show else "unchanged"),
         "emotion": emotion,
         "head_motion": head_motion,
         "reason": f"focus mode {intent or 'active'}",
@@ -7047,15 +7104,6 @@ def handle_focus_mode_response(
         print(f"parsed reply: {reply}")
         print(f"parsed control: {json.dumps(control, ensure_ascii=False)}")
         voice_chat.print_result(response, verbose_debug=args.debug)
-
-    send_focus_uart_update(
-        args,
-        robot,
-        state=focus_manager.dashboard_state,
-        remaining_min=focus_manager.dashboard_remaining_min,
-        streak=focus_manager.dashboard_streak,
-        reason=f"focus mode {intent or 'active'} dashboard",
-    )
 
     robot.send_speaking_and_emotion(emotion)
     head_thread, head_stop = robot.start_speaking_head_motion(head_motion)
@@ -7074,6 +7122,8 @@ def handle_focus_mode_response(
         finally:
             if timing is not None:
                 timing.mark("TTS finished or estimated finished")
+            if intent != "stop" and focus_manager.is_running():
+                focus_manager.open_uart_gate()
             set_post_reply_screen(
                 args,
                 robot,
@@ -7083,6 +7133,15 @@ def handle_focus_mode_response(
                 focus_stopped=intent == "stop",
                 reason="focus mode reply complete",
             )
+            if intent == "stop" or focus_manager.is_running():
+                send_focus_uart_update(
+                    args,
+                    robot,
+                    state=focus_manager.dashboard_state,
+                    remaining_min=focus_manager.dashboard_remaining_min,
+                    streak=focus_manager.dashboard_streak,
+                    reason=f"focus mode {intent or 'active'} dashboard",
+                )
     return tts_ok or not getattr(args, "require_tts", False)
 
 
@@ -7759,7 +7818,8 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         if args.no_focus_mode
         else (
             f"enabled, script={args.focus_script}, interval={args.focus_interval_sec:g}s, "
-            f"duration_default={args.focus_duration_min:g}min, notify={args.focus_notify_mode}"
+            f"duration_default={args.focus_duration_min:g}min, notify={args.focus_notify_mode}, "
+            f"alert_threshold={args.focus_alert_threshold}, alert_cooldown={args.focus_alert_cooldown_sec:g}s"
         )
     )
     print(f"Focus work mode: {focus_desc}")
@@ -8274,6 +8334,9 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     focus_group.add_argument("--focus-log-root", default=os.getenv("FOCUS_LOG_ROOT", str(THIS_DIR / "logs" / "focus_sessions")))
     focus_group.add_argument("--focus-task", default=os.getenv("FOCUS_TASK", ""), help="Default focus task if the start command does not include one.")
     focus_group.add_argument("--focus-alert-threshold", type=int, default=_env_int("FOCUS_ALERT_THRESHOLD", 2))
+    focus_group.add_argument("--focus-alert-cooldown-sec", type=float, default=_env_float("FOCUS_ALERT_COOLDOWN_SEC", 90.0))
+    focus_group.add_argument("--no-focus-alert-tts", action="store_true", help="Disable spoken warnings from background focus monitoring.")
+    focus_group.add_argument("--no-focus-alert-motion", action="store_true", help="Disable MotorYawPitch warnings from background focus monitoring.")
     focus_group.add_argument("--focus-save-images", action="store_true", help="Debug only: let focus_work_mode.py save sampled images.")
     focus_group.add_argument("--focus-notify-mode", choices=["none", "discord"], default=os.getenv("FOCUS_NOTIFY_MODE", "none"))
     focus_group.add_argument("--focus-discord-webhook-url", default=default_discord_webhook_url())
@@ -8630,6 +8693,9 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
             return False
         if int(getattr(args, "focus_alert_threshold", 0) or 0) < 1:
             print("ERROR: --focus-alert-threshold must be >= 1.")
+            return False
+        if float(getattr(args, "focus_alert_cooldown_sec", 0.0) or 0.0) < 0.0:
+            print("ERROR: --focus-alert-cooldown-sec must be >= 0.")
             return False
     if not getattr(args, "no_pet_idle_reflection", False):
         if float(getattr(args, "pet_idle_interval_sec", 0.0) or 0.0) <= 0.0:
