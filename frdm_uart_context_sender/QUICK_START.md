@@ -1,6 +1,6 @@
-# Quick Start: Wake Bridge Full Demo + Vision + FRDM UART + Focus + To-Do + Music + Weather
+# Quick Start: Wake Bridge Full Demo + Vision + FRDM UART + Focus + To-Do + Music + Weather + Dashboard
 
-這份文件是現場 demo 操作手冊。每次要從零啟動，先看 **0. 一頁照貼版**，照順序貼 Terminal 1/2/4/3 即可。Terminal 4 是 Jetson 本地工具視窗，負責音樂 `/music` 與天氣 `/weather`；Wake Bridge 也能自動啟動它，但正式 demo 建議開著。
+這份文件是現場 demo 操作手冊。每次要從零啟動，先看 **0. 一頁照貼版**，照順序貼 Terminal 1/2/4/5/3 即可。Terminal 4 是 Jetson 本地工具視窗，負責音樂 `/music` 與天氣 `/weather`；Terminal 5 是手機/網站 dashboard；Terminal 3 是 Wake Bridge，正式語音 demo 最後啟動。
 
 最短使用方式：
 
@@ -8,6 +8,7 @@
 Terminal 1 on Windows : desktop_fast_chat_server.py
 Terminal 2 on Jetson  : jetson_piper_tts.server
 Terminal 4 on Jetson  : music_web_player.py   # local /music + /weather tools
+Terminal 5 on Jetson  : smart_home_dashboard/server.py   # phone/web dashboard
 Terminal 3 on Jetson  : wake_voice_chat_frdm_bridge.py
 ```
 
@@ -18,6 +19,19 @@ Terminal 3 on Jetson  : wake_voice_chat_frdm_bridge.py
 正確：--tts-poll-interval 0.75 \
       --tts-debug \
       --uart-debug
+```
+
+現在建議 Terminal 3 直接用啟動腳本，避免 `source` 錯 venv 或尾端參數貼壞：
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+如果 FRDM firmware 還沒加入 Time / Weather / Todo / Health dashboard parser，log 出現 `FRDM UART RX: No such command exist.` 不會影響語音、TTS、表情和頭部馬達；要暫時關掉那些 dashboard UART 噪音，可用：
+
+```bash
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh --no-startup-time --no-startup-weather --no-dashboard-uart
 ```
 
 目前預設：
@@ -31,8 +45,10 @@ Text/Vision model : qwen35-fast:latest
 Wake word         : Hey Jarvis
 FRDM baudrate     : 115200, CRLF
 Local tool server : http://127.0.0.1:8788
+Dashboard server  : http://jetson-ip:8789/dashboard
 Weather source    : Open-Meteo, default location=Taipei
 Startup weather   : enabled, sends Weather UART once before Normal
+Local temperature : optional ESP32-S3 + DS18B20 on ESP32 GPIO4, POSTs to Jetson Terminal 3
 ```
 
 如果 Tailscale IP 變了，所有指令裡的 IP 要一起改。
@@ -67,6 +83,8 @@ tts_poll_interval=0.75
 music_backend=mpv
 music_wake_pause_timeout=0.6
 weather_default_location=Taipei
+smart_home_dashboard=on, Jetson :8789, phone/web controls Jetson state
+esp32_temperature_mode=push, receiver=:8790/temperature, appended to Weather UART if fresh
 head_pitch=65..90..115 (down..center..up)
 head_yaw=0..90..180 (right..center..left)
 head_motor=enabled in Terminal 3 full demo, disable only for FRDM parser debugging
@@ -99,6 +117,7 @@ Windows Terminal 1  -> 必須重啟，讓 emotion alias / local fallback 生效
 Jetson Terminal 2   -> 必須重啟，讓 TTS volume_gain API 生效
 Jetson Terminal 3   -> 必須重啟，讓 Speaking 0-5、音樂誤判保護、tts-volume-gain 生效
 Jetson Terminal 4   -> music/weather tool 若已正常可不用重啟；若點歌誤判仍怪，重啟它
+Jetson Terminal 5   -> dashboard server 若前端/API 有改，重啟它
 ```
 
 現場最快恢復順序：
@@ -107,14 +126,15 @@ Jetson Terminal 4   -> music/weather tool 若已正常可不用重啟；若點�
 1. Windows Terminal 1 還活著嗎？先看 /health。
 2. Jetson Terminal 2 TTS 還活著嗎？先看 /health。
 3. 停掉舊 bridge：pkill -9 -f wake_voice_chat_frdm_bridge.py
-4. 重貼 Terminal 3 正式完整模式。
-5. 若找不到 USB，跑 ./recover_demo_usb.sh，然後重開 Terminal 2 和 Terminal 3。
+4. Dashboard 不動可先不用重開；若網站怪怪的，重貼 Terminal 5。
+5. 重貼 Terminal 3 正式完整模式。
+6. 若找不到 USB，跑 ./recover_demo_usb.sh，然後重開 Terminal 2 和 Terminal 3。
 ```
 
 FRDM UART 狀態機速查：
 
 ```text
-bridge startup        -> wait 2s -> Weather <payload> -> Normal 0 0
+bridge startup        -> wait 2s -> Weather <payload>[,local_temp_x10] -> Normal 0 0
 Hey Jarvis detected   -> Thinking 0 0
 AI/TTS starts         -> Speaking <0..5>
 TTS speaking          -> MotorYawPitch <yaw> <pitch>
@@ -166,13 +186,15 @@ Startup Weather UART：
 
 ```text
 Jetson startup weather lookup -> Weather daily,23,29,40,61
+Jetson + ESP32 local temp     -> Weather daily,23,29,40,61,254
 
-格式：Weather kind,low_or_temp,high_or_temp,rain_percent,open_meteo_weather_code
+格式：Weather kind,low_or_temp,high_or_temp,rain_percent,open_meteo_weather_code[,local_temp_c_x10]
 daily   例：Weather daily,23,29,40,61
+local   例：Weather daily,23,29,40,61,254  # 254 = 25.4 C
 current 例：Weather current,27,27,0,2
 ```
 
-Jetson 會用既有 `/weather` 工具查 Open-Meteo，FRDM 只負責解析這行 UART 並把資料顯示在 Sleep 畫面。FRDM 端參考 patch：
+Jetson 會用既有 `/weather` 工具查 Open-Meteo，並在 Terminal 3 有收到 ESP32/DS18B20 溫度時把它加成第 6 欄。FRDM 只負責解析這行 UART 並把資料顯示在 Sleep 畫面。FRDM 端參考 patch，並把 `WeatherGui` parser 擴充成可接受 5 欄或 6 欄：
 
 ```text
 emotion_robot_controller/frdm_firmware/patches/weather_uart_sleep_screen.c
@@ -187,8 +209,18 @@ emotion_robot_controller/frdm_firmware/patches/weather_uart_sleep_screen.c
 1. Windows Terminal 1 : ASR + qwen35-fast server
 2. Jetson Terminal 2  : Piper TTS
 3. Jetson Terminal 4  : Music Web Player, optional but recommended
-4. Jetson Terminal 3  : Wake Bridge, 最後啟動
+4. Jetson Terminal 5  : Smart Home Dashboard, phone/web UI
+5. Jetson Terminal 3  : Wake Bridge, 最後啟動
 ```
+
+現場有兩種 UART owner 模式：
+
+```text
+語音桌寵 demo       : Terminal 3 Wake Bridge owns FRDM UART；Terminal 5 用 --no-frdm-uart
+手機智慧家庭 HMI demo: Terminal 5 Dashboard owns FRDM UART；不要同時跑 Terminal 3 搶 UART
+```
+
+這份 Quick Start 預設走「語音桌寵 demo」，所以 Terminal 5 不碰 FRDM UART，只負責手機/網站 API。
 
 Wake Bridge 啟動後會進入常駐 standby。之後只需要說：
 
@@ -341,6 +373,19 @@ python3 music_web_player.py \
 `mpv` 會真的播放第一個搜尋結果，並支援 pause/resume 保留播放位置；`browser` 只開搜尋頁，不保證播放，也不能可靠暫停/繼續。
 天氣走 Open-Meteo，不需要 API key。`--weather-default-location Taipei` 是「所在地、這裡、附近、here」的預設位置；如果 demo 場地在新竹，可改成 `Hsinchu`。
 
+ESP32-S3 + DS18B20 本地溫度不在 Terminal 4。它由 Terminal 3 的 Wake Bridge 接收，預設建議用 push 模式：ESP32 和 Jetson 在同一個 LAN，DS18B20 接 ESP32 GPIO4，ESP32 定期 POST 到 Jetson：
+
+```text
+POST http://JETSON_LAN_IP:8790/temperature
+{"ok":true,"temperature_c":25.4}
+```
+
+Jetson 的 LAN IP 用這個看，ESP32 程式裡要填這個 IP，不要填 `127.0.0.1`：
+
+```bash
+hostname -I
+```
+
 Terminal 4 health 可用這個看：
 
 ```bash
@@ -354,6 +399,7 @@ backend=mpv        -> 正式播放模式
 active=true        -> 目前有 mpv process
 paused=true        -> 音樂暫停中，可以 resume
 last_query=...     -> 上一次點的歌
+title=...          -> mpv 從 YouTube/yt-dlp 取得的實際 media title
 ipc_path=/tmp/...  -> mpv IPC socket，pause/resume 需要它
 weather_available=true -> /weather 已載入
 weather_default_location=Taipei -> 所在地天氣預設城市
@@ -367,7 +413,121 @@ curl -X POST http://127.0.0.1:8788/weather \
   -d '{"text":"明天下午三點所在地天氣如何","default_location":"Taipei"}'
 ```
 
-### 0.6 Terminal 3: Jetson Wake Bridge
+### 0.6 Terminal 5: Jetson Smart Home Dashboard
+
+這個 terminal 提供手機/網站 dashboard：
+
+```text
+/dashboard             手機/網頁 UI
+/api/status            time / devices / sensors / todo / focus / music / weather / health
+/api/camera/latest     pet camera snapshot
+/api/camera/stream     MJPEG pet camera stream
+/api/devices           電器控制狀態
+/api/todo              和 Wake Bridge 共用同一份 todo JSON
+/api/focus/summaries   專心紀錄圖像化資料
+/api/ai/trace          使用者文字輸入 / 模型文字輸出
+/api/frdm/power-cycle  斷開/恢復 Jetson 供給 FRDM 的電源
+/api/events            dashboard 操作紀錄
+```
+
+Terminal 3 Wake Bridge 會把每輪使用者 transcript / model reply 寫到：
+
+```text
+frdm_uart_context_sender/logs/ai_trace.jsonl
+```
+
+Terminal 5 的 AI 分頁和 `/api/ai/trace` 會優先讀這份本機 trace；如果還沒有語音 turn，才會退回 Windows AI `/health` 的最近 debug。
+
+語音桌寵 demo 預設不要讓 Dashboard 搶 FRDM UART，所以用 `--no-frdm-uart`：
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+
+python3 smart_home_dashboard/server.py \
+  --host 0.0.0.0 \
+  --port 8789 \
+  --no-frdm-uart
+```
+
+網站 Maintenance 的 `Power Cycle` 按鈕不走 UART。預設 `--frdm-power-cycle-mode usb-host` 會讓 Jetson unbind/bind `3610000.usb`，把 USB-powered FRDM 斷電後再重啟。這可以和語音 demo 同時使用，但同一個 USB controller 上的 camera / UACDemo audio / 其他 USB 裝置會短暫斷線再重連。
+
+這個動作需要 Dashboard 有權限寫入：
+
+```text
+/sys/bus/platform/drivers/tegra-xusb/unbind
+/sys/bus/platform/drivers/tegra-xusb/bind
+```
+
+實機 demo 可以用 root 跑 Dashboard，或設定 passwordless sudo 讓 Dashboard 用 `sudo -n tee` 寫入這兩個 sysfs 檔案。
+
+如果網站跳 `FRDM power cycle failed: sudo: a password is required`，代表 web request 不能互動輸入 sudo 密碼。新版 Dashboard 會用 `sudo -n tee` 寫入 xUSB bind/unbind；正式 demo 建議用 `visudo` 加 NOPASSWD：
+
+```bash
+sudo visudo -f /etc/sudoers.d/makentu-frdm-power
+```
+
+內容把 `<jetson-user>` 換成 Jetson 登入帳號：
+
+```text
+<jetson-user> ALL=(root) NOPASSWD: /usr/bin/tee /sys/bus/platform/drivers/tegra-xusb/unbind, /usr/bin/tee /sys/bus/platform/drivers/tegra-xusb/bind
+```
+
+存檔後檢查：
+
+```bash
+sudo visudo -cf /etc/sudoers.d/makentu-frdm-power
+```
+
+臨時測試可以直接用 root 跑 Dashboard：
+
+```bash
+sudo python3 smart_home_dashboard/server.py --host 0.0.0.0 --port 8789 --no-frdm-uart
+```
+
+如果要只斷 FRDM、不影響其他 USB 裝置，建議用獨立 hub port / relay / load switch，並改成：
+
+```bash
+python3 smart_home_dashboard/server.py \
+  --host 0.0.0.0 \
+  --port 8789 \
+  --no-frdm-uart \
+  --frdm-power-cycle-mode script \
+  --frdm-power-cycle-script /path/to/power_cycle_frdm.sh
+```
+
+手機或同網段電腦打開：
+
+```text
+http://JETSON_LAN_IP:8789/dashboard
+```
+
+Jetson LAN IP 用這個看：
+
+```bash
+hostname -I
+```
+
+Dashboard health / smoke test：
+
+```bash
+curl http://127.0.0.1:8789/api/status
+curl http://127.0.0.1:8789/api/devices
+curl http://127.0.0.1:8789/api/focus/summaries?range=today
+```
+
+如果是「手機智慧家庭 HMI demo」，要讓網站按鈕也同步 FRDM 面板，才改成：
+
+```bash
+python3 smart_home_dashboard/server.py \
+  --host 0.0.0.0 \
+  --port 8789 \
+  --frdm-uart-port auto
+```
+
+這個模式不要同時跑 Terminal 3 Wake Bridge，避免兩個 process 搶同一條 UART。
+
+### 0.7 Terminal 3: Jetson Wake Bridge
 
 這個最後啟動。請整段複製，不要手打最後幾行。要真的送 Discord，先在同一個 terminal 設：
 
@@ -404,6 +564,21 @@ except urllib.error.HTTPError as e:
 PY
 ```
 
+推薦直接跑腳本；它會自動進 `/home/asrlab-yian/MakeNTU`、啟用 `emotion_robot_controller/.venv`，並帶完整穩定參數：
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+如果 Windows Tailscale IP 變了，不用改檔案，這樣覆蓋：
+
+```bash
+SERVER_URL=http://NEW_WINDOWS_IP:8766/voice-chat \
+FOCUS_SERVER_URL=http://NEW_WINDOWS_IP:8766/focus-check \
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
 ```bash
 cd /home/asrlab-yian/MakeNTU
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
@@ -418,6 +593,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --uart-baudrate 115200 \
   --enable-head-motor \
   --boot-normal-delay 2.0 \
+  --device-ready-timeout 30 \
   --wake-threshold 0.75 \
   --wake-volume-min 500 \
   --volume-min 1100 \
@@ -456,6 +632,10 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
+  --esp32-temperature-mode push \
+  --esp32-temperature-host 0.0.0.0 \
+  --esp32-temperature-port 8790 \
+  --esp32-temperature-path /temperature \
   --motor-step-delay 0.55 \
   --motor-smooth-step-deg 120 \
   --motor-speaking-step-delay 0.72 \
@@ -518,6 +698,8 @@ speech end/silence <= 13000
 
 Focus Work Mode 指令也會自動結束 conversation mode，避免進入工作模式後還一直收 follow-up。開始後會立刻拍第一張工作狀態照片，之後每 `--focus-interval-sec 60` 秒取樣一次；照片預設只存在記憶體，判斷完就丟掉。`--focus-duration-min 0` 代表不自動結束，要再說「結束工作 / 停止專心 / 下班」才會停。
 
+Wake Bridge 啟動 focus mode 時，FRDM 畫面順序是 `Speaking <emotion>` 回覆你，TTS/頭部動作結束後一定送 `Focus 0 0`。背景的 `focus_work_mode.py` 只送 `Focus active/focused/idle` dashboard raw data，不會在 active 期間搶送 `Thinking` 或其他螢幕狀態；如果是設定分鐘數自動結束，子程序最後仍會送 `Normal 0 0`。
+
 Focus 結束時會寫 `focus_summary.json` 和 `focus_report.md`，內容會整合專注時間、分心時間、專注分數、建議，以及這段期間完成/剩下的 To-Do。報告標題會使用「專心報告：YYYY/MM/DD/HH 開始的專注時段」，同時寫進 `focus_summary.json` 的 `report_title`，Discord 第一行也會使用同一個標題。若有設定 `DISCORD_WEBHOOK_URL`，會透過 Discord webhook 送一則短摘要；沒設 webhook 時只會留下檔案。
 
 To-Do List 是本機 JSON 功能，不需要 Terminal 4 或 Windows server 額外支援。說「新增待辦 寫報告」「列出待辦」「完成待辦 1」會直接更新 `frdm_uart_context_sender/logs/todo_list.json`；它不會啟動/停止 focus mode，focus mode 執行中仍可先記明確的待辦。
@@ -540,8 +722,11 @@ Focus work mode: enabled, script=/home/asrlab-yian/MakeNTU/frdm_uart_context_sen
 To-do list: enabled, path=/home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json
 Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True, beep_settle=0.18s, post_music_cooldown=0.8s
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
+Weather local temperature: push receiver http://0.0.0.0:8790/temperature
 Head motor motion: enabled=True, smooth_step=120deg, step_delay=0.55s, speaking_step_delay=0.72s, speaking_smooth_step=120deg, reset_repeats=1, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
 Boot screen settle: waiting 2s, then sending Normal.
+ESP32 temperature receiver: http://0.0.0.0:8790/temperature
+Weather UART sent: Weather daily,23,29,40,61,254 (local=25.4 C)  # 如果 ESP32 已先送溫度
 FRDM UART TX: Normal 0 0
 Listening for wake word 'hey_jarvis'
 ```
@@ -559,6 +744,8 @@ MotorYaw 180    -> 左轉極限
 ```
 
 所有 head motion 結束都會回 `Yaw 90 / Pitch 90`。一般單軸馬達 UART 只送一個角度參數：`MotorPitch 90`、`MotorYaw 90`；新的同步馬達指令會送兩個數值：`MotorYawPitch 120 90`。目前頭部動作表會優先使用 `MotorYawPitch`，讓 yaw/pitch 同時到位。
+
+新版動作表把 yaw 當成表情的一部分，不再只有俯仰。左右跨側動作也不會插入 `Yaw 90` 中間停頓；例如從右看改成左看，會直接送下一個左側 `MotorYawPitch` 目標，讓伺服自己連續轉過去。
 
 如果 TX 是正確的 `MotorPitch 90`，但 RX 變成：
 
@@ -613,11 +800,11 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 ```text
 Motor settings: pitch=65..90..115 (down..center..up), yaw=0..90..180 (right..center..left), smooth_step=120deg
 Testing head motion: nod
-head motion keyframes: MotorYawPitch:yaw=90,pitch=90 -> MotorYawPitch:yaw=90,pitch=65 -> MotorYawPitch:yaw=90,pitch=108 -> MotorYawPitch:yaw=90,pitch=90
-head motion expanded: MotorYawPitch:yaw=90,pitch=90 -> MotorYawPitch:yaw=90,pitch=65 -> MotorYawPitch:yaw=90,pitch=108 -> MotorYawPitch:yaw=90,pitch=90
+head motion keyframes: MotorYawPitch:yaw=72,pitch=100 -> MotorYawPitch:yaw=108,pitch=65 -> MotorYawPitch:yaw=72,pitch=108 -> MotorYawPitch:yaw=90,pitch=90
+head motion expanded: MotorYawPitch:yaw=72,pitch=100 -> MotorYawPitch:yaw=108,pitch=65 -> MotorYawPitch:yaw=72,pitch=108 -> MotorYawPitch:yaw=90,pitch=90
 head motion reset skipped: already centered
-FRDM UART dry-run TX: MotorYawPitch 90 90
-FRDM UART dry-run TX: MotorYawPitch 90 65
+FRDM UART dry-run TX: MotorYawPitch 72 100
+FRDM UART dry-run TX: MotorYawPitch 108 65
 ```
 
 再測「情緒會不會自動對應頭部動作」：
@@ -636,14 +823,14 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 
 ```text
 neutral   -> Speaking 0 -> none
-concerned -> Speaking 1 -> gentle_nod
-angry     -> Speaking 2 -> shake
-sad       -> Speaking 3 -> gentle_nod
-happy     -> Speaking 4 -> nod
-curious   -> Speaking 5 -> look_around
-excited   -> Speaking 4 -> double_nod
-confused  -> Speaking 5 -> shake
-sleepy    -> Speaking 3 -> sleepy_drop
+concerned -> Speaking 1 -> concerned_tilt  # 右下 -> 左下 -> 右下小回收
+angry     -> Speaking 2 -> firm_shake      # 右上極限 -> 左上極限 -> 右/左斜切
+sad       -> Speaking 3 -> sad_droop       # 右下 -> 左低頭 -> 右低頭
+happy     -> Speaking 4 -> happy_bounce    # 右上跳 -> 左上跳 -> 右下蓄力 -> 左上
+curious   -> Speaking 5 -> curious_peek    # 右上探看 -> 直接左上探看
+excited   -> Speaking 4 -> excited_bounce  # 大幅右上 -> 大幅左上 -> 斜向回彈
+confused  -> Speaking 5 -> confused_tilt   # 右上疑惑 -> 左下疑惑 -> 右上/左下
+sleepy    -> Speaking 3 -> sleepy_drop     # 右側下垂 -> 左側低頭 -> 右側沉下
 surprised / amazed       -> excited
 anxious / worried / 急   -> concerned
 操你媽 / 生氣 / 不爽     -> concerned
@@ -658,7 +845,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --uart-port auto \
   --uart-debug \
   --enable-head-motor \
-  --test-speaking-head-motion shake \
+  --test-speaking-head-motion happy_bounce \
   --test-speaking-seconds 6 \
   --motor-speaking-step-delay 0.72 \
   --motor-speaking-smooth-step-deg 120 \
@@ -684,7 +871,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 
 ```text
 看起來太碎、一直抖          -> --motor-smooth-step-deg 120
-想要稍微有中間過渡          -> --motor-smooth-step-deg 60
+想要同側/俯仰稍微有過渡      -> --motor-smooth-step-deg 60
 講話時動作太快              -> --motor-speaking-step-delay 0.9
 講話時動作太慢              -> --motor-speaking-step-delay 0.55
 一次性測試動作太快          -> --motor-step-delay 0.75
@@ -892,7 +1079,33 @@ python3 music_web_player.py \
 python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --weather-default-location Hsinchu
 ```
 
-### 1.7 Terminal 3: Jetson Wake Bridge
+### 1.7 Terminal 5: Smart Home Dashboard Optional
+
+手機/網站 dashboard 可以和語音 demo 同時開。語音 demo 時讓 Terminal 3 擁有 FRDM UART，所以 Terminal 5 使用 `--no-frdm-uart`：
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+
+python3 smart_home_dashboard/server.py \
+  --host 0.0.0.0 \
+  --port 8789 \
+  --no-frdm-uart
+```
+
+手機開：
+
+```text
+http://JETSON_LAN_IP:8789/dashboard
+```
+
+如果這場 demo 是 phone-first smart home HMI，不跑 Wake Bridge，才可以讓 Dashboard 擁有 FRDM UART：
+
+```bash
+python3 smart_home_dashboard/server.py --host 0.0.0.0 --port 8789 --frdm-uart-port auto
+```
+
+### 1.8 Terminal 3: Jetson Wake Bridge
 
 正式完整模式：
 
@@ -911,6 +1124,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --uart-baudrate 115200 \
   --enable-head-motor \
   --boot-normal-delay 2.0 \
+  --device-ready-timeout 30 \
   --wake-threshold 0.75 \
   --wake-volume-min 500 \
   --volume-min 1100 \
@@ -949,6 +1163,10 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
+  --esp32-temperature-mode push \
+  --esp32-temperature-host 0.0.0.0 \
+  --esp32-temperature-port 8790 \
+  --esp32-temperature-path /temperature \
   --motor-step-delay 0.55 \
   --motor-smooth-step-deg 120 \
   --motor-speaking-step-delay 0.72 \
@@ -980,7 +1198,27 @@ USB reset 後有時 ALSA 已經看到 UACDemo，但 sounddevice 還沒刷新；b
 偵測到 `Hey Jarvis` 的瞬間，bridge 會先用很短 timeout 對 Music Player 送 `pause`，讓音樂不要被錄進麥克風；如果 Music Player 沒開，這一步會安靜跳過，不會自動啟動 sidecar。
 點歌或繼續播放時會在 TTS 確認句說完後呼叫 Music Player。如果 Terminal 4 沒開，bridge 會在點歌時自動嘗試啟動 sidecar。正式要真的出聲並支援 pause/resume，用 `--music-backend mpv`；`browser` 只開搜尋頁，不保證播放。
 天氣也走同一個 Terminal 4 local tool server，但 endpoint 是 `http://127.0.0.1:8788/weather`。Wake Bridge 會先用 rule-based intent 判斷 transcript 是否在問天氣；只有問天氣時才呼叫 `/weather`，一般聊天、FRDM 控制、vision 問題不會查天氣。天氣資料由 Jetson 端直接連 Open-Meteo 查詢，不經 Windows Ollama，不需要 API key。
-天氣回答會覆蓋桌機 AI 的一般回答，避免模型亂猜天氣；FRDM 會用 `curious/gentle_nod` 的控制資料，最後仍回 Normal 或 Sleep。
+
+本地溫度走 ESP32-S3，不走 Terminal 4。DS18B20 接 ESP32 GPIO4，ESP32 和 Jetson 在同一個 LAN。Terminal 3 加上 `--esp32-temperature-mode push` 後會開：
+
+```text
+http://JETSON_LAN_IP:8790/temperature
+```
+
+ESP32 每幾秒 POST 一次：
+
+```json
+{"ok":true,"temperature_c":25.4}
+```
+
+之後 Weather UART 會把 Open-Meteo 資料和本地溫度合併：
+
+```text
+Weather daily,23,29,40,61,254
+```
+
+其中第 6 欄 `254` 是 `25.4 C`。如果 ESP32 還沒送或資料超過 `--esp32-temperature-max-age-sec`，就退回舊的 5 欄格式。
+天氣回答會覆蓋桌機 AI 的一般回答，避免模型亂猜天氣；FRDM 會用 `curious/curious_peek` 的控制資料，最後仍回 Normal 或 Sleep。
 
 錄音使用 adaptive recording gate。程式會在 wake 前估計環境底噪，wake 後自動算：
 
@@ -1056,7 +1294,7 @@ AI control:
   persistent_state : unchanged / normal / sleep
   screen_mode      : unchanged / normal / sleep / music / focus / thinking
   emotion          : neutral / concerned / angry / sad / happy / curious / excited / confused / sleepy
-  head_motion      : none / nod / double_nod / look_around / shake / gentle_nod / sleepy_drop
+  head_motion      : none / nod / double_nod / look_around / shake / gentle_nod / sleepy_drop / happy_bounce / excited_bounce / curious_peek / concerned_tilt / sad_droop / confused_tilt / firm_shake
 FRDM UART TX: Speaking 0..5     # 0 neutral, 1 concerned, 2 angry, 3 sad, 4 happy, 5 confused
 TTS started
 head motion started
@@ -1280,8 +1518,9 @@ Hey Jarvis，weather in Tokyo tomorrow.
 ```text
 Weather routing: intent=True location=...
 Weather tool: ok=True handled=True source=open-meteo
+Weather UART sent: Weather daily,23,29,40,61,254 (local=25.4 C)  # 有 ESP32 溫度時
 Reply: <城市><時間>大約 ... °C，... 降雨機率 ...
-AI control: emotion=curious, head_motion=gentle_nod
+AI control: emotion=curious, head_motion=curious_peek
 FRDM UART TX: Speaking 5
 最後 FRDM UART TX: Thinking 0 0 或 Normal/Music/Focus/Sleep
 ```
@@ -1325,6 +1564,14 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --list-mics
 python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --list-uarts
 lsusb
 ls -l /dev/video* /dev/ttyACM* 2>/dev/null
+```
+
+Terminal 3 已啟動且使用 ESP32 push mode 時，可以手動打一筆本地溫度進 receiver：
+
+```bash
+curl -X POST http://127.0.0.1:8790/temperature \
+  -H "Content-Type: application/json" \
+  -d '{"ok":true,"temperature_c":25.4}'
 ```
 
 `--list-mics` 要看到 UACDemo input，例如：
@@ -1701,6 +1948,42 @@ Hey Jarvis，明天下午三點所在地天氣如何。
 Hey Jarvis，今天會下雨嗎？
 ```
 
+### ESP32 本地溫度沒有合併到 Weather UART
+
+先確認 Terminal 3 啟動參數有：
+
+```text
+--esp32-temperature-mode push
+--esp32-temperature-host 0.0.0.0
+--esp32-temperature-port 8790
+--esp32-temperature-path /temperature
+```
+
+Terminal 3 啟動時應看到：
+
+```text
+ESP32 temperature receiver: http://0.0.0.0:8790/temperature
+Weather local temperature: push receiver http://0.0.0.0:8790/temperature
+```
+
+Jetson 本機先手動 POST：
+
+```bash
+curl -X POST http://127.0.0.1:8790/temperature \
+  -H "Content-Type: application/json" \
+  -d '{"ok":true,"temperature_c":25.4}'
+```
+
+再問一次天氣或重啟 Terminal 3，應看到：
+
+```text
+Weather UART sent: Weather daily,23,29,40,61,254 (local=25.4 C)
+```
+
+如果 Jetson 本機可 POST，但 ESP32 不行，檢查 ESP32 程式裡的目標 IP 必須是 Jetson 的 LAN IP，不是 `127.0.0.1`。用 `hostname -I` 看 Jetson IP。ESP32 和 Jetson 也要在同一個 WiFi/LAN，且網路不能隔離 client-to-client traffic。
+
+如果 FRDM 收到 `Weather ... ,254` 但畫面沒有本地溫度，代表 FRDM firmware 還只 parse 5 欄；要把 `WeatherGui` / `ParseWeatherPayload` 改成 5 欄和 6 欄都接受，並把第 6 欄 `local_temp_c_x10` 顯示成 `25.4 C`。
+
 ### TTS ready 但沒聲音
 
 ```bash
@@ -1790,6 +2073,7 @@ line ending CRLF
 [ ] Windows Terminal 1 server 還開著
 [ ] Jetson Terminal 2 TTS 還開著
 [ ] Jetson Terminal 3 bridge 是最新重開的，不是舊卡住 process
+[ ] ESP32-S3 和 Jetson 在同一個 LAN，本地溫度 POST 目標是 Jetson LAN IP
 [ ] 三個 USB：UACDemo 音訊、Global Shutter Camera、FRDM MCU-LINK 都接著
 [ ] Quick Start 裡的 Windows IP 還是目前 tailscale ip
 ```

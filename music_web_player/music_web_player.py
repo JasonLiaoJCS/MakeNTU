@@ -801,6 +801,9 @@ class MusicPlayer:
         self._paused = False
         self.last_query = ""
         self.last_backend = ""
+        self.last_title = ""
+        self.last_artist = ""
+        self.last_url = ""
 
     def _remove_ipc_socket(self) -> None:
         if self._ipc_path:
@@ -863,7 +866,48 @@ class MusicPlayer:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def _mpv_property(self, name: str, *, timeout: float = 0.6) -> Any:
+        result = self._mpv_command(["get_property", name], timeout=timeout)
+        if not result.get("ok"):
+            return None
+        response = result.get("mpv_response") if isinstance(result.get("mpv_response"), dict) else {}
+        return response.get("data")
+
+    def _refresh_now_playing_once(self) -> dict[str, Any]:
+        title = self._mpv_property("media-title")
+        artist = (
+            self._mpv_property("metadata/by-key/artist")
+            or self._mpv_property("metadata/by-key/uploader")
+            or self._mpv_property("metadata/by-key/channel")
+        )
+        url = self._mpv_property("path")
+        with self._lock:
+            if title:
+                self.last_title = str(title).strip()
+            if artist:
+                self.last_artist = str(artist).strip()
+            if url:
+                self.last_url = str(url).strip()
+            return {
+                "title": self.last_title,
+                "artist": self.last_artist,
+                "url": self.last_url,
+            }
+
+    def _refresh_now_playing(self, *, wait_sec: float = 0.0) -> dict[str, Any]:
+        deadline = time.monotonic() + max(0.0, wait_sec)
+        latest: dict[str, Any] = {}
+        while True:
+            latest = self._refresh_now_playing_once()
+            if latest.get("title") or time.monotonic() >= deadline:
+                return latest
+            time.sleep(0.15)
+
     def status(self) -> dict[str, Any]:
+        with self._lock:
+            active = self._is_active_locked()
+        if active:
+            self._refresh_now_playing()
         with self._lock:
             active = self._is_active_locked()
             return {
@@ -871,6 +915,10 @@ class MusicPlayer:
                 "paused": bool(self._paused and active),
                 "last_query": self.last_query,
                 "last_backend": self.last_backend,
+                "last_title": self.last_title,
+                "title": self.last_title if active else "",
+                "artist": self.last_artist if active else "",
+                "url": self.last_url if active else "",
                 "ipc_path": self._ipc_path if active else None,
             }
 
@@ -951,6 +999,9 @@ class MusicPlayer:
         with self._lock:
             self.last_query = query
             self.last_backend = "browser"
+            self.last_title = ""
+            self.last_artist = ""
+            self.last_url = url
         try:
             if opener:
                 subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1017,6 +1068,9 @@ class MusicPlayer:
                 self._paused = False
                 self.last_query = query
                 self.last_backend = "mpv"
+                self.last_title = ""
+                self.last_artist = ""
+                self.last_url = target
             deadline = time.monotonic() + 1.5
             while time.monotonic() < deadline and not os.path.exists(ipc_path):
                 with self._lock:
@@ -1024,7 +1078,19 @@ class MusicPlayer:
                         break
                 time.sleep(0.05)
             ipc_ready = os.path.exists(ipc_path)
-            result = {"ok": True, "action": "play", "backend": "mpv", "query": query, "target": target, "ipc_path": ipc_path, "ipc_ready": ipc_ready}
+            now_playing = self._refresh_now_playing(wait_sec=1.2) if ipc_ready else {}
+            result = {
+                "ok": True,
+                "action": "play",
+                "backend": "mpv",
+                "query": query,
+                "target": target,
+                "ipc_path": ipc_path,
+                "ipc_ready": ipc_ready,
+                "title": now_playing.get("title") or "",
+                "artist": now_playing.get("artist") or "",
+                "url": now_playing.get("url") or target,
+            }
             if not ipc_ready:
                 result["warning"] = "mpv IPC socket was not ready yet; pause/resume may fail until mpv finishes starting"
             return result
@@ -1105,6 +1171,10 @@ def make_handler(
                         "yt_dlp_available": bool(shutil.which("yt-dlp") or shutil.which("youtube-dl")),
                         "last_query": player.last_query,
                         "last_backend": player.last_backend,
+                        "last_title": status.get("last_title", ""),
+                        "title": status.get("title", ""),
+                        "artist": status.get("artist", ""),
+                        "url": status.get("url", ""),
                         "active": status["active"],
                         "paused": status["paused"],
                         "ipc_path": status["ipc_path"],

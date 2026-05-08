@@ -16,6 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as Futur
 from datetime import datetime, timezone
 import fcntl
 import glob
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
 import os
@@ -64,12 +65,14 @@ except Exception:
     music_tool = None  # type: ignore[assignment]
 
 
-CLIENT_VERSION = "wake_voice_chat_frdm_bridge_vision_conversation_motor_natural_v5"
+CLIENT_VERSION = "wake_voice_chat_frdm_bridge_vision_conversation_motor_natural_v6"
 DEFAULT_INSTANCE_LOCK = "/tmp/wake_voice_chat_frdm_bridge.lock"
 DEFAULT_MUSIC_TOOL_URL = os.getenv("MUSIC_TOOL_URL", "http://127.0.0.1:8788/music")
 DEFAULT_WEATHER_TOOL_URL = os.getenv("WEATHER_TOOL_URL", "http://127.0.0.1:8788/weather")
 DEFAULT_WEATHER_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "Taipei")
+DEFAULT_ESP32_TEMPERATURE_PATH = os.getenv("ESP32_TEMPERATURE_PATH", "/temperature")
 DEFAULT_TODO_LIST_PATH = THIS_DIR / "logs" / "todo_list.json"
+DEFAULT_AI_TRACE_PATH = THIS_DIR / "logs" / "ai_trace.jsonl"
 DEFAULT_DISCORD_WEBHOOK_FILE = Path(os.getenv("DISCORD_WEBHOOK_FILE", "~/.config/makentu/discord_webhook_url")).expanduser()
 PET_IDLE_SILENCE_TOKEN = "PET_IDLE_SILENCE"
 SESSION_END_KEYWORDS = (
@@ -143,7 +146,22 @@ SINGLE_ARG_UART_COMMANDS = (MOTOR_COMMANDS - {"MotorYawPitch"}) | {"Speaking"}
 VALID_PERSISTENT_STATES = {"normal", "sleep", "unchanged"}
 VALID_SCREEN_MODES = {"unchanged", "normal", "sleep", "thinking", "music", "focus"}
 VALID_EMOTIONS = {"neutral", "concerned", "angry", "sad", "happy", "curious", "excited", "confused", "sleepy"}
-VALID_HEAD_MOTIONS = {"none", "nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop"}
+VALID_HEAD_MOTIONS = {
+    "none",
+    "nod",
+    "double_nod",
+    "look_around",
+    "shake",
+    "gentle_nod",
+    "sleepy_drop",
+    "happy_bounce",
+    "excited_bounce",
+    "curious_peek",
+    "concerned_tilt",
+    "sad_droop",
+    "confused_tilt",
+    "firm_shake",
+}
 SCREEN_STATE_DEDUPE_SEC = 1.5
 
 SCREEN_MODE_TO_COMMAND = {
@@ -170,13 +188,13 @@ EMOTION_TO_SPEAKING_CODE = {
 
 EMOTION_TO_HEAD_MOTION = {
     "neutral": "none",
-    "concerned": "gentle_nod",
-    "angry": "shake",
-    "sad": "gentle_nod",
-    "happy": "nod",
-    "curious": "look_around",
-    "excited": "double_nod",
-    "confused": "shake",
+    "concerned": "concerned_tilt",
+    "angry": "firm_shake",
+    "sad": "sad_droop",
+    "happy": "happy_bounce",
+    "curious": "curious_peek",
+    "excited": "excited_bounce",
+    "confused": "confused_tilt",
     "sleepy": "sleepy_drop",
 }
 
@@ -265,7 +283,9 @@ YAW_RIGHT_LIMIT = MOTOR_YAW_MIN
 YAW_RIGHT = MOTOR_YAW_MIN
 YAW_RIGHT_SOFT = 25
 YAW_RIGHT_SMALL = 55
+YAW_RIGHT_TINY = 72
 YAW_CENTER = MOTOR_YAW_CENTER
+YAW_LEFT_TINY = 108
 YAW_LEFT_SMALL = 125
 YAW_LEFT_SOFT = 155
 YAW_LEFT = MOTOR_YAW_MAX
@@ -414,6 +434,30 @@ def interpolation_segments(max_delta: int, step_deg: int) -> int:
     return max(1, int(np.ceil(max_delta / max(1, step_deg))))
 
 
+def crosses_yaw_center(current_yaw: int, target_yaw: int, *, min_offset: int = 12) -> bool:
+    current_offset = int(current_yaw) - YAW_CENTER
+    target_offset = int(target_yaw) - YAW_CENTER
+    return (
+        current_offset * target_offset < 0
+        and abs(current_offset) >= min_offset
+        and abs(target_offset) >= min_offset
+    )
+
+
+def yaw_pitch_interpolation_segments(
+    current_yaw: int,
+    current_pitch: int,
+    target_yaw: int,
+    target_pitch: int,
+    step_deg: int,
+) -> int:
+    # A cross-center yaw turn should be one continuous servo move. Inserting
+    # an intermediate center command makes the head pause in the middle.
+    if crosses_yaw_center(current_yaw, target_yaw):
+        return 1
+    return interpolation_segments(max(abs(target_yaw - current_yaw), abs(target_pitch - current_pitch)), step_deg)
+
+
 def smooth_motor_sequence(keyframes: list[MotorStep], max_step_deg: int) -> list[MotorStep]:
     """Expand only very large jumps; keyframes carry the intended held poses."""
     step_deg = max(1, int(max_step_deg or MOTOR_SMOOTH_STEP_DEG))
@@ -438,7 +482,7 @@ def smooth_motor_sequence(keyframes: list[MotorStep], max_step_deg: int) -> list
                 expanded.append(yaw_pitch(target_yaw, target_pitch))
                 continue
 
-            segments = interpolation_segments(max(abs(delta_yaw), abs(delta_pitch)), step_deg)
+            segments = yaw_pitch_interpolation_segments(current_yaw, current_pitch, target_yaw, target_pitch, step_deg)
             for index in range(1, segments + 1):
                 fraction = index / segments
                 interpolated_yaw = clamp_int(int(round(current_yaw + (delta_yaw * fraction))), MOTOR_YAW_MIN, MOTOR_YAW_MAX)
@@ -532,44 +576,90 @@ def sleep_interruptible(duration_sec: float, stop_event: threading.Event | None 
 HEAD_MOTION_SEQUENCES = {
     "none": center_head_steps(),
     "nod": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_CENTER, PITCH_DOWN_STRONG)),
-        yaw_pitch(YAW_CENTER, PITCH_UP),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
+        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_STRONG)),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "double_nod": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_CENTER, PITCH_DOWN_STRONG)),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_CENTER, PITCH_DOWN)),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
+        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_STRONG)),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
+        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN)),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "look_around": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_ATTENTIVE),
         *hold_step(yaw_pitch(YAW_RIGHT, PITCH_ATTENTIVE)),
-        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE),
         *hold_step(yaw_pitch(YAW_LEFT, PITCH_ATTENTIVE)),
         yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "shake": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_RIGHT, PITCH_CENTER)),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_LEFT, PITCH_CENTER)),
+        *hold_step(yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER)),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_CENTER),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "gentle_nod": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT)),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
+        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT)),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "sleepy_drop": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DROWSY),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN),
         *hold_step(yaw_pitch(YAW_RIGHT_SOFT, PITCH_DOWN_STRONG)),
+        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+    ],
+    "happy_bounce": [
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_STRONG),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+    ],
+    "excited_bounce": [
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_UP_STRONG),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_UP_STRONG),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+    ],
+    "curious_peek": [
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT, PITCH_UP),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+    ],
+    "concerned_tilt": [
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+    ],
+    "sad_droop": [
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_STRONG),
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_DOWN_STRONG),
+        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+    ],
+    "confused_tilt": [
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN),
+        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+    ],
+    "firm_shake": [
+        yaw_pitch(YAW_RIGHT, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT, PITCH_UP_SOFT),
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
 }
@@ -577,43 +667,75 @@ HEAD_MOTION_SEQUENCES = {
 SPEAKING_HEAD_MOTION_LOOPS = {
     "none": center_head_steps(),
     "nod": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_CENTER, PITCH_DOWN)),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
+        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN)),
     ],
     "double_nod": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_CENTER, PITCH_DOWN)),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        yaw_pitch(YAW_CENTER, PITCH_DOWN),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
+        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN)),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT),
     ],
     "look_around": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_ATTENTIVE),
         *hold_step(yaw_pitch(YAW_RIGHT, PITCH_ATTENTIVE)),
-        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE),
         *hold_step(yaw_pitch(YAW_LEFT, PITCH_ATTENTIVE)),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "shake": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_RIGHT, PITCH_CENTER)),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_LEFT, PITCH_CENTER)),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+        *hold_step(yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER)),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_CENTER),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT),
     ],
     "gentle_nod": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
-        *hold_step(yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT)),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
+        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT)),
     ],
     "sleepy_drop": [
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DROWSY),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN),
         *hold_step(yaw_pitch(YAW_RIGHT_SOFT, PITCH_DOWN_STRONG)),
-        yaw_pitch(YAW_CENTER, PITCH_CENTER),
+    ],
+    "happy_bounce": [
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_STRONG),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_UP),
+    ],
+    "excited_bounce": [
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_UP_STRONG),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_UP_STRONG),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP),
+    ],
+    "curious_peek": [
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT, PITCH_UP),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT, PITCH_UP),
+    ],
+    "concerned_tilt": [
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
+    ],
+    "sad_droop": [
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_STRONG),
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_DOWN_STRONG),
+    ],
+    "confused_tilt": [
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN),
+    ],
+    "firm_shake": [
+        yaw_pitch(YAW_RIGHT, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT, PITCH_UP_SOFT),
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_DOWN_SOFT),
     ],
 }
 
@@ -1096,6 +1218,29 @@ def find_output_device_by_keyword(keyword: str) -> int | None:
     return None
 
 
+def refresh_sounddevice_backend(*, label: str = "") -> bool:
+    """Refresh PortAudio's device view after USB audio re-enumerates."""
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise RuntimeError("Missing dependency: sounddevice. Install it in the voice venv.") from exc
+
+    terminate = getattr(sd, "_terminate", None)
+    initialize = getattr(sd, "_initialize", None)
+    if not callable(terminate) or not callable(initialize):
+        return False
+    try:
+        terminate()
+        initialize()
+        if label:
+            print(f"Device preflight: refreshed sounddevice backend while waiting for {label}.")
+        return True
+    except Exception as exc:
+        if label:
+            print(f"WARNING: sounddevice backend refresh failed while waiting for {label}: {exc}")
+        return False
+
+
 def wait_for_sounddevice_keyword(keyword: str, *, output: bool, timeout_sec: float, label: str) -> int | None:
     keyword = str(keyword or "").strip()
     if not keyword:
@@ -1103,6 +1248,8 @@ def wait_for_sounddevice_keyword(keyword: str, *, output: bool, timeout_sec: flo
     finder = find_output_device_by_keyword if output else find_device_by_keyword
     deadline = time.monotonic() + max(0.0, timeout_sec)
     last_report_at = 0.0
+    last_refresh_at = 0.0
+    refresh_label = f"{label} keyword {keyword!r}"
     while True:
         selected = finder(keyword)
         if selected is not None:
@@ -1114,6 +1261,13 @@ def wait_for_sounddevice_keyword(keyword: str, *, output: bool, timeout_sec: flo
         if now - last_report_at >= 2.0:
             print(f"Device preflight: waiting for sounddevice {label} keyword {keyword!r}...")
             last_report_at = now
+        if now - last_refresh_at >= 2.0:
+            if refresh_sounddevice_backend(label=refresh_label):
+                selected = finder(keyword)
+                if selected is not None:
+                    print(f"Device ready: selected {label} device {selected} by keyword {keyword!r}.")
+                    return selected
+            last_refresh_at = now
         time.sleep(0.5)
 
 
@@ -1848,8 +2002,12 @@ def direct_head_motion_from_transcript(transcript: str) -> str | None:
         return "nod"
     if any(word in compact for word in ("搖頭", "摇头", "不要的動作", "不要的动作")) or re.search(r"\bshake your head\b", text):
         return "shake"
+    if any(word in compact for word in ("歪頭", "歪头", "困惑動作", "困惑动作")) or re.search(r"\btilt your head\b", text):
+        return "confused_tilt"
+    if any(word in compact for word in ("賣萌", "卖萌", "可愛一點", "可爱一点", "開心動作", "开心动作")):
+        return "happy_bounce"
     if any(word in compact for word in ("左右看", "看左右", "轉頭", "转头", "四處看", "四处看")) or re.search(r"\blook around\b", text):
-        return "look_around"
+        return "curious_peek"
     return None
 
 
@@ -1868,7 +2026,7 @@ def local_control_from_transcript(transcript: str, response: dict[str, Any] | No
             "persistent_state": "normal",
             "screen_mode": "normal",
             "emotion": "happy",
-            "head_motion": "nod",
+            "head_motion": "happy_bounce",
             "reason": "wake/normal intent",
         }
 
@@ -1962,7 +2120,7 @@ def normalize_control(response: dict[str, Any]) -> dict[str, str]:
         if emotion in {"sleepy", "concerned", "confused"}:
             emotion = "happy"
         if head_motion in {"sleepy_drop", "shake"}:
-            head_motion = "nod"
+            head_motion = "happy_bounce"
         reason = "wake/normal intent"
     elif persistent_state in {"normal", "sleep"} and screen_mode == "unchanged":
         screen_mode = persistent_state
@@ -2020,6 +2178,48 @@ def sanitize_reply(response: dict[str, Any]) -> str:
         reply = "我剛剛有收到，但這次回覆有點不穩，我先保持待命。"
         response["reply"] = reply
     return reply
+
+
+def is_user_visible_transcript(transcript: str) -> bool:
+    text = str(transcript or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered == "pet_idle_reflection" or text.startswith("[PET_IDLE_REFLECTION]"):
+        return False
+    return True
+
+
+def append_ai_trace(response: dict[str, Any], args: argparse.Namespace, *, turn_source: str = "") -> None:
+    if getattr(args, "no_ai_trace_log", False):
+        return
+    transcript = str(response.get("transcript", "") or "").strip()
+    if not is_user_visible_transcript(transcript):
+        return
+    path = Path(getattr(args, "ai_trace_path", "") or DEFAULT_AI_TRACE_PATH).expanduser()
+    debug = response.get("debug") if isinstance(response.get("debug"), dict) else {}
+    control = normalize_control(response)
+    record = {
+        "timestamp": todo_timestamp(),
+        "request_id": str(response.get("request_id") or debug.get("request_id") or ""),
+        "turn_source": turn_source,
+        "model": str(debug.get("ollama_model") or response.get("vision_model") or ""),
+        "input": transcript,
+        "output": sanitize_reply(response),
+        "raw_output": str(debug.get("ollama_content_preview") or ""),
+        "parse_status": str(debug.get("parse_status") or ""),
+        "emotion": control.get("emotion", ""),
+        "screen_mode": control.get("screen_mode", ""),
+        "head_motion": control.get("head_motion", ""),
+        "ok": bool(debug.get("ok", response.get("ok", True))),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        if getattr(args, "debug", False):
+            print(f"WARN: failed to append AI trace {path}: {exc}")
 
 
 def normalize_local_tool_url(raw_url: str, *, default_url: str, endpoint: str) -> str:
@@ -2584,6 +2784,270 @@ def maybe_apply_weather_response(response: dict[str, Any], args: argparse.Namesp
     return result
 
 
+def normalize_temperature_path(raw_path: str) -> str:
+    path = str(raw_path or DEFAULT_ESP32_TEMPERATURE_PATH).strip()
+    if not path:
+        path = DEFAULT_ESP32_TEMPERATURE_PATH
+    parsed = urllib.parse.urlsplit(path)
+    if parsed.scheme or parsed.netloc:
+        path = parsed.path or DEFAULT_ESP32_TEMPERATURE_PATH
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return path.rstrip("/") or "/temperature"
+
+
+def _coerce_temperature_c(value: Any) -> float | None:
+    try:
+        temp_c = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if temp_c < -55.0 or temp_c > 125.0:
+        return None
+    return temp_c
+
+
+def extract_temperature_c(payload: Any) -> float | None:
+    if isinstance(payload, dict):
+        if "ok" in payload and not bool(payload.get("ok")):
+            return None
+        for key in ("temperature_c", "temp_c", "temperatureC", "temperature", "temp", "value"):
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if isinstance(value, dict):
+                nested = extract_temperature_c(value)
+                if nested is not None:
+                    return nested
+                continue
+            temp_c = _coerce_temperature_c(value)
+            if temp_c is not None:
+                return temp_c
+        return None
+    if isinstance(payload, (list, tuple)):
+        for item in payload:
+            temp_c = extract_temperature_c(item)
+            if temp_c is not None:
+                return temp_c
+        return None
+    if isinstance(payload, (int, float)):
+        return _coerce_temperature_c(payload)
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return None
+        try:
+            return extract_temperature_c(json.loads(text))
+        except json.JSONDecodeError:
+            return _coerce_temperature_c(text)
+    return None
+
+
+def temperature_c_to_uart_x10(temp_c: float) -> int:
+    return clamp_int(int(round(temp_c * 10)), -550, 1250)
+
+
+def format_temperature_uart_field(temp_c: float | None) -> str | None:
+    if temp_c is None:
+        return None
+    coerced = _coerce_temperature_c(temp_c)
+    if coerced is None:
+        return None
+    return str(temperature_c_to_uart_x10(coerced))
+
+
+class Esp32TemperatureReceiver:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.host = str(getattr(args, "esp32_temperature_host", "0.0.0.0") or "0.0.0.0")
+        self.port = int(getattr(args, "esp32_temperature_port", 8790) or 8790)
+        self.path = normalize_temperature_path(str(getattr(args, "esp32_temperature_path", DEFAULT_ESP32_TEMPERATURE_PATH)))
+        self.debug = bool(getattr(args, "esp32_temperature_debug", False))
+        self._lock = threading.RLock()
+        self._latest: dict[str, Any] | None = None
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def update(self, temp_c: float, *, source: str, remote: str = "") -> dict[str, Any]:
+        reading = {
+            "temperature_c": temp_c,
+            "source": source,
+            "remote": remote,
+            "received_at": time.monotonic(),
+            "received_at_iso": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        }
+        with self._lock:
+            self._latest = reading
+        if self.debug:
+            print(f"ESP32 temperature update: {temp_c:.1f} C from {source}" + (f" ({remote})" if remote else ""))
+        return reading
+
+    def latest(self, *, max_age_sec: float) -> dict[str, Any] | None:
+        with self._lock:
+            latest = dict(self._latest) if self._latest is not None else None
+        if latest is None:
+            return None
+        age_sec = max(0.0, time.monotonic() - float(latest.get("received_at", 0.0) or 0.0))
+        if max_age_sec > 0 and age_sec > max_age_sec:
+            return None
+        latest["age_sec"] = age_sec
+        return latest
+
+    def start(self) -> bool:
+        if self._server is not None:
+            return True
+        receiver = self
+
+        class TemperatureHandler(BaseHTTPRequestHandler):
+            server_version = "MakeNTUTemperatureHTTP/1.0"
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                if receiver.debug:
+                    print("ESP32 temperature HTTP: " + (fmt % args))
+
+            def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _path_ok(self) -> bool:
+                parsed = urllib.parse.urlsplit(self.path)
+                return normalize_temperature_path(parsed.path) == receiver.path
+
+            def do_GET(self) -> None:
+                if not self._path_ok():
+                    self._send_json(404, {"ok": False, "error": "not_found", "path": receiver.path})
+                    return
+                parsed = urllib.parse.urlsplit(self.path)
+                params = urllib.parse.parse_qs(parsed.query)
+                temp_c = extract_temperature_c({key: values[0] for key, values in params.items() if values})
+                if temp_c is not None:
+                    reading = receiver.update(temp_c, source="esp32-http-get", remote=str(self.client_address[0]))
+                    self._send_json(200, {"ok": True, "temperature_c": reading["temperature_c"]})
+                    return
+                latest = receiver.latest(max_age_sec=float(getattr(receiver.args, "esp32_temperature_max_age_sec", 120.0) or 120.0))
+                if latest is None:
+                    self._send_json(503, {"ok": False, "error": "no_temperature"})
+                else:
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "temperature_c": latest["temperature_c"],
+                            "age_sec": round(float(latest.get("age_sec", 0.0)), 2),
+                            "source": latest.get("source", ""),
+                        },
+                    )
+
+            def do_POST(self) -> None:
+                if not self._path_ok():
+                    self._send_json(404, {"ok": False, "error": "not_found", "path": receiver.path})
+                    return
+                try:
+                    length = min(max(0, int(self.headers.get("Content-Length", "0") or "0")), 4096)
+                except ValueError:
+                    length = 0
+                raw = self.rfile.read(length).decode("utf-8", errors="replace").strip()
+                content_type = str(self.headers.get("Content-Type", "") or "").lower()
+                payload: Any
+                if "application/x-www-form-urlencoded" in content_type:
+                    payload = {key: values[0] for key, values in urllib.parse.parse_qs(raw).items() if values}
+                else:
+                    payload = raw
+                temp_c = extract_temperature_c(payload)
+                if temp_c is None:
+                    self._send_json(400, {"ok": False, "error": "invalid_temperature"})
+                    return
+                reading = receiver.update(temp_c, source="esp32-http-post", remote=str(self.client_address[0]))
+                self._send_json(200, {"ok": True, "temperature_c": reading["temperature_c"]})
+
+        class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        try:
+            self._server = ReusableThreadingHTTPServer((self.host, self.port), TemperatureHandler)
+        except OSError as exc:
+            print(f"WARNING: ESP32 temperature receiver could not listen on {self.host}:{self.port}: {exc}")
+            return False
+        self._thread = threading.Thread(target=self._server.serve_forever, name="esp32-temperature-http", daemon=True)
+        self._thread.start()
+        print(f"ESP32 temperature receiver: http://{self.host}:{self.port}{self.path}")
+        return True
+
+    def stop(self) -> None:
+        server = self._server
+        self._server = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+
+def maybe_start_esp32_temperature_receiver(args: argparse.Namespace) -> Esp32TemperatureReceiver | None:
+    mode = str(getattr(args, "esp32_temperature_mode", "disabled") or "disabled").strip().lower()
+    if mode not in {"push", "both"} or getattr(args, "no_weather_local_temperature", False):
+        return None
+    receiver = Esp32TemperatureReceiver(args)
+    if not receiver.start():
+        return None
+    setattr(args, "_esp32_temperature_receiver", receiver)
+    return receiver
+
+
+def fetch_esp32_temperature(args: argparse.Namespace) -> dict[str, Any] | None:
+    url = str(getattr(args, "esp32_temperature_url", "") or "").strip()
+    if not url:
+        return None
+    timeout_sec = max(0.05, float(getattr(args, "esp32_temperature_timeout", 0.6) or 0.6))
+    try:
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            raw = response.read().decode("utf-8", errors="replace").strip()
+        temp_c = extract_temperature_c(raw)
+        if temp_c is None:
+            return None
+        return {"temperature_c": temp_c, "source": "esp32-http-get", "url": url, "age_sec": 0.0}
+    except Exception as exc:
+        if getattr(args, "esp32_temperature_debug", False):
+            print(f"ESP32 temperature fetch failed: {exc}")
+        return None
+
+
+def get_local_temperature_reading(args: argparse.Namespace) -> dict[str, Any] | None:
+    if getattr(args, "no_weather_local_temperature", False):
+        return None
+    mode = str(getattr(args, "esp32_temperature_mode", "disabled") or "disabled").strip().lower()
+    if mode not in {"push", "pull", "both"}:
+        return None
+    max_age_sec = max(0.0, float(getattr(args, "esp32_temperature_max_age_sec", 120.0) or 120.0))
+    receiver = getattr(args, "_esp32_temperature_receiver", None)
+    if mode in {"push", "both"} and isinstance(receiver, Esp32TemperatureReceiver):
+        latest = receiver.latest(max_age_sec=max_age_sec)
+        if latest is not None:
+            return latest
+    if mode in {"pull", "both"}:
+        fetched = fetch_esp32_temperature(args)
+        if fetched is not None:
+            if isinstance(receiver, Esp32TemperatureReceiver):
+                receiver.update(float(fetched["temperature_c"]), source=str(fetched.get("source", "esp32-http-get")))
+            return fetched
+    return None
+
+
+def attach_local_temperature_to_weather_result(args: argparse.Namespace, weather_result: dict[str, Any]) -> dict[str, Any] | None:
+    reading = get_local_temperature_reading(args)
+    if reading is None:
+        return None
+    weather_result["local_temperature"] = reading
+    weather_result["local_temperature_c"] = reading["temperature_c"]
+    return reading
+
+
 def _weather_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -2593,8 +3057,8 @@ def _weather_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def format_weather_uart_payload(weather_result: dict[str, Any]) -> str | None:
-    """Return compact FRDM payload: kind,low_or_temp,high_or_temp,pop,weather_code."""
+def format_weather_uart_payload(weather_result: dict[str, Any], *, local_temperature_c: float | None = None) -> str | None:
+    """Return compact FRDM payload: kind,low_or_temp,high_or_temp,pop,weather_code[,local_temp_c_x10]."""
     if not weather_result.get("ok") or not weather_result.get("handled", weather_result.get("ok")):
         return None
     summary = weather_result.get("weather")
@@ -2616,7 +3080,35 @@ def format_weather_uart_payload(weather_result: dict[str, Any]) -> str | None:
     code = _weather_int(summary.get("weather_code"), -1)
     pop = clamp_int(pop, 0, 100)
     code = clamp_int(code, -1, 999)
-    return f"{kind},{low},{high},{pop},{code}"
+    payload = f"{kind},{low},{high},{pop},{code}"
+    if local_temperature_c is None:
+        local_temperature_c = weather_result.get("local_temperature_c")  # type: ignore[assignment]
+    temp_field = format_temperature_uart_field(local_temperature_c)
+    if temp_field is not None:
+        payload = f"{payload},{temp_field}"
+    return payload
+
+
+def send_weather_uart_update(
+    args: argparse.Namespace,
+    robot: RobotUartController,
+    weather_result: dict[str, Any],
+    *,
+    reason: str,
+) -> str | None:
+    reading = attach_local_temperature_to_weather_result(args, weather_result)
+    payload = format_weather_uart_payload(weather_result)
+    if not payload:
+        return None
+    ok = robot.send_uart_raw_line(f"Weather {payload}", reason=reason, read_ms=100)
+    if ok:
+        if reading is not None:
+            print(f"Weather UART sent: Weather {payload} (local={float(reading['temperature_c']):.1f} C)")
+        else:
+            print(f"Weather UART sent: Weather {payload} (local temperature unavailable)")
+    else:
+        print("WARNING: Weather UART was not sent.")
+    return payload
 
 
 def format_time_uart_payload(current: datetime | None = None) -> str:
@@ -2884,16 +3376,10 @@ def send_startup_weather_update(args: argparse.Namespace, robot: RobotUartContro
     if not result:
         print("Startup weather UART update skipped: no weather result.")
         return None
-    payload = format_weather_uart_payload(result)
+    payload = send_weather_uart_update(args, robot, result, reason="startup weather update")
     if not payload:
         print("Startup weather UART update skipped: weather result did not contain compact numeric data.")
         return result
-
-    ok = robot.send_uart_raw_line(f"Weather {payload}", reason="startup weather update", read_ms=100)
-    if ok:
-        print(f"Startup Weather UART sent: Weather {payload}")
-    else:
-        print("WARNING: Startup Weather UART was not sent.")
     return result
 
 
@@ -3586,6 +4072,7 @@ class FocusModeManager:
             command.append("--uart-dry-run")
         if getattr(self.args, "uart_debug", False):
             command.append("--uart-debug")
+        command.append("--no-active-screen-uart")
         if getattr(self.args, "focus_save_images", False):
             command.append("--save-images")
         if getattr(self.args, "focus_notify_dry_run", False):
@@ -5810,7 +6297,7 @@ def run_self_test() -> int:
             },
             "normal",
             "happy",
-            "nod",
+            "happy_bounce",
         ),
         (
             {
@@ -5829,7 +6316,7 @@ def run_self_test() -> int:
             },
             "unchanged",
             "happy",
-            "nod",
+            "happy_bounce",
         ),
         (
             {
@@ -5854,6 +6341,11 @@ def run_self_test() -> int:
         lowered_reply = reply.lower()
         if any(marker in lowered_reply for marker in ("json", "uart", "motorpitch", "motoryaw", "persistent_state", "head_motion")):
             raise AssertionError(f"reply leaked internal text: {reply!r}")
+
+    if set(HEAD_MOTION_SEQUENCES) != VALID_HEAD_MOTIONS:
+        raise AssertionError(f"HEAD_MOTION_SEQUENCES mismatch: {sorted(set(HEAD_MOTION_SEQUENCES) ^ VALID_HEAD_MOTIONS)}")
+    if set(SPEAKING_HEAD_MOTION_LOOPS) != VALID_HEAD_MOTIONS:
+        raise AssertionError(f"SPEAKING_HEAD_MOTION_LOOPS mismatch: {sorted(set(SPEAKING_HEAD_MOTION_LOOPS) ^ VALID_HEAD_MOTIONS)}")
 
     for motion, sequence in HEAD_MOTION_SEQUENCES.items():
         if not sequence:
@@ -5891,13 +6383,22 @@ def run_self_test() -> int:
         raise AssertionError("look_around should stay keyframe-driven, not over-expanded into jittery micro-steps")
     if yaw_pitch(YAW_RIGHT, PITCH_ATTENTIVE) not in expanded_look or yaw_pitch(YAW_LEFT, PITCH_ATTENTIVE) not in expanded_look:
         raise AssertionError("look_around should visit clear right/left held poses")
+    right_index = expanded_look.index(yaw_pitch(YAW_RIGHT, PITCH_ATTENTIVE))
+    left_soft_index = expanded_look.index(yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE))
+    between_right_and_left = expanded_look[right_index + 1 : left_soft_index]
+    if any(step[0] == "MotorYawPitch" and step[1] == YAW_CENTER for step in between_right_and_left):
+        raise AssertionError(f"look_around should turn directly from right to left without inserted center: {format_motor_sequence(expanded_look)}")
     previous_combo: tuple[int, int] | None = None
     previous_by_command: dict[str, int] = {}
     for command, value, value2 in expanded_look:
         if command == "MotorYawPitch":
             if previous_combo is not None:
                 prev_yaw, prev_pitch = previous_combo
-                if abs(value - prev_yaw) > MOTOR_SMOOTH_STEP_DEG or abs(value2 - prev_pitch) > MOTOR_SMOOTH_STEP_DEG:
+                allowed_direct_cross = crosses_yaw_center(prev_yaw, value)
+                if (
+                    not allowed_direct_cross
+                    and (abs(value - prev_yaw) > MOTOR_SMOOTH_STEP_DEG or abs(value2 - prev_pitch) > MOTOR_SMOOTH_STEP_DEG)
+                ):
                     raise AssertionError(f"smoothed {command} jump too large: {(prev_yaw, prev_pitch)} -> {(value, value2)}")
             previous_combo = (value, value2)
             continue
@@ -5944,6 +6445,8 @@ def run_self_test() -> int:
         raise AssertionError("Time raw dry-run failed")
     if not robot.send_uart_raw_line("Weather daily,23,29,40,61", reason="self-test"):
         raise AssertionError("Weather raw dry-run failed")
+    if not robot.send_uart_raw_line("Weather daily,23,29,40,61,254", reason="self-test"):
+        raise AssertionError("Weather+local-temperature raw dry-run failed")
     if not robot.send_uart_raw_line("Todo 3,1", reason="self-test"):
         raise AssertionError("Todo raw dry-run failed")
     if not robot.send_uart_raw_line("TodoItem 1,42,open,Write%20report", reason="self-test"):
@@ -6036,7 +6539,7 @@ def run_self_test() -> int:
         if speaking_code_for_emotion(raw_emotion) != expected_code:
             raise AssertionError(f"emotion alias Speaking code failed: {raw_emotion}")
     alias_control = normalize_control({"transcript": "我有點擔心", "control": {"emotion": "anxious"}})
-    if alias_control["emotion"] != "concerned" or alias_control["head_motion"] != "gentle_nod":
+    if alias_control["emotion"] != "concerned" or alias_control["head_motion"] != "concerned_tilt":
         raise AssertionError(f"emotion alias control failed: {alias_control}")
     strong_user_tone_control = normalize_control({"transcript": "我操你妈的！", "control": {"emotion": "concerned"}})
     if strong_user_tone_control["emotion"] != "concerned" or speaking_code_for_emotion(strong_user_tone_control["emotion"]) != 1:
@@ -6253,6 +6756,8 @@ def run_self_test() -> int:
         weather_debug=False,
         weather_url=DEFAULT_WEATHER_TOOL_URL,
         weather_default_location="Taipei",
+        no_weather_local_temperature=True,
+        esp32_temperature_mode="disabled",
     )
     weather_route = detect_weather_route({"transcript": "明天下午三點所在地天氣如何？"}, weather_args)
     if not weather_route.get("intent") or weather_route.get("action") != "weather":
@@ -6272,6 +6777,26 @@ def run_self_test() -> int:
     )
     if weather_payload != "daily,22,29,41,61":
         raise AssertionError(f"weather UART payload formatting failed: {weather_payload}")
+    weather_payload_with_local = format_weather_uart_payload(
+        {
+            "ok": True,
+            "handled": True,
+            "weather": {
+                "kind": "daily",
+                "temperature_min_c": 22.5,
+                "temperature_max_c": 28.6,
+                "precipitation_probability_max": 41,
+                "weather_code": 61,
+            },
+        },
+        local_temperature_c=25.36,
+    )
+    if weather_payload_with_local != "daily,22,29,41,61,254":
+        raise AssertionError(f"weather local temperature UART payload formatting failed: {weather_payload_with_local}")
+    if extract_temperature_c({"ok": True, "temperature_c": 25.36}) != 25.36:
+        raise AssertionError("ESP32 temperature JSON parsing failed")
+    if extract_temperature_c("25.4") != 25.4:
+        raise AssertionError("ESP32 plain temperature parsing failed")
     non_weather_route = detect_weather_route({"transcript": "講個笑話"}, weather_args)
     if non_weather_route.get("intent"):
         raise AssertionError(f"non-weather route should not trigger: {non_weather_route}")
@@ -6537,22 +7062,27 @@ def handle_focus_mode_response(
     if timing is not None:
         timing.mark("focus mode command handled")
 
+    tts_ok = False
     try:
         tts_ok = speak_reply_and_wait(response, args)
+    except Exception as exc:
+        print(f"WARNING: focus mode TTS failed unexpectedly: {exc}")
+        tts_ok = False
     finally:
-        robot.stop_speaking_head_motion(head_thread, head_stop, reason="speaking_head_motion focus stop reset")
-    if timing is not None:
-        timing.mark("TTS finished or estimated finished")
-
-    set_post_reply_screen(
-        args,
-        robot,
-        timing,
-        control=control,
-        focus_running=focus_manager.is_running(),
-        focus_stopped=intent == "stop",
-        reason="focus mode reply complete",
-    )
+        try:
+            robot.stop_speaking_head_motion(head_thread, head_stop, reason="speaking_head_motion focus stop reset")
+        finally:
+            if timing is not None:
+                timing.mark("TTS finished or estimated finished")
+            set_post_reply_screen(
+                args,
+                robot,
+                timing,
+                control=control,
+                focus_running=focus_manager.is_running(),
+                focus_stopped=intent == "stop",
+                reason="focus mode reply complete",
+            )
     return tts_ok or not getattr(args, "require_tts", False)
 
 
@@ -6644,6 +7174,10 @@ def handle_wake_chat_response(
     weather_result = maybe_apply_weather_response(response, args)
     if weather_result is not None and timing is not None:
         timing.mark("weather tool handled" if weather_result.get("ok") else "weather tool failed")
+    if weather_result is not None and weather_result.get("ok") and weather_result.get("handled", weather_result.get("ok")):
+        send_weather_uart_update(args, robot, weather_result, reason="weather query update")
+        if timing is not None:
+            timing.mark("Weather UART sent")
 
     control = normalize_control(response)
     response["control"] = control
@@ -7017,6 +7551,7 @@ def send_and_handle_audio_turn(
             print(f"AI raw response preview: {raw_preview}")
 
         transcript = str(response.get("transcript", "") or "")
+        append_ai_trace(response, args, turn_source=str(metadata.get("turn_source") or meta.get("turn_source") or "wake"))
         focus_intent = detect_focus_mode_intent(transcript) if focus_manager is not None else None
         focus_was_running = focus_manager.is_running() if focus_manager is not None else False
         end_keyword = end_session_keyword(transcript)
@@ -7086,13 +7621,19 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     focus_manager: FocusModeManager | None = None
     pet_idle_manager: PetIdleReflectionManager | None = None
     todo_event_listener: FrdmTodoEventListener | None = None
+    temperature_receiver: Esp32TemperatureReceiver | None = None
     try:
+        temperature_receiver = maybe_start_esp32_temperature_receiver(args)
         if not voice_chat.preflight_server(args):
             signal.signal(signal.SIGINT, previous_sigint)
+            if temperature_receiver is not None:
+                temperature_receiver.stop()
             lock.release()
             return 1
         if not voice_chat.preflight_tts(args):
             signal.signal(signal.SIGINT, previous_sigint)
+            if temperature_receiver is not None:
+                temperature_receiver.stop()
             lock.release()
             return 1
 
@@ -7103,11 +7644,15 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         except (RuntimeError, ValueError) as exc:
             print(f"ERROR: {exc}")
             signal.signal(signal.SIGINT, previous_sigint)
+            if temperature_receiver is not None:
+                temperature_receiver.stop()
             lock.release()
             return 1
     except Exception as exc:
         print(f"ERROR: {exc}")
         signal.signal(signal.SIGINT, previous_sigint)
+        if temperature_receiver is not None:
+            temperature_receiver.stop()
         lock.release()
         return 1
 
@@ -7153,6 +7698,8 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             todo_event_listener.stop()
         if camera_manager is not None:
             camera_manager.release()
+        if temperature_receiver is not None:
+            temperature_receiver.stop()
         signal.signal(signal.SIGINT, previous_sigint)
         lock.release()
         return 1
@@ -7260,6 +7807,18 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             f"source=Open-Meteo, startup_uart={startup_weather}"
         )
     print(f"Weather tool: {weather_desc}")
+    if args.no_weather_local_temperature or args.esp32_temperature_mode == "disabled":
+        local_temp_desc = "disabled"
+    elif args.esp32_temperature_mode == "push":
+        local_temp_desc = f"push receiver http://{args.esp32_temperature_host}:{args.esp32_temperature_port}{normalize_temperature_path(args.esp32_temperature_path)}"
+    elif args.esp32_temperature_mode == "pull":
+        local_temp_desc = f"pull {args.esp32_temperature_url or '(missing --esp32-temperature-url)'}"
+    else:
+        local_temp_desc = (
+            f"push receiver http://{args.esp32_temperature_host}:{args.esp32_temperature_port}{normalize_temperature_path(args.esp32_temperature_path)}; "
+            f"pull fallback {args.esp32_temperature_url or '(none)'}"
+        )
+    print(f"Weather local temperature: {local_temp_desc}")
     print(
         "Head motor motion: "
         f"enabled={robot.head_motor_enabled()}, "
@@ -7424,6 +7983,8 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             todo_event_listener.stop()
         if focus_manager is not None:
             focus_manager.shutdown()
+        if temperature_receiver is not None:
+            temperature_receiver.stop()
         if camera_manager is not None:
             camera_manager.release()
         signal.signal(signal.SIGINT, previous_sigint)
@@ -7561,6 +8122,16 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--quiet-dialog",
         action="store_true",
         help="Do not print transcript/reply text in the terminal; keep request id, timing, and device/tool logs.",
+    )
+    conversation_group.add_argument(
+        "--ai-trace-path",
+        default=os.getenv("AI_TRACE_PATH", str(DEFAULT_AI_TRACE_PATH)),
+        help="JSONL path for dashboard AI trace: user transcript + model reply.",
+    )
+    conversation_group.add_argument(
+        "--no-ai-trace-log",
+        action="store_true",
+        help="Disable writing the dashboard AI trace JSONL.",
     )
     conversation_group.add_argument(
         "--speak-end-reply",
@@ -7765,6 +8336,20 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=os.getenv("STARTUP_WEATHER_TEXT", "今天天氣如何"),
         help="Text routed through the existing weather tool at startup before sending Normal.",
     )
+    weather_group.add_argument(
+        "--esp32-temperature-mode",
+        choices=["disabled", "push", "pull", "both"],
+        default=os.getenv("ESP32_TEMPERATURE_MODE", "disabled"),
+        help="Local DS18B20 temperature source: ESP32 POSTs to Jetson, Jetson pulls ESP32 HTTP API, both, or disabled.",
+    )
+    weather_group.add_argument("--esp32-temperature-host", default=os.getenv("ESP32_TEMPERATURE_HOST", "0.0.0.0"), help="Host/IP for Jetson's ESP32 temperature receiver.")
+    weather_group.add_argument("--esp32-temperature-port", type=int, default=_env_int("ESP32_TEMPERATURE_PORT", 8790), help="Port for Jetson's ESP32 temperature receiver.")
+    weather_group.add_argument("--esp32-temperature-path", default=os.getenv("ESP32_TEMPERATURE_PATH", DEFAULT_ESP32_TEMPERATURE_PATH), help="HTTP path for ESP32 temperature POST/GET.")
+    weather_group.add_argument("--esp32-temperature-url", default=os.getenv("ESP32_TEMPERATURE_URL", ""), help="ESP32 temperature JSON URL used in pull/both mode, for example http://192.168.1.50/temperature.")
+    weather_group.add_argument("--esp32-temperature-timeout", type=float, default=_env_float("ESP32_TEMPERATURE_TIMEOUT", 0.6), help="HTTP timeout when pulling ESP32 temperature.")
+    weather_group.add_argument("--esp32-temperature-max-age-sec", type=float, default=_env_float("ESP32_TEMPERATURE_MAX_AGE_SEC", 120.0), help="Maximum age for a pushed ESP32 temperature reading before it is ignored.")
+    weather_group.add_argument("--esp32-temperature-debug", action="store_true", help="Print ESP32 temperature receiver/fetch debug logs.")
+    weather_group.add_argument("--no-weather-local-temperature", action="store_true", help="Do not append ESP32 local temperature to Weather UART payloads.")
     motor_group = parser.add_argument_group("head motor motion")
     motor_group.add_argument(
         "--enable-head-motor",

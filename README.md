@@ -7,6 +7,7 @@ For the live demo, start here:
 ```text
 frdm_uart_context_sender/QUICK_START.md   # full on-site startup guide
 frdm_uart_context_sender/README.md        # architecture, UART, focus/to-do/music/weather details
+smart_home_dashboard/README.md            # phone/web dashboard API for smart home mode
 ```
 
 ## Current Main Features
@@ -25,6 +26,7 @@ Head motor            : MotorPitch 65..90..115, MotorYaw 0..90..180
 TTS                   : Jetson Piper /speak_async, UACDemo audio
 Music tool            : Jetson local /music, mpv + yt-dlp
 Weather tool          : Jetson local /weather, Open-Meteo
+Smart home dashboard  : Jetson local /dashboard + REST API on port 8789
 To-do list            : local JSON voice tool, frdm_uart_context_sender/logs/todo_list.json
 Focus work mode       : samples every 60 seconds; writes focus_summary.json + focus_report.md
 Focus report title    : "專心報告：YYYY/MM/DD/HH 開始的專注時段"
@@ -49,6 +51,7 @@ Startup order:
 Terminal 1 on Windows : desktop_fast_chat_server.py
 Terminal 2 on Jetson  : jetson_piper_tts.server
 Terminal 4 on Jetson  : music_web_player.py   # /music + /weather
+Terminal 5 on Jetson  : smart_home_dashboard/server.py   # phone/web dashboard
 Terminal 3 on Jetson  : wake_voice_chat_frdm_bridge.py
 ```
 
@@ -60,6 +63,7 @@ Jetson Tailscale  : 100.110.90.72
 Windows server    : http://100.108.141.26:8766/voice-chat
 Jetson TTS        : http://127.0.0.1:8777
 Local tools       : http://127.0.0.1:8788/music and /weather
+Phone dashboard   : http://jetson-ip:8789/dashboard
 ```
 
 If the IP changes, update every `100.108.141.26` in the commands below.
@@ -140,6 +144,78 @@ Health check:
 
 ```bash
 curl http://127.0.0.1:8788/health
+```
+
+### Terminal 5: Jetson Smart Home Dashboard API
+
+This is the phone/web entrypoint for the smart-home version of the demo.
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+
+python3 smart_home_dashboard/server.py \
+  --host 0.0.0.0 \
+  --port 8789
+```
+
+Open from a phone on the same network:
+
+```text
+http://jetson-ip:8789/dashboard
+```
+
+The website should call Jetson, not FRDM directly:
+
+```text
+phone browser / website
+-> Jetson dashboard API on :8789
+-> local JSON state, camera frame, focus reports, music/weather sidecars
+-> optional FRDM UART sync for HMI pages
+```
+
+Dashboard API surface:
+
+```text
+GET  /api/status                         # time, devices, sensors, todo, focus, music, weather, health
+GET  /api/camera/latest                  # pet camera snapshot
+GET  /api/camera/stream?fps=2            # MJPEG stream for phone monitor mode
+GET  /api/devices
+POST /api/devices/{device_id}/set        # appliance control
+GET  /api/sensors
+POST /api/sensors/{sensor_id}/update     # FRDM/Jetson sensor hub state
+GET  /api/todo
+POST /api/todo
+POST /api/todo/{id}/done                 # phone checkbox -> Jetson todo JSON
+GET  /api/focus/summaries?range=today|week|month|all
+GET  /api/music/status
+POST /api/music/control
+GET  /api/weather?location=Taipei
+POST /api/frdm/power-cycle
+GET  /api/events
+```
+
+FRDM sync mode:
+
+```text
+Default live voice mode:
+  Wake Bridge owns FRDM UART. Dashboard updates Jetson state and exposes it to phone/web.
+  Dashboard can still power-cycle USB-powered FRDM without owning UART.
+
+Smart-home HMI mode:
+  Dashboard may own FRDM UART and push website actions to FRDM:
+  python3 smart_home_dashboard/server.py --host 0.0.0.0 --port 8789 --frdm-uart-port auto
+```
+
+Do not intentionally run two different processes as the main FRDM UART owner for a demo. Pick Wake Bridge for the voice demo, or Dashboard API for the phone-first smart-home HMI demo.
+
+FRDM recovery button:
+
+```text
+POST /api/frdm/power-cycle cuts Jetson-supplied FRDM power and restores it.
+Default mode resets Jetson xUSB controller 3610000.usb, so USB camera/audio on that controller may briefly reconnect.
+If the website says sudo needs a password, configure NOPASSWD for /usr/bin/tee on the xUSB bind/unbind sysfs files or run the dashboard as root.
+For a cleaner demo, use a dedicated hub port, relay, load switch, or script mode for FRDM-only power control.
 ```
 
 ### Discord Webhook Setup For Focus Reports

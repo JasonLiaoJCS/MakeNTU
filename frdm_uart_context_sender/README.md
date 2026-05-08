@@ -33,6 +33,7 @@ uart                  : auto, 115200, CRLF
 tts                   : local Piper /speak_async, AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
 tts volume            : --tts-volume-gain 2.25, server accepts volume_gain 0.05..8.0
 music/weather         : local tool server on 127.0.0.1:8788, mpv + Open-Meteo
+local temperature     : optional ESP32-S3 + DS18B20 over LAN, merged into Weather UART as a 6th field
 to-do list            : local JSON voice tool, frdm_uart_context_sender/logs/todo_list.json
 focus work mode       : voice-triggered start/stop, periodic /focus-check, JSONL log + Markdown report
 pet idle reflection   : every ~30s ask /text-chat an internal self-question; most checks stay silent, occasional worthy shares use TTS
@@ -65,7 +66,7 @@ Music/weather intent changed                  -> restart Jetson Terminal 4
 Bridge process starts
 -> FRDM startup waits 2 seconds
 -> Jetson sends Time <payload> over UART
--> Jetson calls local /weather once and sends Weather <payload> over UART
+-> Jetson calls local /weather once, merges latest ESP32 local temperature if available, and sends Weather <payload> over UART
 -> Normal 0 0
 -> while idle, every ~30 seconds Jetson may ask the model an internal pet-reflection question
 -> if the model answers PET_IDLE_SILENCE, nothing is spoken
@@ -93,7 +94,7 @@ Focus work mode is a side mode. When the transcript is a work-mode command, the 
 
 Pet idle reflection is intentionally blocked while focus work mode is running. The bridge may still do silent internal checks during normal standby, but it will not start a spontaneous TTS line during focus mode. Disable this behavior with `--no-pet-idle-reflection` or `PET_IDLE_REFLECTION=0`; tune it with `--pet-idle-interval-sec`, `--pet-idle-share-cooldown-sec`, and `--pet-idle-debug`.
 
-This bridge does not use Gemini, OpenAI, or cloud LLM APIs. ASR and Ollama run locally on the Windows desktop. Wake word, camera, TTS, UART, music/weather routing, to-do list, and focus orchestration run locally on the Jetson. Weather uses the local tool server and Open-Meteo; music uses local `mpv`/`yt-dlp`.
+This bridge does not use Gemini, OpenAI, or cloud LLM APIs. ASR and Ollama run locally on the Windows desktop. Wake word, camera, TTS, UART, music/weather routing, ESP32 local-temperature receiving, to-do list, and focus orchestration run locally on the Jetson. Weather uses the local tool server and Open-Meteo; music uses local `mpv`/`yt-dlp`.
 
 ## FRDM State Machine
 
@@ -172,6 +173,7 @@ Time yyyymmdd,hhmmss,isoweekday,utc_offset_min
 
 ```text
 Weather daily,23,29,40,61
+Weather daily,23,29,40,61,254
 Weather current,27,27,0,2
 ```
 
@@ -179,7 +181,10 @@ Payload format:
 
 ```text
 Weather kind,low_or_temp,high_or_temp,rain_percent,open_meteo_weather_code
+Weather kind,low_or_temp,high_or_temp,rain_percent,open_meteo_weather_code,local_temp_c_x10
 ```
+
+The optional 6th field is the ESP32/DS18B20 local temperature in Celsius multiplied by 10. For example, `254` means `25.4 C`, and `-42` means `-4.2 C`. The field is omitted when no recent ESP32 temperature is available, so older FRDM firmware that only parses 5 fields can keep running while the temperature path is being tested.
 
 Dashboard data commands update swipe-page widgets and do not switch screens by themselves. `Todo x,y` means `x=open/unfinished count` and `y=done/completed count`.
 
@@ -327,6 +332,10 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --weather-default-location Taipei \
   --weather-timeout 6 \
   --weather-debug \
+  --esp32-temperature-mode push \
+  --esp32-temperature-host 0.0.0.0 \
+  --esp32-temperature-port 8790 \
+  --esp32-temperature-path /temperature \
   --motor-step-delay 0.55 \
   --motor-smooth-step-deg 120 \
   --motor-speaking-step-delay 0.72 \
@@ -541,10 +550,12 @@ transcript='明天下午三點台北天氣如何'
 -> detect_weather_intent=True
 -> POST /weather {"text": transcript, "default_location": "Taipei"}
 -> Jetson calls Open-Meteo geocoding + forecast API
+-> Wake Bridge reads the latest ESP32/DS18B20 local temperature if enabled
 -> response.reply='台北市、台湾明天約15:00預報約 ...'
 -> replace desktop AI generic reply
+-> FRDM UART gets Weather <Open-Meteo data>[,<local_temp_c_x10>]
 -> TTS speaks weather answer
--> FRDM uses emotion=curious, head_motion=gentle_nod
+-> FRDM uses emotion=curious, head_motion=curious_peek
 ```
 
 Supported phrases:
@@ -579,7 +590,50 @@ Wake Bridge options:
 --weather-debug
 --no-weather
 --weather-always-call
+--esp32-temperature-mode disabled|push|pull|both
+--esp32-temperature-host 0.0.0.0
+--esp32-temperature-port 8790
+--esp32-temperature-path /temperature
+--esp32-temperature-url http://ESP32_IP/temperature
+--esp32-temperature-timeout 0.6
+--esp32-temperature-max-age-sec 120
+--esp32-temperature-debug
+--no-weather-local-temperature
 ```
+
+ESP32 local-temperature merge:
+
+```text
+DS18B20 -> ESP32-S3 GPIO4 -> WiFi LAN -> Jetson Terminal 3 -> Weather UART -> FRDM
+```
+
+Recommended live mode is `push`. Terminal 3 opens an HTTP receiver on the Jetson, and the ESP32 periodically POSTs its current DS18B20 reading:
+
+```text
+Jetson receiver : http://JETSON_LAN_IP:8790/temperature
+ESP32 payload   : {"ok":true,"temperature_c":25.4}
+UART output     : Weather daily,23,29,40,61,254
+```
+
+Use `pull` only if the ESP32 already exposes its own HTTP API, for example `http://ESP32_IP/temperature`. In `both` mode, the Wake Bridge first uses a recent pushed reading and falls back to pulling the ESP32 URL. A pushed reading older than `--esp32-temperature-max-age-sec` is ignored.
+
+Manual ESP32 receiver test after Terminal 3 is running:
+
+```bash
+curl -X POST http://127.0.0.1:8790/temperature \
+  -H "Content-Type: application/json" \
+  -d '{"ok":true,"temperature_c":25.4}'
+```
+
+Expected Terminal 3 log:
+
+```text
+ESP32 temperature receiver: http://0.0.0.0:8790/temperature
+Weather local temperature: push receiver http://0.0.0.0:8790/temperature
+Weather UART sent: Weather daily,23,29,40,61,254 (local=25.4 C)
+```
+
+FRDM firmware note: update `WeatherGui` / `ParseWeatherPayload` to accept either 5 fields or 6 fields. The 6th field is `local_temp_c_x10`, not a float. Display it as integer Celsius plus one decimal digit, for example `254 -> 25.4 C`, in the desired LVGL label.
 
 Manual test:
 
@@ -594,6 +648,7 @@ Fallback behavior:
 ```text
 /weather unreachable    -> Wake Bridge tries to autostart Terminal 4 sidecar
 Open-Meteo unreachable  -> TTS says the local weather tool or source was unavailable
+ESP32 temp unavailable  -> Weather UART keeps the old 5-field payload
 intent not matched      -> no weather call; normal desktop AI reply continues
 ```
 
@@ -860,7 +915,7 @@ Windows `qwen35-fast:latest` is asked to return exactly one JSON object:
     "persistent_state": "normal | sleep | unchanged",
     "screen_mode": "normal | sleep | music | focus | thinking | unchanged",
     "emotion": "neutral | concerned | angry | sad | happy | curious | excited | confused | sleepy",
-    "head_motion": "none | nod | double_nod | look_around | shake | gentle_nod | sleepy_drop",
+    "head_motion": "none | nod | double_nod | look_around | shake | gentle_nod | sleepy_drop | happy_bounce | excited_bounce | curious_peek | concerned_tilt | sad_droop | confused_tilt | firm_shake",
     "reason": "short internal reason, not spoken to the user"
   }
 }
@@ -978,13 +1033,13 @@ Emotion-to-motion fallback:
 
 ```text
 neutral   -> none
-concerned -> gentle_nod
-angry     -> shake
-sad       -> gentle_nod
-happy     -> nod
-curious   -> look_around
-excited   -> double_nod
-confused  -> shake
+concerned -> concerned_tilt
+angry     -> firm_shake
+sad       -> sad_droop
+happy     -> happy_bounce
+curious   -> curious_peek
+excited   -> excited_bounce
+confused  -> confused_tilt
 sleepy    -> sleepy_drop
 ```
 
@@ -1006,14 +1061,14 @@ tired / drowsy / 想睡 / 疲累      -> sleepy
 Local fallback examples:
 
 ```text
-我操你媽的                 -> concerned, gentle_nod, Speaking 1
-我很難過                   -> concerned, gentle_nod, Speaking 1
-太酷了我超期待             -> excited, double_nod, Speaking 4
-這個結果怪怪的我看不懂     -> confused, shake, Speaking 5
-我有點擔心                 -> concerned, gentle_nod, Speaking 1
+我操你媽的                 -> concerned, concerned_tilt, Speaking 1
+我很難過                   -> concerned, concerned_tilt, Speaking 1
+太酷了我超期待             -> excited, excited_bounce, Speaking 4
+這個結果怪怪的我看不懂     -> confused, confused_tilt, Speaking 5
+我有點擔心                 -> concerned, concerned_tilt, Speaking 1
 我好睏想睡                 -> sleepy, sleepy_drop, Speaking 3
-為什麼會這樣               -> curious, look_around, Speaking 5
-太好了很棒                 -> happy, nod, Speaking 4
+為什麼會這樣               -> curious, curious_peek, Speaking 5
+太好了很棒                 -> happy, happy_bounce, Speaking 4
 ```
 
 Sleep/wake intent has higher priority than emotion fallback.
@@ -1067,12 +1122,12 @@ MOTOR_PITCH_MAX=115
 MOTOR_YAW_MIN=0
 MOTOR_YAW_CENTER=90
 MOTOR_YAW_MAX=180
-MOTOR_STEP_DELAY_SEC=0.14
-MOTOR_SMOOTH_STEP_DEG=6
-MOTOR_SPEAKING_STEP_DELAY_SEC=0.16
-MOTOR_SPEAKING_SMOOTH_STEP_DEG=8
-MOTOR_RESET_REPEATS=2
-MOTOR_RESET_DELAY_SEC=0.12
+MOTOR_STEP_DELAY_SEC=0.55
+MOTOR_SMOOTH_STEP_DEG=120
+MOTOR_SPEAKING_STEP_DELAY_SEC=0.72
+MOTOR_SPEAKING_SMOOTH_STEP_DEG=120
+MOTOR_RESET_REPEATS=1
+MOTOR_RESET_DELAY_SEC=0.35
 MOTOR_STOP_TIMEOUT_SEC=6.0
 MOTOR_JOIN_TIMEOUT_SEC=6.0
 ```
@@ -1165,7 +1220,30 @@ gentle_nod:
 
 sleepy_drop:
   center -> diagonal droop -> held down/right -> center
+
+happy_bounce:
+  center -> strong up -> soft down -> up -> center
+
+excited_bounce:
+  center -> right/up -> center -> left/up -> up -> center
+
+curious_peek:
+  center -> right prep -> right/up look -> center/up -> left prep -> left/up look -> center
+
+concerned_tilt:
+  center -> right/down tilt -> down-center hold -> center
+
+sad_droop:
+  center -> right/down -> deeper down/right hold -> center
+
+confused_tilt:
+  center -> right/up tilt -> center -> left/down tilt -> center
+
+firm_shake:
+  center -> right/up limit -> center -> left/up limit -> center
 ```
+
+Emotion fallback uses the expressive versions by default: `happy_bounce`, `excited_bounce`, `curious_peek`, `concerned_tilt`, `sad_droop`, `confused_tilt`, and `firm_shake`. The older generic motions remain available for explicit commands like "點頭" or "搖頭".
 
 In live dialogue, TTS starts a speaking motion loop. While TTS is playing, the loop repeats short motions. When TTS finishes, the stop event centers the head and exits, then the bridge sends the next screen mode.
 
@@ -1232,7 +1310,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --uart-port auto \
   --uart-debug \
   --enable-head-motor \
-  --test-speaking-head-motion shake \
+  --test-speaking-head-motion happy_bounce \
   --test-speaking-seconds 6 \
   --motor-speaking-step-delay 0.72 \
   --motor-speaking-smooth-step-deg 120 \
@@ -1659,6 +1737,8 @@ Jetson:
 [ ] lsusb shows UACDemo / Global Shutter Camera / MCU-LINK
 [ ] Music Web Player /health ok=true
 [ ] Music backend is mpv; pause/resume tested
+[ ] ESP32-S3 and Jetson are on the same LAN if local temperature is enabled
+[ ] ESP32 POST or pull URL returns {"ok":true,"temperature_c":...}
 [ ] wake bridge self-test OK
 [ ] focus_work_mode.py self-test OK
 [ ] focus mock session writes focus_log.jsonl / focus_summary.json / focus_report.md

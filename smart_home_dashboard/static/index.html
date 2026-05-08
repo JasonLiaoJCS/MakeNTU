@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f4f5f7">
+  <title>Smart Home Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <div class="header-row">
+        <div class="brand">
+          <div class="brand-icon">SH</div>
+          <div>
+            <div class="brand-title">Smart Home</div>
+            <div class="brand-sub" id="header-sub">Dashboard</div>
+          </div>
+        </div>
+        <div class="header-status" id="header-status">
+          <span class="dot" id="conn-dot"></span>
+          <span id="conn-text">connecting...</span>
+        </div>
+      </div>
+
+      <nav class="segmented tabs-top" role="tablist" id="tabs-top">
+        <button data-tab="live" class="active" role="tab"><span class="seg-icon">●</span>Live</button>
+        <button data-tab="focus" role="tab"><span class="seg-icon">◐</span>Focus</button>
+        <button data-tab="control" role="tab"><span class="seg-icon">◇</span>Control</button>
+        <button data-tab="ai" role="tab"><span class="seg-icon">◆</span>AI</button>
+      </nav>
+    </header>
+
+    <section class="tab-panel active" id="panel-live">
+      <div class="section">
+        <div class="section-title">Pet Camera</div>
+        <div class="card camera-card">
+          <div class="camera-frame">
+            <img id="camera-img" src="/api/camera/latest" alt="Pet camera">
+            <div class="camera-overlay">
+              <div class="camera-badge"><span class="live-dot"></span>LIVE</div>
+              <div class="camera-badge" id="camera-time">--</div>
+            </div>
+          </div>
+          <div class="camera-meta">
+            <span>Pet camera <strong id="camera-source">Jetson</strong></span>
+            <span id="camera-status">Auto-refresh every 5s</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Home Status</div>
+        <div class="home-status">
+          <div class="status-card">
+            <div class="status-icon ok" id="home-mode-icon">⌂</div>
+            <div>
+              <div class="status-label">Mode</div>
+              <div class="status-value" id="home-mode">--</div>
+            </div>
+          </div>
+          <div class="status-card">
+            <div class="status-icon info" id="person-icon">◉</div>
+            <div>
+              <div class="status-label">Person</div>
+              <div class="status-value" id="person-detected">--</div>
+            </div>
+          </div>
+        </div>
+        <div class="last-update-line">
+          Last update: <span id="last-update">--</span>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Weather</div>
+        <div class="card weather-card" id="weather-card">
+          <div class="weather-icon" id="weather-icon">⛅</div>
+          <div>
+            <div class="weather-temp"><span id="weather-temp">--</span>°C</div>
+            <div class="weather-condition" id="weather-condition">--</div>
+          </div>
+          <div class="weather-extra">
+            <div>Rain <strong id="weather-rain">--%</strong></div>
+            <div>Humidity <strong id="weather-humidity">--%</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">System Health</div>
+        <div class="health-grid" id="health-grid"></div>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="panel-focus">
+      <div class="section">
+        <nav class="segmented" id="focus-range">
+          <button data-range="today" class="active">Daily</button>
+          <button data-range="month">Monthly</button>
+        </nav>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Summary</div>
+        <div class="focus-stats">
+          <div class="stat-card">
+            <div class="stat-label">Focus Score</div>
+            <div class="stat-value accent"><span id="focus-score">--</span></div>
+            <div class="stat-sub" id="focus-score-sub">avg over sessions</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Focus Time</div>
+            <div class="stat-value ok"><span id="focus-time">--</span><span class="stat-unit">min</span></div>
+            <div class="stat-sub"><span id="focus-percent">--</span>% of total</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Distracted</div>
+            <div class="stat-value"><span id="distracted-time">--</span><span class="stat-unit">min</span></div>
+            <div class="stat-sub" id="distract-sub">--</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Sessions</div>
+            <div class="stat-value"><span id="session-count">--</span></div>
+            <div class="stat-sub" id="session-sub">today</div>
+          </div>
+        </div>
+
+        <div class="card compact-card">
+          <div class="breakdown">
+            <div class="breakdown-item">
+              <div class="breakdown-num" id="phone-count">--</div>
+              <div class="breakdown-label">Phone</div>
+            </div>
+            <div class="breakdown-item">
+              <div class="breakdown-num" id="away-count">--</div>
+              <div class="breakdown-label">Away</div>
+            </div>
+            <div class="breakdown-item">
+              <div class="breakdown-num" id="sleeping-count">--</div>
+              <div class="breakdown-label">Sleeping</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title" id="chart-title-section">Hourly Breakdown</div>
+        <div class="card chart-card">
+          <div class="chart-title">
+            <span id="chart-label">Today</span>
+            <div class="chart-legend">
+              <span><span class="legend-swatch swatch-ok"></span>Focused</span>
+              <span><span class="legend-swatch swatch-danger"></span>Distracted</span>
+            </div>
+          </div>
+          <svg class="chart-svg" id="focus-chart" viewBox="0 0 600 160" preserveAspectRatio="none"></svg>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Recent Sessions</div>
+        <div id="session-list">
+          <div class="empty">Loading sessions...</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="panel-ai">
+      <div class="section">
+        <div class="section-title">
+          Live AI Trace
+          <button class="section-action" id="ai-refresh-btn" type="button">Refresh</button>
+        </div>
+        <div class="focus-stats ai-stats">
+          <div class="stat-card">
+            <div class="stat-label">Model</div>
+            <div class="stat-value small" id="ai-model">--</div>
+            <div class="stat-sub">Ollama text / vision</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Server</div>
+            <div class="stat-value small" id="ai-ready">--</div>
+            <div class="stat-sub" id="ai-source">health trace</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Recent Turns</div>
+        <div id="ai-trace-list">
+          <div class="empty">Loading AI trace...</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="panel-control">
+      <div class="section">
+        <div class="section-title">Devices</div>
+        <div id="device-list">
+          <div class="empty">Loading devices...</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">
+          To-do
+          <button class="section-action" id="todo-clear-btn" type="button">Clear completed</button>
+        </div>
+        <div class="todo-add">
+          <input type="text" class="todo-input" id="todo-input" placeholder="Add a task..." maxlength="160">
+          <button class="btn-primary" id="todo-add-btn" type="button">Add</button>
+        </div>
+        <ul class="todo-list" id="todo-list">
+          <li class="empty">No tasks yet</li>
+        </ul>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Music</div>
+        <div class="card music-card">
+          <div class="music-title" id="music-title">Nothing playing</div>
+          <div class="music-artist" id="music-artist">--</div>
+          <div class="music-controls">
+            <button class="music-btn" id="music-stop" title="Stop" type="button">■</button>
+            <button class="music-btn primary" id="music-play" title="Play / Pause" type="button">▶</button>
+            <button class="music-btn" id="music-next" title="Play default" type="button">▶▶</button>
+            <span class="music-status" id="music-status">stopped</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Maintenance</div>
+        <div class="card maintenance-card">
+          <div>
+            <div class="maintenance-title">FRDM Panel</div>
+            <div class="maintenance-sub">Cut Jetson USB power, then restore it.</div>
+          </div>
+          <button class="btn-danger" id="frdm-reset-btn" type="button">Power Cycle</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Event Log</div>
+        <div class="card event-card">
+          <ul class="event-log" id="event-log">
+            <li class="empty">No events yet</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <nav class="tab-bar" role="tablist">
+      <button data-tab="live" class="active" type="button"><span class="tab-icon">●</span>Live</button>
+      <button data-tab="focus" type="button"><span class="tab-icon">◐</span>Focus</button>
+      <button data-tab="control" type="button"><span class="tab-icon">◇</span>Control</button>
+      <button data-tab="ai" type="button"><span class="tab-icon">◆</span>AI</button>
+    </nav>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

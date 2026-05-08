@@ -24,6 +24,8 @@ ENV/
 *.log
 *.jsonl
 fast_chat_debug.jsonl
+frdm_uart_context_sender/logs/
+smart_home_dashboard/data/*.json
 
 # Generated archives and audio
 *.zip

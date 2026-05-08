@@ -1169,6 +1169,8 @@ class FocusSession:
         self._send_uart(STATE_UART_COMMANDS.get(state, "Confused"), reason=f"{state} streak={self.streak_count}")
 
     def _send_uart(self, command: str, *, reason: str, force: bool = False) -> None:
+        if getattr(self.args, "no_active_screen_uart", False) and str(command or "").strip() != "Normal":
+            return
         if not force and command == self.last_uart_command:
             return
         if self.uart.send(command, reason=reason):
@@ -1308,6 +1310,17 @@ def build_parser() -> argparse.ArgumentParser:
     uart.add_argument("--uart-baudrate", type=int, default=int(os.getenv("FOCUS_UART_BAUDRATE", "115200")))
     uart.add_argument("--uart-timeout", type=float, default=float(os.getenv("FOCUS_UART_TIMEOUT", "0.08")))
     uart.add_argument("--uart-line-ending", choices=["lf", "crlf"], default=os.getenv("FOCUS_UART_LINE_ENDING", "crlf"))
+    uart.add_argument(
+        "--no-active-screen-uart",
+        action="store_true",
+        help="Do not send active focus screen-state UART commands; still allow Focus dashboard raw updates and final Normal.",
+    )
+    uart.add_argument(
+        "--no-screen-uart",
+        action="store_true",
+        dest="no_active_screen_uart",
+        help="Compatibility alias for --no-active-screen-uart.",
+    )
     uart.add_argument("--alert-threshold", type=int, default=int(os.getenv("FOCUS_ALERT_THRESHOLD", "2")), help="Non-focused streak before changing robot state.")
 
     parser.add_argument("--self-test", action="store_true", help="Run local parser/report tests and exit.")
