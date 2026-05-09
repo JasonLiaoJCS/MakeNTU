@@ -47,6 +47,38 @@ OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 DEFAULT_WEATHER_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "Taipei")
 DEFAULT_WEATHER_LANGUAGE = os.getenv("WEATHER_LANGUAGE", "zh")
 DEFAULT_WEATHER_TIMEOUT_SEC = float(os.getenv("WEATHER_TIMEOUT_SEC", "5.0"))
+DEFAULT_WEATHER_CACHE_TTL_SEC = float(os.getenv("WEATHER_CACHE_TTL_SEC", "300.0"))
+_WEATHER_CACHE_LOCK = threading.Lock()
+_WEATHER_GEOCODE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_WEATHER_FORECAST_CACHE: dict[tuple[float, float], tuple[float, dict[str, Any]]] = {}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
+
+
+DEFAULT_MPV_AUDIO_DEVICE = os.getenv("MPV_AUDIO_DEVICE", "auto")
+DEFAULT_MPV_AUDIO_DEVICE_KEYWORD = os.getenv("MPV_AUDIO_DEVICE_KEYWORD", "UACDemo")
+DEFAULT_MPV_YTDL_COOKIES = os.getenv("MPV_YTDL_COOKIES", os.getenv("YTDLP_COOKIES", ""))
+DEFAULT_MPV_YTDL_COOKIES_FROM_BROWSER = os.getenv("MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("YTDLP_COOKIES_FROM_BROWSER", ""))
+DEFAULT_MPV_VOLUME = _env_int("MPV_VOLUME", 100)
+DEFAULT_MPV_READY_TIMEOUT_SEC = _env_float("MPV_READY_TIMEOUT_SEC", _env_float("MPV_READY_TIMEOUT", 1.5))
 
 WAKE_WORD_PATTERNS = (
     r"\bhey\s+jarvis\b",
@@ -457,8 +489,37 @@ def _http_get_json(url: str, *, timeout_sec: float) -> dict[str, Any]:
     return parsed
 
 
+def _weather_cache_get(cache: dict[Any, tuple[float, dict[str, Any]]], key: Any) -> dict[str, Any] | None:
+    ttl = max(0.0, DEFAULT_WEATHER_CACHE_TTL_SEC)
+    if ttl <= 0.0:
+        return None
+    now = time.monotonic()
+    with _WEATHER_CACHE_LOCK:
+        item = cache.get(key)
+        if item is None:
+            return None
+        saved_at, value = item
+        if now - saved_at > ttl:
+            cache.pop(key, None)
+            return None
+        return dict(value)
+
+
+def _weather_cache_set(cache: dict[Any, tuple[float, dict[str, Any]]], key: Any, value: dict[str, Any]) -> None:
+    ttl = max(0.0, DEFAULT_WEATHER_CACHE_TTL_SEC)
+    if ttl <= 0.0:
+        return
+    with _WEATHER_CACHE_LOCK:
+        cache[key] = (time.monotonic(), dict(value))
+
+
 def geocode_location(location: str, *, language: str = DEFAULT_WEATHER_LANGUAGE, timeout_sec: float = DEFAULT_WEATHER_TIMEOUT_SEC) -> dict[str, Any]:
     query = WEATHER_LOCATION_ALIASES.get(normalize_text(location), normalize_text(location) or DEFAULT_WEATHER_LOCATION)
+    cache_key = (query.lower(), language)
+    cached = _weather_cache_get(_WEATHER_GEOCODE_CACHE, cache_key)
+    if cached is not None:
+        cached["cache_hit"] = True
+        return cached
     params = urllib.parse.urlencode({"name": query, "count": 1, "language": language, "format": "json"})
     url = f"{OPEN_METEO_GEOCODING_URL}?{params}"
     data = _http_get_json(url, timeout_sec=timeout_sec)
@@ -468,7 +529,7 @@ def geocode_location(location: str, *, language: str = DEFAULT_WEATHER_LANGUAGE,
     first = results[0]
     if not isinstance(first, dict):
         raise RuntimeError(f"地點資料格式不正確：{location}")
-    return {
+    result = {
         "name": first.get("name") or query,
         "country": first.get("country") or "",
         "admin1": first.get("admin1") or "",
@@ -478,6 +539,8 @@ def geocode_location(location: str, *, language: str = DEFAULT_WEATHER_LANGUAGE,
         "query": query,
         "geocoding_url": url,
     }
+    _weather_cache_set(_WEATHER_GEOCODE_CACHE, cache_key, result)
+    return result
 
 
 def _safe_zone_now(timezone_name: str) -> datetime:
@@ -570,6 +633,11 @@ def parse_weather_target(text: str | None, *, now: datetime | None = None) -> di
 
 
 def fetch_open_meteo_forecast(location_info: dict[str, Any], *, timeout_sec: float = DEFAULT_WEATHER_TIMEOUT_SEC) -> dict[str, Any]:
+    cache_key = (round(float(location_info["latitude"]), 4), round(float(location_info["longitude"]), 4))
+    cached = _weather_cache_get(_WEATHER_FORECAST_CACHE, cache_key)
+    if cached is not None:
+        cached["cache_hit"] = True
+        return cached
     params = urllib.parse.urlencode(
         {
             "latitude": location_info["latitude"],
@@ -611,6 +679,7 @@ def fetch_open_meteo_forecast(location_info: dict[str, Any], *, timeout_sec: flo
     url = f"{OPEN_METEO_FORECAST_URL}?{params}"
     data = _http_get_json(url, timeout_sec=timeout_sec)
     data["_request_url"] = url
+    _weather_cache_set(_WEATHER_FORECAST_CACHE, cache_key, data)
     return data
 
 
@@ -744,6 +813,12 @@ def handle_weather_text(
     language: str = DEFAULT_WEATHER_LANGUAGE,
     timeout_sec: float = DEFAULT_WEATHER_TIMEOUT_SEC,
 ) -> dict[str, Any]:
+    started = time.monotonic()
+    timeout_sec = max(0.8, float(timeout_sec or DEFAULT_WEATHER_TIMEOUT_SEC))
+
+    def remaining_timeout(*, floor: float = 0.6) -> float:
+        return max(floor, timeout_sec - (time.monotonic() - started))
+
     intent = detect_weather_intent(text, default_location=default_location)
     result: dict[str, Any] = {
         "ok": True,
@@ -758,8 +833,8 @@ def handle_weather_text(
         result["message"] = "not a weather request"
         return result
 
-    location_info = geocode_location(intent.location or default_location, language=language, timeout_sec=timeout_sec)
-    forecast = fetch_open_meteo_forecast(location_info, timeout_sec=timeout_sec)
+    location_info = geocode_location(intent.location or default_location, language=language, timeout_sec=remaining_timeout())
+    forecast = fetch_open_meteo_forecast(location_info, timeout_sec=remaining_timeout())
     now = _safe_zone_now(str(forecast.get("timezone") or location_info.get("timezone") or "UTC"))
     target = parse_weather_target(text, now=now)
     reply, summary = build_weather_reply(location_info, forecast, target)
@@ -778,6 +853,12 @@ def handle_weather_text(
             "weather": summary,
             "forecast_url": forecast.get("_request_url"),
             "geocoding_url": location_info.get("geocoding_url"),
+            "cache": {
+                "geocode": bool(location_info.get("cache_hit")),
+                "forecast": bool(forecast.get("cache_hit")),
+                "ttl_sec": DEFAULT_WEATHER_CACHE_TTL_SEC,
+            },
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
         }
     )
     return result
@@ -791,10 +872,95 @@ def youtube_search_url(query: str) -> str:
     return YOUTUBE_SEARCH_URL + urllib.parse.quote_plus(query)
 
 
+def list_mpv_audio_devices(*, timeout_sec: float = 2.0) -> list[tuple[str, str]]:
+    mpv = shutil.which("mpv")
+    if not mpv:
+        return []
+    try:
+        completed = subprocess.run(
+            [mpv, "--audio-device=help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except Exception:
+        return []
+    devices: list[tuple[str, str]] = []
+    for line in f"{completed.stdout}\n{completed.stderr}".splitlines():
+        match = re.match(r"\s*'([^']+)'\s+\((.*)\)\s*$", line)
+        if match:
+            devices.append((match.group(1).strip(), match.group(2).strip()))
+    return devices
+
+
+def uacdemo_alsa_card_names(*, keyword: str = DEFAULT_MPV_AUDIO_DEVICE_KEYWORD) -> list[str]:
+    try:
+        cards_text = open("/proc/asound/cards", encoding="utf-8", errors="replace").read()
+    except OSError:
+        return []
+    names: list[str] = []
+    pattern = re.compile(r"^\s*\d+\s+\[([^\]]+)\]\s*:\s*(.*)$")
+    keyword_lower = keyword.lower()
+    for line in cards_text.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        card_name = match.group(1).strip()
+        description = match.group(2).strip()
+        if keyword_lower in card_name.lower() or keyword_lower in description.lower():
+            names.append(card_name)
+    return names
+
+
+def resolve_mpv_audio_device(requested: str | None, *, keyword: str = DEFAULT_MPV_AUDIO_DEVICE_KEYWORD) -> str:
+    value = str(requested or "").strip()
+    lowered = value.lower()
+    if lowered in {"", "default", "system", "none", "off"}:
+        return ""
+    if lowered not in {"auto", "auto-uacdemo", "uacdemo"}:
+        return value
+
+    devices = list_mpv_audio_devices()
+    keyword_lower = keyword.lower()
+
+    def matches(identifier: str, label: str) -> bool:
+        return keyword_lower in identifier.lower() or keyword_lower in label.lower()
+
+    for prefix in ("pulse/", "alsa/plughw:", "alsa/sysdefault:", "alsa/dmix:"):
+        for identifier, label in devices:
+            if identifier.startswith(prefix) and matches(identifier, label):
+                return identifier
+    for identifier, label in devices:
+        if matches(identifier, label):
+            return identifier
+    for card_name in uacdemo_alsa_card_names(keyword=keyword):
+        return f"alsa/plughw:CARD={card_name},DEV=0"
+    return ""
+
+
 class MusicPlayer:
-    def __init__(self, *, backend: str = DEFAULT_BACKEND, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        backend: str = DEFAULT_BACKEND,
+        dry_run: bool = False,
+        mpv_audio_device: str = DEFAULT_MPV_AUDIO_DEVICE,
+        mpv_audio_keyword: str = DEFAULT_MPV_AUDIO_DEVICE_KEYWORD,
+        mpv_ytdl_cookies: str = DEFAULT_MPV_YTDL_COOKIES,
+        mpv_ytdl_cookies_from_browser: str = DEFAULT_MPV_YTDL_COOKIES_FROM_BROWSER,
+        mpv_volume: int = DEFAULT_MPV_VOLUME,
+        mpv_ready_timeout: float = DEFAULT_MPV_READY_TIMEOUT_SEC,
+    ) -> None:
         self.backend = backend
         self.dry_run = dry_run
+        self.requested_mpv_audio_device = str(mpv_audio_device or "").strip()
+        self.mpv_audio_keyword = str(mpv_audio_keyword or DEFAULT_MPV_AUDIO_DEVICE_KEYWORD).strip() or DEFAULT_MPV_AUDIO_DEVICE_KEYWORD
+        self.mpv_audio_device = resolve_mpv_audio_device(self.requested_mpv_audio_device, keyword=self.mpv_audio_keyword)
+        self.mpv_ytdl_cookies = str(mpv_ytdl_cookies or "").strip()
+        self.mpv_ytdl_cookies_from_browser = str(mpv_ytdl_cookies_from_browser or "").strip()
+        self.mpv_volume = max(0, min(150, int(mpv_volume)))
+        self.mpv_ready_timeout = max(0.0, float(mpv_ready_timeout))
         self._lock = threading.RLock()
         self._process: subprocess.Popen[Any] | None = None
         self._ipc_path: str | None = None
@@ -873,6 +1039,51 @@ class MusicPlayer:
         response = result.get("mpv_response") if isinstance(result.get("mpv_response"), dict) else {}
         return response.get("data")
 
+    def _resolve_audio_device_for_play(self) -> str:
+        lowered = self.requested_mpv_audio_device.lower()
+        if lowered in {"auto", "auto-uacdemo", "uacdemo"}:
+            self.mpv_audio_device = resolve_mpv_audio_device(
+                self.requested_mpv_audio_device,
+                keyword=self.mpv_audio_keyword,
+            )
+        return self.mpv_audio_device
+
+    def _mpv_playback_snapshot(self) -> dict[str, Any]:
+        snapshot = {
+            "title": self._mpv_property("media-title"),
+            "url": self._mpv_property("path"),
+            "pause": self._mpv_property("pause"),
+            "core_idle": self._mpv_property("core-idle"),
+            "eof_reached": self._mpv_property("eof-reached"),
+            "audio_params": self._mpv_property("audio-params"),
+            "audio_out": self._mpv_property("audio-out-params"),
+            "volume": self._mpv_property("volume"),
+        }
+        return snapshot
+
+    def _wait_for_mpv_playback(self, *, wait_sec: float) -> dict[str, Any]:
+        deadline = time.monotonic() + max(0.0, wait_sec)
+        latest: dict[str, Any] = {}
+        while True:
+            with self._lock:
+                active = self._is_active_locked()
+                returncode = self._process.poll() if self._process is not None else None
+            if not active:
+                latest["playback_ready"] = False
+                latest["mpv_returncode"] = returncode
+                return latest
+            latest = self._mpv_playback_snapshot()
+            if latest.get("audio_out"):
+                latest["playback_ready"] = True
+                return latest
+            if latest.get("title") and latest.get("eof_reached") is not True:
+                latest["playback_ready"] = True
+                return latest
+            if time.monotonic() >= deadline:
+                latest["playback_ready"] = False
+                return latest
+            time.sleep(0.15)
+
     def _refresh_now_playing_once(self) -> dict[str, Any]:
         title = self._mpv_property("media-title")
         artist = (
@@ -906,8 +1117,10 @@ class MusicPlayer:
     def status(self) -> dict[str, Any]:
         with self._lock:
             active = self._is_active_locked()
+        playback: dict[str, Any] = {}
         if active:
             self._refresh_now_playing()
+            playback = self._mpv_playback_snapshot()
         with self._lock:
             active = self._is_active_locked()
             return {
@@ -920,6 +1133,16 @@ class MusicPlayer:
                 "artist": self.last_artist if active else "",
                 "url": self.last_url if active else "",
                 "ipc_path": self._ipc_path if active else None,
+                "mpv_audio_device": self.mpv_audio_device or "system-default",
+                "requested_mpv_audio_device": self.requested_mpv_audio_device or "default",
+                "mpv_audio_keyword": self.mpv_audio_keyword,
+                "mpv_ytdl_cookies": self.mpv_ytdl_cookies,
+                "mpv_ytdl_cookies_configured": bool(self.mpv_ytdl_cookies),
+                "mpv_ytdl_cookies_from_browser": self.mpv_ytdl_cookies_from_browser,
+                "mpv_volume": self.mpv_volume,
+                "playback_ready": bool(playback.get("audio_out") or playback.get("title")) if active else False,
+                "audio_out": playback.get("audio_out") if active else None,
+                "audio_params": playback.get("audio_params") if active else None,
             }
 
     def stop(self) -> dict[str, Any]:
@@ -1043,6 +1266,18 @@ class MusicPlayer:
                 "error": "yt-dlp/youtube-dl not found. Install yt-dlp or use --backend browser.",
             }
 
+        audio_device = self._resolve_audio_device_for_play()
+        cookies_path = str(Path(self.mpv_ytdl_cookies).expanduser()) if self.mpv_ytdl_cookies else ""
+        cookies_from_browser = self.mpv_ytdl_cookies_from_browser
+        if cookies_path and not Path(cookies_path).exists():
+            return {
+                "ok": False,
+                "action": "play",
+                "backend": "mpv",
+                "query": query,
+                "error": f"cookies file not found: {cookies_path}",
+            }
+
         self.stop()
         target = f"ytdl://ytsearch1:{query}"
         ipc_path = f"/tmp/makentu_music_web_player_{os.getpid()}.sock"
@@ -1056,11 +1291,24 @@ class MusicPlayer:
             mpv,
             "--no-video",
             "--force-window=no",
-            "--really-quiet",
+            "--msg-level=all=warn",
             f"--input-ipc-server={ipc_path}",
             "--term-playing-msg=Now playing: ${media-title}",
-            target,
         ]
+        if audio_device:
+            command.append(f"--audio-device={audio_device}")
+        command.append(f"--volume={self.mpv_volume}")
+        if cookies_path:
+            command.extend(
+                [
+                    "--cookies",
+                    f"--cookies-file={cookies_path}",
+                    f"--ytdl-raw-options=cookies={cookies_path}",
+                ]
+            )
+        elif cookies_from_browser:
+            command.append(f"--ytdl-raw-options=cookies-from-browser={cookies_from_browser}")
+        command.append(target)
         try:
             with self._lock:
                 self._process = subprocess.Popen(command)
@@ -1071,28 +1319,40 @@ class MusicPlayer:
                 self.last_title = ""
                 self.last_artist = ""
                 self.last_url = target
-            deadline = time.monotonic() + 1.5
+            deadline = time.monotonic() + max(0.3, self.mpv_ready_timeout)
             while time.monotonic() < deadline and not os.path.exists(ipc_path):
                 with self._lock:
                     if self._process is None or self._process.poll() is not None:
                         break
                 time.sleep(0.05)
             ipc_ready = os.path.exists(ipc_path)
-            now_playing = self._refresh_now_playing(wait_sec=1.2) if ipc_ready else {}
+            playback = self._wait_for_mpv_playback(wait_sec=self.mpv_ready_timeout) if ipc_ready else {}
+            now_playing = self._refresh_now_playing(wait_sec=0.2) if ipc_ready else {}
             result = {
                 "ok": True,
                 "action": "play",
                 "backend": "mpv",
                 "query": query,
                 "target": target,
+                "audio_device": audio_device or "system-default",
+                "requested_audio_device": self.requested_mpv_audio_device or "default",
+                "cookies": cookies_path,
+                "cookies_configured": bool(cookies_path),
+                "cookies_from_browser": "" if cookies_path else cookies_from_browser,
+                "volume": self.mpv_volume,
                 "ipc_path": ipc_path,
                 "ipc_ready": ipc_ready,
-                "title": now_playing.get("title") or "",
+                "playback_ready": playback.get("playback_ready") if ipc_ready else False,
+                "audio_out": playback.get("audio_out") if ipc_ready else None,
+                "audio_params": playback.get("audio_params") if ipc_ready else None,
+                "title": now_playing.get("title") or playback.get("title") or "",
                 "artist": now_playing.get("artist") or "",
-                "url": now_playing.get("url") or target,
+                "url": now_playing.get("url") or playback.get("url") or target,
             }
             if not ipc_ready:
                 result["warning"] = "mpv IPC socket was not ready yet; pause/resume may fail until mpv finishes starting"
+            elif not result["playback_ready"]:
+                result["warning"] = "mpv started but did not expose playback audio status before timeout; check Terminal 4 for yt-dlp/YouTube errors"
             return result
         except Exception as exc:
             return {"ok": False, "action": "play", "backend": "mpv", "query": query, "error": str(exc)}
@@ -1133,13 +1393,17 @@ def handle_text(player: MusicPlayer, text: str, *, backend: str | None = None, d
     return result
 
 
-def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> bool:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        return False
+    return True
 
 
 def make_handler(
@@ -1149,11 +1413,14 @@ def make_handler(
     default_dry_run: bool,
     weather_default_location: str,
     weather_language: str,
+    weather_timeout_sec: float = DEFAULT_WEATHER_TIMEOUT_SEC,
 ) -> type[BaseHTTPRequestHandler]:
     class MusicHandler(BaseHTTPRequestHandler):
         server_version = "MakeNTUMusicTool/1.0"
 
         def log_message(self, fmt: str, *args: Any) -> None:
+            if self.path.startswith("/health"):
+                return
             print(f"{self.address_string()} - {fmt % args}")
 
         def do_GET(self) -> None:
@@ -1178,6 +1445,16 @@ def make_handler(
                         "active": status["active"],
                         "paused": status["paused"],
                         "ipc_path": status["ipc_path"],
+                        "mpv_audio_device": status.get("mpv_audio_device"),
+                        "requested_mpv_audio_device": status.get("requested_mpv_audio_device"),
+                        "mpv_audio_keyword": status.get("mpv_audio_keyword"),
+                        "mpv_ytdl_cookies": status.get("mpv_ytdl_cookies"),
+                        "mpv_ytdl_cookies_configured": status.get("mpv_ytdl_cookies_configured"),
+                        "mpv_ytdl_cookies_from_browser": status.get("mpv_ytdl_cookies_from_browser"),
+                        "mpv_volume": status.get("mpv_volume"),
+                        "playback_ready": status.get("playback_ready"),
+                        "audio_out": status.get("audio_out"),
+                        "audio_params": status.get("audio_params"),
                         "weather_available": True,
                         "weather_source": "open-meteo",
                         "weather_default_location": weather_default_location,
@@ -1208,7 +1485,7 @@ def make_handler(
             if self.path.startswith("/weather"):
                 default_location = str(data.get("default_location") or data.get("location") or weather_default_location).strip() or weather_default_location
                 language = str(data.get("language") or weather_language).strip() or weather_language
-                timeout_sec = float(data.get("timeout_sec") or DEFAULT_WEATHER_TIMEOUT_SEC)
+                timeout_sec = float(data.get("timeout_sec") or weather_timeout_sec or DEFAULT_WEATHER_TIMEOUT_SEC)
                 if data.get("location") and not text:
                     text = f"{data.get('location')} 天氣"
                 try:
@@ -1263,7 +1540,16 @@ def make_handler(
 
 
 def run_server(args: argparse.Namespace) -> int:
-    player = MusicPlayer(backend=args.backend, dry_run=args.dry_run)
+    player = MusicPlayer(
+        backend=args.backend,
+        dry_run=args.dry_run,
+        mpv_audio_device=args.mpv_audio_device,
+        mpv_audio_keyword=args.mpv_audio_keyword,
+        mpv_ytdl_cookies=args.mpv_ytdl_cookies,
+        mpv_ytdl_cookies_from_browser=args.mpv_ytdl_cookies_from_browser,
+        mpv_volume=args.mpv_volume,
+        mpv_ready_timeout=args.mpv_ready_timeout,
+    )
     try:
         server = ThreadingHTTPServer(
             (args.host, args.port),
@@ -1273,6 +1559,7 @@ def run_server(args: argparse.Namespace) -> int:
                 default_dry_run=args.dry_run,
                 weather_default_location=args.weather_default_location,
                 weather_language=args.weather_language,
+                weather_timeout_sec=args.weather_timeout,
             ),
         )
     except OSError as exc:
@@ -1297,7 +1584,14 @@ def run_server(args: argparse.Namespace) -> int:
     print(f"  URL     : http://{args.host}:{args.port}/music")
     print(f"  backend : {args.backend}")
     print(f"  dry_run : {args.dry_run}")
-    print(f"  weather : Open-Meteo, default_location={args.weather_default_location}")
+    if args.backend == "mpv":
+        print(f"  mpv out : {player.mpv_audio_device or 'system-default'}")
+        print(f"  mpv vol : {player.mpv_volume}")
+        if player.mpv_ytdl_cookies:
+            print(f"  cookies : {Path(player.mpv_ytdl_cookies).expanduser()}")
+        elif player.mpv_ytdl_cookies_from_browser:
+            print(f"  cookies : browser:{player.mpv_ytdl_cookies_from_browser}")
+    print(f"  weather : Open-Meteo, default_location={args.weather_default_location}, timeout={args.weather_timeout:g}s")
     print("  note    : browser backend opens a legal streaming/search page; mpv backend requires yt-dlp.")
     server.serve_forever(poll_interval=0.5)
     stop_event.set()
@@ -1329,10 +1623,29 @@ def run_self_test() -> int:
         if expected_query and intent.query != expected_query:
             raise AssertionError(f"bad query for {text!r}: {intent.query!r}")
 
-    player = MusicPlayer(backend="browser", dry_run=True)
+    player = MusicPlayer(backend="browser", dry_run=True, mpv_audio_device="default")
     result = handle_text(player, "幫我放稻香", dry_run=True)
     if not result.get("ok") or result.get("query") != "稻香":
         raise AssertionError(f"dry-run play failed: {result}")
+
+    class BrokenPipeWriter:
+        def write(self, _body: bytes) -> None:
+            raise BrokenPipeError("self-test client disconnected")
+
+    class FakeHandler:
+        wfile = BrokenPipeWriter()
+
+        def send_response(self, _status: int) -> None:
+            pass
+
+        def send_header(self, _name: str, _value: str) -> None:
+            pass
+
+        def end_headers(self) -> None:
+            pass
+
+    if json_response(FakeHandler(), 200, {"ok": True}):  # type: ignore[arg-type]
+        raise AssertionError("json_response should tolerate client disconnects")
 
     weather_cases = [
         ("所在地天氣如何", True, "Taipei"),
@@ -1359,8 +1672,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--backend", choices=["browser", "mpv"], default=DEFAULT_BACKEND)
     parser.add_argument("--dry-run", action="store_true", help="Detect and return the action without opening browser or mpv.")
+    parser.add_argument("--mpv-audio-device", default=DEFAULT_MPV_AUDIO_DEVICE, help="mpv --audio-device value. Use auto to prefer the UACDemo USB audio output.")
+    parser.add_argument("--mpv-audio-keyword", default=DEFAULT_MPV_AUDIO_DEVICE_KEYWORD, help="Keyword used by --mpv-audio-device auto.")
+    parser.add_argument("--mpv-ytdl-cookies", default=DEFAULT_MPV_YTDL_COOKIES, help="Optional cookies.txt passed to mpv/yt-dlp for logged-in YouTube playback.")
+    parser.add_argument("--mpv-ytdl-cookies-from-browser", default=DEFAULT_MPV_YTDL_COOKIES_FROM_BROWSER, help="Optional yt-dlp browser cookie source, e.g. firefox or chrome:Profile 1.")
+    parser.add_argument("--mpv-volume", type=int, default=DEFAULT_MPV_VOLUME, help="mpv playback volume, default 100.")
+    parser.add_argument("--mpv-ready-timeout", type=float, default=DEFAULT_MPV_READY_TIMEOUT_SEC, help="Seconds to wait for mpv IPC/playback status.")
     parser.add_argument("--weather-default-location", default=DEFAULT_WEATHER_LOCATION, help="Default location for local/here weather requests.")
     parser.add_argument("--weather-language", default=DEFAULT_WEATHER_LANGUAGE, help="Open-Meteo geocoding language.")
+    parser.add_argument("--weather-timeout", type=float, default=DEFAULT_WEATHER_TIMEOUT_SEC, help="Total-ish seconds budget for Open-Meteo geocoding + forecast.")
     parser.add_argument("--text", help="One-shot transcript text to detect and handle.")
     parser.add_argument("--weather", help="One-shot transcript text to answer with Open-Meteo weather.")
     parser.add_argument("--query", help="One-shot exact search query to play.")
@@ -1375,9 +1695,18 @@ def main() -> int:
     args = build_arg_parser().parse_args()
     if args.self_test:
         return run_self_test()
-    player = MusicPlayer(backend=args.backend, dry_run=args.dry_run)
     if args.server:
         return run_server(args)
+    player = MusicPlayer(
+        backend=args.backend,
+        dry_run=args.dry_run,
+        mpv_audio_device=args.mpv_audio_device,
+        mpv_audio_keyword=args.mpv_audio_keyword,
+        mpv_ytdl_cookies=args.mpv_ytdl_cookies,
+        mpv_ytdl_cookies_from_browser=args.mpv_ytdl_cookies_from_browser,
+        mpv_volume=args.mpv_volume,
+        mpv_ready_timeout=args.mpv_ready_timeout,
+    )
     if args.stop:
         print(json.dumps(player.stop(), ensure_ascii=False, indent=2))
         return 0
@@ -1394,6 +1723,7 @@ def main() -> int:
                     args.weather,
                     default_location=args.weather_default_location,
                     language=args.weather_language,
+                    timeout_sec=args.weather_timeout,
                 ),
                 ensure_ascii=False,
                 indent=2,

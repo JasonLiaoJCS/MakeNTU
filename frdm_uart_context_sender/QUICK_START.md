@@ -367,11 +367,16 @@ python3 music_web_player.py \
   --host 127.0.0.1 \
   --port 8788 \
   --backend mpv \
-  --weather-default-location Taipei
+  --mpv-audio-device auto \
+  --mpv-volume 100 \
+  --mpv-ready-timeout 1.5 \
+  --weather-default-location Taipei \
+  --weather-timeout 4.5
 ```
 
 `mpv` 會真的播放第一個搜尋結果，並支援 pause/resume 保留播放位置；`browser` 只開搜尋頁，不保證播放，也不能可靠暫停/繼續。
-天氣走 Open-Meteo，不需要 API key。`--weather-default-location Taipei` 是「所在地、這裡、附近、here」的預設位置；如果 demo 場地在新竹，可改成 `Hsinchu`。
+`--mpv-audio-device auto` 會優先找 `UACDemo` USB 音效輸出，避免 mpv 播了但聲音跑到 Jetson 預設音源。
+天氣走 Open-Meteo，不需要 API key。`--weather-default-location Taipei` 是「所在地、這裡、附近、here」的預設位置；如果 demo 場地在新竹，可改成 `Hsinchu`。`--weather-timeout 4.5` 會讓外部 Open-Meteo 查詢在合理時間內回覆，並搭配本機 cache 避免 dashboard/status 被天氣查詢卡住。
 
 ESP32-S3 + DS18B20 本地溫度不在 Terminal 4。它由 Terminal 3 的 Wake Bridge 接收，預設建議用 push 模式：ESP32 和 Jetson 在同一個 LAN，DS18B20 接 ESP32 GPIO4，ESP32 定期 POST 到 Jetson：
 
@@ -587,10 +592,14 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
   --beep-keyword UACDemo \
+  --beep-player auto \
   --noisy-room \
   --tts-volume-gain 2.25 \
   --uart-port auto \
   --uart-baudrate 115200 \
+  --frdm-uart-tx-timeout 0.45 \
+  --frdm-uart-failure-threshold 2 \
+  --frdm-uart-circuit-breaker-sec 4.0 \
   --enable-head-motor \
   --boot-normal-delay 2.0 \
   --device-ready-timeout 30 \
@@ -617,21 +626,28 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-script /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py \
   --focus-server-url http://100.108.141.26:8766/focus-check \
   --focus-interval-sec 60 \
+  --focus-first-sample-delay-sec -1 \
   --focus-duration-min 0 \
   --focus-log-root /tmp/focus_voice_test \
-  --focus-alert-threshold 2 \
+  --focus-alert-threshold 1 \
   --focus-alert-cooldown-sec 90 \
+  --fan-device-id desk_fan \
+  --fan-speed-max 3 \
   --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
   --focus-notify-mode discord \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
+  --music-mpv-audio-device auto \
+  --music-mpv-volume 100 \
+  --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
-  --music-wake-pause-timeout 0.6 \
-  --music-wake-beep-settle 0.18 \
+  --music-wake-pause-timeout 0.25 \
+  --music-wake-beep-settle 0.05 \
   --post-music-standby-cooldown 0.8 \
   --music-debug \
   --weather-default-location Taipei \
   --weather-timeout 6 \
+  --weather-api-timeout 4.5 \
   --weather-debug \
   --esp32-temperature-mode push \
   --esp32-temperature-host 0.0.0.0 \
@@ -647,6 +663,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --motor-join-timeout 6 \
   --device-preflight-verbose \
   --tts-poll-interval 0.75 \
+  --tts-start-poll-interval 0.12 \
+  --tts-speaking-start-timeout 1.2 \
   --tts-debug \
   --uart-debug
 ```
@@ -693,15 +711,32 @@ speech end/silence <= 13000
 --standby-progress-interval 0
 ```
 
-每次準備收音前都會先 beep；程式判定你講完時會再 beep 一聲，並在那一刻抓照片，跟該輪語音一起送到 Windows server。播音樂後下一次 `Hey Jarvis` 會先 pause 音樂、等 0.18 秒讓音訊裝置穩定，再播開始收音 beep；如果 UACDemo output 被 mpv 暫時佔住，會自動用 default output 重試 beep。說 `byebye / 掰掰 / 拜拜 / 再見` 後會送 `Normal 0 0`；說「去睡覺吧 / 休息一下」會送 `Sleep 0 0`。兩者都會回到只聽喚醒詞的 standby；這之後你講一般話不會送 ASR/Ollama，下一次必須重新說 `Hey Jarvis`。
+每次準備收音前都會先 beep；程式判定你講完時會再 beep 一聲，並在那一刻抓照片，跟該輪語音一起送到 Windows server。beep 預設用 `--beep-player auto`，會優先走 `paplay` / PulseAudio 的 UACDemo sink，不再用 `sounddevice` 直接開 ALSA output，避免 PortAudio 在音樂播放/暫停交界時 assertion abort。播音樂後下一次 `Hey Jarvis` 會先快速 pause 音樂、短暫等 0.05 秒，再播開始收音 beep；為了讓嗶聲快，wake 當下不再先送 `Music paused` dashboard UART。音樂被 pause 後會重設錄音 gate，避免剛剛音樂音量把 speech/silence 門檻墊太高，導致後續回應變慢。說 `byebye / 掰掰 / 拜拜 / 再見` 後會送 `Normal 0 0`；說「去睡覺吧 / 休息一下」會送 `Sleep 0 0`。兩者都會回到只聽喚醒詞的 standby；這之後你講一般話不會送 ASR/Ollama，下一次必須重新說 `Hey Jarvis`。
 
 音樂控制也會自動結束 conversation mode：播音樂或繼續播放後會送 `Music 0 0` 並回到 wake-only standby；暫停或停止處理完會送 `Normal 0 0`。所以下次要暫停、停止或換歌，都必須先說 `Hey Jarvis`。
 
-Focus Work Mode 指令也會自動結束 conversation mode，避免進入工作模式後還一直收 follow-up。開始後會立刻拍第一張工作狀態照片，之後每 `--focus-interval-sec 60` 秒取樣一次；照片預設只存在記憶體，判斷完就丟掉。`--focus-duration-min 0` 代表不自動結束，要再說「結束工作 / 停止專心 / 下班」才會停。
+音樂正在播放時，Wake Bridge 預設維持 `5aae453` 版本的喚醒行為：仍用一般 `--wake-threshold 0.75`，所以可以直接喊 `Hey Jarvis` 讓它 pause 音樂並進入收音。若現場喇叭真的一直誤觸，再額外加 `--music-wake-guard --music-wake-threshold 0.9 --music-wake-confirm-chunks 1`。
 
-Wake Bridge 啟動 focus mode 時，FRDM 畫面順序必須是 `Speaking <emotion>` 回覆你，TTS/頭部動作結束後才送 `Focus 0 0`。背景的 `focus_work_mode.py` 會被 UART gate 擋住，在 Speaking 期間完全不送 `Focus active/focused/idle` 或 `Thinking`；Wake Bridge 送完 `Focus 0 0` 後才打開 gate，讓背景程序繼續同步 `Focus ...` dashboard raw data。如果是設定分鐘數自動結束，子程序最後仍會送 `Normal 0 0`。
+Focus Work Mode 指令也會自動結束 conversation mode，避免進入工作模式後還一直收 follow-up。Wake Bridge 會先講完進入專注模式的回覆、切到 Focus 畫面，最後才打開 focus 子程序的 activation gate；gate 開啟前子程序不會取樣、不會罵人、不會插隊 TTS。`--focus-first-sample-delay-sec -1` 代表第一張工作狀態照片等同 `--focus-interval-sec 60` 秒後再拍，之後每 60 秒取樣一次；照片預設只存在記憶體，判斷完就丟掉。`--focus-duration-min 0` 代表不自動結束，要再說「結束工作 / 停止專心 / 下班」才會停。
 
-Focus 取樣判斷為 `focused` 時，背景程序會保持安靜，不再重送 `Focus focused,...`，倒數也會照原本時間繼續。若連續達到 `--focus-alert-threshold 2` 次判斷為 `distracted / phone / away / sleeping`，背景程序會送 `Speaking 2`、用 TTS 嚴厲提醒回到工作、跑一段 `MotorYawPitch` 警告動作，然後回到 `Focus <state>,<remaining>,<streak>`；有設定自動結束時間時，倒數會從該次分心重新計時。預設兩次 spoken alert 至少間隔 `--focus-alert-cooldown-sec 90` 秒，避免每張照片都罵一次；倒數重設仍會照 confirmed distraction 執行。
+Wake Bridge 啟動 focus mode 時，FRDM 會先維持 `Thinking`；等 TTS `/health` 回報 audio.playing，才送 `Speaking <emotion>` 並開始頭部動作。TTS/頭部動作結束後才送 `Focus 0 0`。背景的 `focus_work_mode.py` 會被 UART gate 擋住，在 Speaking 期間完全不送 `Focus active/focused/idle` 或 `Thinking`；Wake Bridge 送完 `Focus 0 0` 後才打開 gate，讓背景程序繼續同步 `Focus ...` dashboard raw data。如果是設定分鐘數自動結束，子程序最後仍會送 `Normal 0 0`。
+
+Focus 取樣判斷為 `focused` 時，背景程序會保持安靜，不再重送 `Focus focused,...`，倒數也會照原本時間繼續。若達到 `--focus-alert-threshold 1` 次判斷為 `distracted / phone / away / sleeping`，背景程序會等 TTS audio.playing 後才送 `Speaking 2`，用 TTS 嚴厲提醒回到工作、跑一段 `MotorYawPitch` 警告動作，然後回到 `Focus <state>,<remaining>,<streak>`；有設定自動結束時間時，倒數會從該次分心重新計時。預設兩次 spoken alert 至少間隔 `--focus-alert-cooldown-sec 90` 秒，避免每張照片都罵一次；倒數重設仍會照 confirmed distraction 執行。
+
+FRDM 觸控回傳現在由 Wake Bridge 的單一 UART bus 常駐監聽，不再靠短輪詢。也就是 Speaking/TTS/頭部馬達動作、Hey Jarvis standby、conversation follow-up 期間，Jetson 都會持續讀 FRDM 回送行。FRDM 風扇 UI 建議送：
+
+```text
+Fan 1,2          # 開，風速 2
+Fan 0,0          # 關
+EVT,Fan,1,3      # 也支援 EVT 前綴
+FanSpeed 2       # 只改風速；大於 0 會視為開
+```
+
+Wake Bridge 會把它轉成 `desk_fan` dashboard 狀態，預設 POST 到 `http://127.0.0.1:8789/api/devices/desk_fan/set`。若要真的控制 Jetson GPIO/PWM/relay，另外加 `--fan-control-command "/path/to/fan_control.sh {power} {speed} {percent}"`；環境變數也會帶 `FAN_POWER`、`FAN_SPEED`、`FAN_PERCENT`、`FAN_STATE`。Focus 子程序的 UART 也改走 parent UART proxy，所以不會和主程式搶 `/dev/ttyACM0`。
+
+如果 FRDM CDC 一時卡住，正式指令現在會用 `--frdm-uart-tx-timeout 0.45` 快速失敗，不會再每個 `Thinking/Speaking/MotorYawPitch` 卡約 2 秒；連續失敗 2 次後會暫停 TX 4 秒但保持 RX 監聽，所以觸控事件恢復後仍能進來。看到 `FRDM UART bus temporarily bypassing TX` 時，先檢查 FRDM firmware 是否正在讀 UART、MCU-LINK USB-C 是否穩定，必要時重插 FRDM 或加 `--no-frdm-uart-bus` 暫時退回舊 per-command TX。
+
+Wake Bridge 的 device preflight 會清掉真的 `mpv/aplay/ffplay` audio process，但不會再因為 Terminal 4 指令裡有 `--backend mpv` 就誤殺 `music_web_player.py`。如果你看到 Terminal 4 印 `Music web player stopped.`，代表它真的收到 SIGINT/SIGTERM；先用 `curl http://127.0.0.1:8788/health` 確認，沒活著再重開 Terminal 4。
 
 Focus 結束時會寫 `focus_summary.json` 和 `focus_report.md`，內容會整合專注時間、分心時間、專注分數、建議，以及這段期間完成/剩下的 To-Do。報告標題會使用「專心報告：YYYY/MM/DD/HH 開始的專注時段」，同時寫進 `focus_summary.json` 的 `report_title`，Discord 第一行也會使用同一個標題。若有設定 `DISCORD_WEBHOOK_URL`，會透過 Discord webhook 送一則短摘要；沒設 webhook 時只會留下檔案。
 
@@ -1072,14 +1107,27 @@ python3 music_web_player.py \
   --host 127.0.0.1 \
   --port 8788 \
   --backend mpv \
-  --weather-default-location Taipei
+  --mpv-audio-device auto \
+  --mpv-volume 100 \
+  --mpv-ready-timeout 1.5 \
+  --weather-default-location Taipei \
+  --weather-timeout 4.5
+```
+
+如果 YouTube 要登入，先在 Jetson 瀏覽器登入 Premium，然後多加 `--mpv-ytdl-cookies-from-browser firefox` 或 `--mpv-ytdl-cookies-from-browser chrome`。如果 Jetson 沒有瀏覽器，就從已登入的電腦匯出 cookies 檔，再多加 `--mpv-ytdl-cookies "$HOME/.config/makentu/youtube_cookies.txt"`。不要把 Google 帳密寫進程式或指令。
+如果你不開 Terminal 4、交給 Wake Bridge 自動啟動 sidecar，改用環境變數：
+
+```bash
+export MUSIC_MPV_YTDL_COOKIES_FROM_BROWSER=firefox
+# 或
+export MUSIC_MPV_YTDL_COOKIES="$HOME/.config/makentu/youtube_cookies.txt"
 ```
 
 只想打開搜尋頁，用 `--backend browser`。注意 browser 模式不保證自動播放。
 只想改所在地，例如 demo 在新竹：
 
 ```bash
-python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --weather-default-location Hsinchu
+python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --weather-default-location Hsinchu
 ```
 
 ### 1.7 Terminal 5: Smart Home Dashboard Optional
@@ -1122,9 +1170,13 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
   --beep-keyword UACDemo \
+  --beep-player auto \
   --noisy-room \
   --uart-port auto \
   --uart-baudrate 115200 \
+  --frdm-uart-tx-timeout 0.45 \
+  --frdm-uart-failure-threshold 2 \
+  --frdm-uart-circuit-breaker-sec 4.0 \
   --enable-head-motor \
   --boot-normal-delay 2.0 \
   --device-ready-timeout 30 \
@@ -1151,21 +1203,28 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-script /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py \
   --focus-server-url http://100.108.141.26:8766/focus-check \
   --focus-interval-sec 60 \
+  --focus-first-sample-delay-sec -1 \
   --focus-duration-min 0 \
   --focus-log-root /tmp/focus_voice_test \
-  --focus-alert-threshold 2 \
+  --focus-alert-threshold 1 \
   --focus-alert-cooldown-sec 90 \
+  --fan-device-id desk_fan \
+  --fan-speed-max 3 \
   --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
   --focus-notify-mode discord \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
+  --music-mpv-audio-device auto \
+  --music-mpv-volume 100 \
+  --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
-  --music-wake-pause-timeout 0.6 \
-  --music-wake-beep-settle 0.18 \
+  --music-wake-pause-timeout 0.25 \
+  --music-wake-beep-settle 0.05 \
   --post-music-standby-cooldown 0.8 \
   --music-debug \
   --weather-default-location Taipei \
   --weather-timeout 6 \
+  --weather-api-timeout 4.5 \
   --weather-debug \
   --esp32-temperature-mode push \
   --esp32-temperature-host 0.0.0.0 \
@@ -1181,6 +1240,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --motor-join-timeout 6 \
   --device-preflight-verbose \
   --tts-poll-interval 0.75 \
+  --tts-start-poll-interval 0.12 \
+  --tts-speaking-start-timeout 1.2 \
   --tts-debug \
   --uart-debug
 ```
@@ -1927,7 +1988,7 @@ pkill -f 'music_web_player.py'
 
 cd /home/asrlab-yian/MakeNTU/music_web_player
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --weather-default-location Taipei
+python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --weather-default-location Taipei --weather-timeout 4.5
 ```
 
 手動測：
@@ -2004,6 +2065,8 @@ DEFAULT_VOLUME_GAIN=2.25
 ```
 
 改 `.env` 或 USB recovery 後重開 TTS server。
+
+如果 Terminal 3 出現 `WARNING: TTS speak failed: <urlopen error [Errno 111] Connection refused>`，代表 Terminal 2 的 Piper TTS server 在 health check 後又掉了或被重啟。新版 bridge 會立刻結束這輪 conversation follow-up，回到必須重新說 `Hey Jarvis` 的 standby，避免 TTS 沒講出來卻一直錄後續雜音；此時先重啟 Terminal 2，再重啟 Terminal 3。
 
 如果不是完全沒聲音，而是現場聽起來超小聲，Terminal 3 的 Wake Bridge 用：
 

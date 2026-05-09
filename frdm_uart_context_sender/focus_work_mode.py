@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -161,6 +161,19 @@ def tts_base_url(tts_url: str) -> str:
 
 def tts_queue_url(tts_url: str) -> str:
     return urllib.parse.urljoin(tts_base_url(tts_url) + "/", "queue")
+
+
+def tts_health_url(tts_url: str) -> str:
+    return urllib.parse.urljoin(tts_base_url(tts_url) + "/", "health")
+
+
+def tts_audio_playing(tts_url: str, *, timeout_sec: float) -> bool:
+    try:
+        health = get_json(tts_health_url(tts_url), timeout_sec=min(max(timeout_sec, 0.1), 0.6))
+    except Exception:
+        return False
+    audio = health.get("audio") if isinstance(health.get("audio"), dict) else {}
+    return bool(audio.get("playing"))
 
 
 def post_json(url: str, payload: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
@@ -308,6 +321,7 @@ class UartSender:
     dry_run: bool
     no_uart: bool
     debug: bool
+    proxy_url: str = ""
 
     def send(self, command: str, *, reason: str = "") -> bool:
         command = str(command or "").strip()
@@ -320,6 +334,8 @@ class UartSender:
         if self.dry_run:
             print(f"FRDM UART dry-run TX: {wire}" + (f" ({reason})" if reason else ""))
             return True
+        if self.proxy_url:
+            return self._send_proxy_line(wire, reason=reason)
         try:
             import serial
 
@@ -365,6 +381,8 @@ class UartSender:
         if self.dry_run:
             print(f"FRDM UART dry-run TX: {wire}" + (f" ({reason})" if reason else ""))
             return True
+        if self.proxy_url:
+            return self._send_proxy_line(wire, reason=reason)
         try:
             import serial
 
@@ -394,6 +412,23 @@ class UartSender:
         except Exception as exc:
             print(f"WARNING: UART send failed for {wire}: {exc}")
             return False
+
+    def _send_proxy_line(self, wire: str, *, reason: str) -> bool:
+        payload = {
+            "line": wire,
+            "reason": reason or "focus work mode uart proxy",
+            "read_ms": 80,
+        }
+        try:
+            result = post_json(self.proxy_url, payload, timeout_sec=max(0.1, self.timeout + 1.0))
+        except Exception as exc:
+            print(f"WARNING: UART proxy send failed for {wire}: {exc}")
+            return False
+        ok = bool(result.get("ok", False))
+        print(f"FRDM UART proxy TX: {wire}" + (f" ({reason})" if reason else ""))
+        if not ok:
+            print(f"WARNING: UART proxy rejected {wire}: {result}")
+        return ok
 
 
 class OneShotCamera:
@@ -1054,6 +1089,7 @@ class FocusSession:
             dry_run=args.uart_dry_run,
             no_uart=args.no_uart,
             debug=args.uart_debug,
+            proxy_url=str(getattr(args, "uart_proxy_url", "") or "").strip(),
         )
 
     def request_stop(self, _signum: int | None = None, _frame: Any | None = None) -> None:
@@ -1072,6 +1108,7 @@ class FocusSession:
                     "task": self.args.task,
                     "started_at": started_at.isoformat(timespec="seconds"),
                     "interval_sec": self.args.interval_sec,
+                    "first_sample_delay_sec": self.args.first_sample_delay_sec,
                     "duration_min": self.args.duration_min,
                     "focus_url": focus_url,
                     "todo_list_path": str(self.todo_list_path),
@@ -1100,16 +1137,25 @@ class FocusSession:
         if sys.stdin.isatty():
             print("Type q + Enter to end the session.")
 
-        self._send_uart("Thinking", reason="focus session start", force=True)
-        self.duration_sec = (
-            max(0.0, float(self.args.duration_min)) * 60.0 if self.args.duration_min is not None else None
-        )
-        self.timer_started_at = started_at
-        self.deadline_monotonic = time.monotonic() + self.duration_sec if self.duration_sec is not None else None
-        self._send_focus_dashboard("active", streak=0, reason="focus session start")
-
         sample_index = 0
         try:
+            if not self._wait_for_uart_gate_open(reason="focus activation"):
+                print("Focus activation cancelled before first sample.")
+                return 0
+
+            activated_at = now_local()
+            self._send_uart("Thinking", reason="focus session start", force=True)
+            self.duration_sec = (
+                max(0.0, float(self.args.duration_min)) * 60.0 if self.args.duration_min is not None else None
+            )
+            self.timer_started_at = activated_at
+            self.deadline_monotonic = time.monotonic() + self.duration_sec if self.duration_sec is not None else None
+            self._send_focus_dashboard("active", streak=0, reason="focus session start")
+
+            if not self.args.once and not self._sleep_before_first_sample():
+                print("Focus session ended before first scheduled sample.")
+                return 0
+
             while not self.stop_requested:
                 if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
                     print("Duration reached; ending focus session.")
@@ -1258,6 +1304,10 @@ class FocusSession:
             print(f"Focus sample is {state}; no distraction alert, no timer reset.")
             return
 
+        if not self._uart_gate_open():
+            print(f"Focus distraction sample deferred while parent voice turn is active: {state}.")
+            return
+
         if self.streak_count < self.args.alert_threshold:
             print(
                 f"Focus distraction candidate: {state} streak={self.streak_count}/"
@@ -1288,6 +1338,9 @@ class FocusSession:
             print(f"Focus timer reset marker recorded ({reason}); this session has no auto-stop duration.")
 
     def _maybe_send_distraction_alert(self, state: str) -> None:
+        if not self._uart_gate_open():
+            print(f"Focus alert deferred because parent voice turn owns the screen/TTS: {state}.")
+            return
         cooldown = max(0.0, float(getattr(self.args, "alert_cooldown_sec", 0.0) or 0.0))
         elapsed = time.monotonic() - self.last_alert_monotonic if self.last_alert_monotonic else cooldown
         if self.last_alert_monotonic and elapsed < cooldown:
@@ -1297,11 +1350,21 @@ class FocusSession:
         self.last_alert_monotonic = time.monotonic()
         message = build_focus_alert_message(state, self.args.task)
         print(f"Focus distraction alert: {message}")
-        self._send_raw_uart_line("Speaking 2", reason=f"focus distraction alert {state}")
+        visual_started = False
+
+        def start_alert_visuals() -> None:
+            nonlocal visual_started
+            if visual_started:
+                return
+            visual_started = True
+            self._send_raw_uart_line("Speaking 2", reason=f"focus distraction alert {state}")
+            self._send_focus_alert_motion(state)
+
         tts_started, job_id = self._speak_focus_alert(message)
-        self._send_focus_alert_motion(state)
         if tts_started:
-            self._wait_for_focus_alert_tts(job_id, message)
+            self._wait_for_focus_alert_tts(job_id, message, on_playback_start=start_alert_visuals)
+        if not visual_started:
+            start_alert_visuals()
 
     def _speak_focus_alert(self, message: str) -> tuple[bool, str]:
         if getattr(self.args, "no_alert_tts", False):
@@ -1325,34 +1388,67 @@ class FocusSession:
         print(f"Focus alert TTS queued: job_id={job_id or '(none)'}")
         return True, job_id
 
-    def _wait_for_focus_alert_tts(self, job_id: str, message: str) -> None:
+    def _wait_for_focus_alert_tts(
+        self,
+        job_id: str,
+        message: str,
+        *,
+        on_playback_start: Callable[[], None] | None = None,
+    ) -> None:
         timeout_sec = max(0.1, float(getattr(self.args, "alert_tts_wait_timeout", 16.0) or 16.0))
         if not job_id:
+            if on_playback_start is not None:
+                on_playback_start()
             time.sleep(min(timeout_sec, estimate_tts_seconds(message)))
             return
 
         queue_url = tts_queue_url(self.args.alert_tts_url)
         deadline = time.monotonic() + timeout_sec
         poll_interval = max(0.1, min(float(getattr(self.args, "alert_tts_poll_interval", 0.5) or 0.5), 2.0))
+        start_poll_interval = max(0.05, min(poll_interval, 0.12))
+        start_fallback_sec = 1.2
         saw_current_job = False
+        current_job_seen_at = 0.0
+        playback_start_notified = False
+
+        def notify_playback_start(detail: str) -> None:
+            nonlocal playback_start_notified
+            if playback_start_notified:
+                return
+            playback_start_notified = True
+            print(f"Focus alert TTS playback observed: {detail}")
+            if on_playback_start is not None:
+                on_playback_start()
+
         while time.monotonic() < deadline:
             try:
                 status = get_json(queue_url, timeout_sec=min(float(getattr(self.args, "alert_tts_timeout", 5.0)), 2.0))
             except Exception:
-                time.sleep(poll_interval)
+                time.sleep(start_poll_interval if not playback_start_notified else poll_interval)
                 continue
             last_result = status.get("last_result") if isinstance(status.get("last_result"), dict) else {}
             if last_result.get("job_id") == job_id:
+                notify_playback_start("job finished before start poll observed output")
                 print(f"Focus alert TTS finished: job_id={job_id}")
                 return
             current = status.get("current") if isinstance(status.get("current"), dict) else {}
             if current.get("id") == job_id:
                 saw_current_job = True
+                if current_job_seen_at <= 0.0:
+                    current_job_seen_at = time.monotonic()
+                if not playback_start_notified:
+                    if tts_audio_playing(
+                        self.args.alert_tts_url,
+                        timeout_sec=float(getattr(self.args, "alert_tts_timeout", 5.0) or 5.0),
+                    ):
+                        notify_playback_start("TTS audio player reports output")
+                    elif time.monotonic() - current_job_seen_at >= start_fallback_sec:
+                        notify_playback_start("TTS queue current fallback")
             last_error = str(status.get("last_error", "") or "").strip()
             if last_error and saw_current_job and not status.get("running"):
                 print(f"WARNING: focus alert TTS worker error for job_id={job_id}: {last_error}")
                 return
-            time.sleep(poll_interval)
+            time.sleep(start_poll_interval if not playback_start_notified else poll_interval)
         print(f"WARNING: focus alert TTS wait timed out after {timeout_sec:.1f}s for job_id={job_id}.")
 
     def _send_focus_alert_motion(self, state: str) -> None:
@@ -1397,6 +1493,26 @@ class FocusSession:
         gate_file = self.uart_gate_file
         return gate_file is None or gate_file.exists()
 
+    def _wait_for_uart_gate_open(self, *, reason: str) -> bool:
+        gate_file = self.uart_gate_file
+        if gate_file is None or gate_file.exists():
+            return True
+        print(f"Focus mode waiting for parent activation gate: {gate_file} ({reason}).")
+        last_log = time.monotonic()
+        while not self.stop_requested:
+            if gate_file.exists():
+                print("Focus mode parent activation gate opened.")
+                return True
+            if stdin_requested_stop():
+                print("Stop command received from terminal before focus activation.")
+                return False
+            now = time.monotonic()
+            if now - last_log >= 3.0:
+                print("Focus mode still waiting for parent to finish entry reply.")
+                last_log = now
+            time.sleep(0.1)
+        return False
+
     def _remaining_minutes(self) -> int:
         deadline = self.deadline_monotonic
         if deadline is None:
@@ -1421,9 +1537,8 @@ class FocusSession:
         streak_count = max(0, int(streak))
         self.uart.send_raw_line(f"Focus {normalized},{remaining},{streak_count}", reason=reason)
 
-    def _sleep_until_next_sample(self) -> bool:
-        wait_sec = max(0.0, float(self.args.interval_sec))
-        end_at = time.monotonic() + wait_sec
+    def _sleep_for(self, wait_sec: float) -> bool:
+        end_at = time.monotonic() + max(0.0, wait_sec)
         while not self.stop_requested and time.monotonic() < end_at:
             if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
                 return False
@@ -1432,6 +1547,18 @@ class FocusSession:
                 return False
             time.sleep(min(0.5, max(0.0, end_at - time.monotonic())))
         return not self.stop_requested
+
+    def _sleep_before_first_sample(self) -> bool:
+        configured = float(getattr(self.args, "first_sample_delay_sec", -1.0) or 0.0)
+        wait_sec = float(self.args.interval_sec) if configured < 0.0 else configured
+        if wait_sec <= 0.0:
+            return True
+        print(f"Focus first sample scheduled in {wait_sec:g}s.")
+        return self._sleep_for(wait_sec)
+
+    def _sleep_until_next_sample(self) -> bool:
+        wait_sec = max(0.0, float(self.args.interval_sec))
+        return self._sleep_for(wait_sec)
 
 
 def run_self_test() -> int:
@@ -1508,6 +1635,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-id", default="", help="Optional fixed session id.")
     parser.add_argument("--duration-min", type=float, default=None, help="End automatically after this many minutes.")
     parser.add_argument("--interval-sec", type=float, default=float(os.getenv("FOCUS_INTERVAL_SEC", str(DEFAULT_INTERVAL_SEC))), help="Seconds between checks.")
+    parser.add_argument(
+        "--first-sample-delay-sec",
+        type=float,
+        default=float(os.getenv("FOCUS_FIRST_SAMPLE_DELAY_SEC", "-1")),
+        help="Seconds to wait after parent activates Focus before the first sample. Negative means use --interval-sec.",
+    )
     parser.add_argument("--once", action="store_true", help="Run one sample and generate a report.")
     parser.add_argument("--timeout", type=float, default=float(os.getenv("FOCUS_TIMEOUT_SEC", "180")), help="HTTP timeout for /focus-check.")
     parser.add_argument("--log-root", default=str(DEFAULT_LOG_ROOT), help="Root folder for focus session logs.")
@@ -1538,6 +1671,7 @@ def build_parser() -> argparse.ArgumentParser:
     uart.add_argument("--uart-timeout", type=float, default=float(os.getenv("FOCUS_UART_TIMEOUT", "0.08")))
     uart.add_argument("--uart-line-ending", choices=["lf", "crlf"], default=os.getenv("FOCUS_UART_LINE_ENDING", "crlf"))
     uart.add_argument("--uart-gate-file", default=os.getenv("FOCUS_UART_GATE_FILE", ""), help="If set, send no UART until this file exists.")
+    uart.add_argument("--uart-proxy-url", default=os.getenv("FOCUS_UART_PROXY_URL", ""), help="Optional Wake Bridge local UART proxy URL. Used so the parent process can own the serial port.")
     uart.add_argument(
         "--no-active-screen-uart",
         action="store_true",
@@ -1552,7 +1686,7 @@ def build_parser() -> argparse.ArgumentParser:
     uart.add_argument(
         "--alert-threshold",
         type=int,
-        default=int(os.getenv("FOCUS_ALERT_THRESHOLD", "2")),
+        default=int(os.getenv("FOCUS_ALERT_THRESHOLD", "1")),
         help="Consecutive distracted samples before scolding and resetting the focus timer.",
     )
 
@@ -1578,6 +1712,8 @@ def main() -> int:
         return run_self_test()
     if args.interval_sec <= 0:
         parser.error("--interval-sec must be > 0")
+    if args.first_sample_delay_sec < -1:
+        parser.error("--first-sample-delay-sec must be >= -1")
     if args.alert_threshold < 1:
         parser.error("--alert-threshold must be >= 1")
     if args.alert_cooldown_sec < 0:

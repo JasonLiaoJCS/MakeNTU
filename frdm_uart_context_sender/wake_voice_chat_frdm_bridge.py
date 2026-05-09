@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fcntl
 import glob
@@ -25,16 +26,19 @@ import queue
 import random
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.error
 import urllib.request
 import urllib.parse
 import uuid
-from typing import Any
+import wave
+from typing import Any, Callable
 
 import numpy as np
 
@@ -73,6 +77,7 @@ DEFAULT_WEATHER_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "Taipei")
 DEFAULT_ESP32_TEMPERATURE_PATH = os.getenv("ESP32_TEMPERATURE_PATH", "/temperature")
 DEFAULT_TODO_LIST_PATH = THIS_DIR / "logs" / "todo_list.json"
 DEFAULT_AI_TRACE_PATH = THIS_DIR / "logs" / "ai_trace.jsonl"
+DEFAULT_FAN_DASHBOARD_URL = os.getenv("FAN_DASHBOARD_URL", "http://127.0.0.1:8789/api/devices/{device_id}/set")
 DEFAULT_DISCORD_WEBHOOK_FILE = Path(os.getenv("DISCORD_WEBHOOK_FILE", "~/.config/makentu/discord_webhook_url")).expanduser()
 PET_IDLE_SILENCE_TOKEN = "PET_IDLE_SILENCE"
 SESSION_END_KEYWORDS = (
@@ -119,6 +124,7 @@ DEMO_STALE_PROCESS_PATTERNS = (
     "ffplay",
     "paplay",
 )
+AUDIO_STALE_PROCESS_NAMES = {"arecord", "aplay", "mpv", "ffplay", "paplay"}
 DEVICE_OWNER_ALLOW_PATTERNS = (
     "jetson_piper_tts.server",
     "pulseaudio",
@@ -139,7 +145,7 @@ MOTOR_COMMANDS = {"MotorPitch", "MotorYaw", "MotorYawPitch"}
 UTILITY_COMMANDS = {"ShowNum"}
 WEATHER_COMMANDS = {"Weather"}
 TIME_COMMANDS = {"Time"}
-DATA_COMMANDS = {"Todo", "TodoItem", "TodoEnd", "Health"}
+DATA_COMMANDS = {"Todo", "TodoItem", "TodoEnd", "Health", "Device"}
 ALLOWED_UART_COMMANDS = CORE_SCREEN_COMMANDS | MOTOR_COMMANDS | UTILITY_COMMANDS | WEATHER_COMMANDS | TIME_COMMANDS | DATA_COMMANDS
 SINGLE_ARG_UART_COMMANDS = (MOTOR_COMMANDS - {"MotorYawPitch"}) | {"Speaking"}
 
@@ -1417,6 +1423,26 @@ def command_matches(cmdline: str, patterns: tuple[str, ...] | list[str]) -> bool
     return any(pattern.lower() in lowered for pattern in patterns if pattern)
 
 
+def command_matches_stale_demo_process(cmdline: str, patterns: tuple[str, ...] | list[str]) -> bool:
+    lowered = cmdline.lower()
+    try:
+        tokens = shlex.split(cmdline)
+    except ValueError:
+        tokens = cmdline.split()
+    executable_name = Path(tokens[0]).name.lower() if tokens else ""
+    for pattern in patterns:
+        normalized = str(pattern or "").strip().lower()
+        if not normalized:
+            continue
+        if normalized in AUDIO_STALE_PROCESS_NAMES:
+            if normalized == executable_name:
+                return True
+            continue
+        if normalized in lowered:
+            return True
+    return False
+
+
 def is_protected_process(cmdline: str, args: argparse.Namespace) -> bool:
     if getattr(args, "kill_audio_servers", False):
         protected = tuple(pattern for pattern in DEVICE_OWNER_ALLOW_PATTERNS if pattern not in {"pulseaudio", "pipewire", "wireplumber"})
@@ -1609,7 +1635,7 @@ def kill_stale_demo_processes(args: argparse.Namespace) -> None:
             continue
         if command_matches(cmdline, DEMO_PREFLIGHT_SKIP_ARGS):
             continue
-        if command_matches(cmdline, patterns):
+        if command_matches_stale_demo_process(cmdline, patterns):
             pid_reasons[pid] = "stale demo/audio process"
     terminate_pids(pid_reasons, dry_run=args.device_preflight_dry_run, grace_sec=args.device_preflight_grace)
 
@@ -2477,6 +2503,16 @@ def music_health_url(music_url: str) -> str:
     return local_tool_health_url(music_url)
 
 
+def music_playback_active(args: argparse.Namespace, *, timeout_sec: float = 0.2) -> bool:
+    if getattr(args, "no_music", False):
+        return False
+    try:
+        health = voice_chat.get_json(music_health_url(args.music_url), timeout_sec=max(0.05, timeout_sec))
+    except Exception:
+        return False
+    return bool(health.get("active") and not health.get("paused"))
+
+
 def resolve_music_backend(args: argparse.Namespace) -> str:
     backend = str(getattr(args, "music_backend", "auto") or "auto").strip().lower()
     if backend in {"browser", "mpv"}:
@@ -2514,7 +2550,22 @@ def maybe_autostart_music_tool(args: argparse.Namespace, *, tool_url: str | None
         str(port),
         "--backend",
         backend,
+        "--weather-default-location",
+        str(getattr(args, "weather_default_location", DEFAULT_WEATHER_LOCATION) or DEFAULT_WEATHER_LOCATION),
+        "--weather-timeout",
+        str(getattr(args, "weather_api_timeout", 4.5) or 4.5),
     ]
+    if backend == "mpv":
+        command.extend(["--mpv-audio-device", str(getattr(args, "music_mpv_audio_device", "auto") or "auto")])
+        command.extend(["--mpv-audio-keyword", str(getattr(args, "music_mpv_audio_keyword", "UACDemo") or "UACDemo")])
+        command.extend(["--mpv-volume", str(getattr(args, "music_mpv_volume", 100))])
+        command.extend(["--mpv-ready-timeout", str(getattr(args, "music_mpv_ready_timeout", 1.5))])
+        cookies_path = str(getattr(args, "music_mpv_ytdl_cookies", "") or "").strip()
+        if cookies_path:
+            command.extend(["--mpv-ytdl-cookies", cookies_path])
+        cookies_browser = str(getattr(args, "music_mpv_ytdl_cookies_from_browser", "") or "").strip()
+        if cookies_browser:
+            command.extend(["--mpv-ytdl-cookies-from-browser", cookies_browser])
     if getattr(args, "music_dry_run", False):
         command.append("--dry-run")
     print(f"Music tool autostart: {' '.join(command)}")
@@ -2667,6 +2718,16 @@ def execute_music_route(route: dict[str, Any], args: argparse.Namespace, respons
         print(f"  url     : {result.get('url')}")
     if result.get("target"):
         print(f"  target  : {result.get('target')}")
+    if result.get("audio_device"):
+        print(f"  audio   : {result.get('audio_device')}")
+    if result.get("cookies_configured"):
+        print(f"  cookies : {result.get('cookies')}")
+    elif result.get("cookies_from_browser"):
+        print(f"  cookies : browser:{result.get('cookies_from_browser')}")
+    if "playback_ready" in result:
+        print(f"  playback_ready: {result.get('playback_ready')}")
+    if result.get("audio_out"):
+        print(f"  audio_out: {result.get('audio_out')}")
     if "paused" in result:
         print(f"  paused  : {result.get('paused')}")
     if "resumed" in result:
@@ -3383,6 +3444,326 @@ def send_startup_weather_update(args: argparse.Namespace, robot: RobotUartContro
     return result
 
 
+@dataclass
+class UartTxRequest:
+    wire: str
+    reason: str = ""
+    read_ms: int = 0
+    rx_lines: list[str] = field(default_factory=list)
+    ok: bool = False
+    cancelled: bool = False
+    done: threading.Event = field(default_factory=threading.Event)
+    finish_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        self.wire = str(self.wire or "").strip()
+        self.reason = str(self.reason or "")
+        self.read_ms = max(0, int(self.read_ms or 0))
+
+    def finish(self, ok: bool) -> None:
+        with self.finish_lock:
+            if self.done.is_set():
+                return
+            self.ok = bool(ok)
+            self.done.set()
+
+
+def frdm_uart_events_active(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "_frdm_uart_bus_active", False))
+
+
+class FrdmUartEventRouter:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.handlers: list[tuple[str, Any]] = []
+
+    def add_handler(self, name: str, handler: Any) -> None:
+        self.handlers.append((name, handler))
+
+    def handle_line(self, line: str) -> bool:
+        text = str(line or "").strip()
+        if not text:
+            return False
+        handled = False
+        for name, handler in list(self.handlers):
+            try:
+                handled = bool(handler(text)) or handled
+            except Exception as exc:
+                print(f"WARNING: FRDM UART event handler {name} failed for {text!r}: {exc}")
+        return handled
+
+
+class FrdmUartBus:
+    """Single owner for FRDM serial I/O.
+
+    The old implementation opened the same USB CDC port for every TX and had a
+    short polling reader for TodoDone. That could miss FRDM touch events during
+    Speaking/head-motion sequences. This bus keeps one serial handle open, sends
+    outbound lines through a queue, and dispatches inbound lines continuously.
+    """
+
+    def __init__(self, args: argparse.Namespace, *, line_handler: Any | None = None) -> None:
+        self.args = args
+        self.line_handler = line_handler
+        self.stop_event = threading.Event()
+        self.tx_queue: queue.Queue[UartTxRequest] = queue.Queue()
+        self.rx_queue: queue.Queue[str] = queue.Queue()
+        self.thread: threading.Thread | None = None
+        self.dispatch_thread: threading.Thread | None = None
+        self._cached_port = ""
+        self._last_open_log = ""
+        self._health_lock = threading.Lock()
+        self._tx_failure_count = 0
+        self._disabled_until = 0.0
+        self._disable_notice_last = 0.0
+        self._last_error = ""
+
+    def is_enabled(self) -> bool:
+        if getattr(self.args, "no_frdm_uart_bus", False):
+            return False
+        if getattr(self.args, "no_uart", False) or getattr(self.args, "uart_dry_run", False):
+            return False
+        return True
+
+    def start(self) -> bool:
+        if not self.is_enabled():
+            print("FRDM UART event bus: disabled; using legacy per-command UART writes.")
+            return False
+        if self.thread is not None and self.thread.is_alive():
+            return True
+        try:
+            import serial  # noqa: F401
+        except ImportError as exc:
+            print(f"WARNING: FRDM UART event bus disabled: pyserial missing: {exc}")
+            return False
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._serial_loop, name="frdm_uart_bus_serial", daemon=True)
+        self.dispatch_thread = threading.Thread(target=self._dispatch_loop, name="frdm_uart_bus_dispatch", daemon=True)
+        self.thread.start()
+        self.dispatch_thread.start()
+        print("FRDM UART event bus: enabled; one serial owner handles TX queue + continuous RX.")
+        return True
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self._cancel_pending_tx("stop")
+        for thread in (self.thread, self.dispatch_thread):
+            if thread is not None and thread.is_alive():
+                try:
+                    thread.join(timeout=1.5)
+                except KeyboardInterrupt:
+                    print("FRDM UART bus cleanup interrupted; continuing shutdown.")
+        self.thread = None
+        self.dispatch_thread = None
+
+    def _configured_tx_timeout(self, read_ms: int = 0) -> float:
+        base = float(getattr(self.args, "frdm_uart_tx_timeout", 0.45) or 0.45)
+        return max(0.05, min(5.0, base + max(0, int(read_ms or 0)) / 1000.0))
+
+    def _disabled_remaining(self) -> float:
+        with self._health_lock:
+            return max(0.0, self._disabled_until - time.monotonic())
+
+    def _note_tx_success(self) -> None:
+        with self._health_lock:
+            self._tx_failure_count = 0
+            self._last_error = ""
+
+    def _note_tx_failure(self, detail: str) -> None:
+        threshold = max(1, int(getattr(self.args, "frdm_uart_failure_threshold", 2) or 2))
+        disable_sec = max(0.0, float(getattr(self.args, "frdm_uart_circuit_breaker_sec", 4.0) or 0.0))
+        should_cancel = False
+        with self._health_lock:
+            self._tx_failure_count += 1
+            self._last_error = str(detail or "unknown")
+            if self._tx_failure_count >= threshold and disable_sec > 0.0:
+                self._disabled_until = max(self._disabled_until, time.monotonic() + disable_sec)
+                self._tx_failure_count = 0
+                should_cancel = True
+                print(
+                    "WARNING: FRDM UART bus temporarily bypassing TX for "
+                    f"{disable_sec:.1f}s after repeated failures ({self._last_error}). "
+                    "RX monitoring remains active."
+                )
+        if should_cancel:
+            self._cancel_pending_tx("UART bus failure")
+
+    def _cancel_pending_tx(self, reason: str) -> None:
+        while True:
+            try:
+                request = self.tx_queue.get_nowait()
+            except queue.Empty:
+                return
+            request.cancelled = True
+            request.finish(False)
+            self.tx_queue.task_done()
+            if getattr(self.args, "uart_debug", False):
+                print(f"FRDM UART bus cancelled TX during {reason}: {request.wire}")
+
+    def send_line(
+        self,
+        wire: str,
+        *,
+        reason: str = "",
+        read_ms: int = 0,
+        timeout_sec: float | None = None,
+    ) -> tuple[bool, list[str]]:
+        if not self.is_enabled():
+            return False, []
+        if self.stop_event.is_set():
+            return False, []
+        disabled_remaining = self._disabled_remaining()
+        if disabled_remaining > 0.0:
+            now = time.monotonic()
+            if getattr(self.args, "uart_debug", False) or now - self._disable_notice_last >= 1.0:
+                print(
+                    "WARNING: FRDM UART bus TX bypassed while recovering "
+                    f"({disabled_remaining:.1f}s left): {str(wire or '').strip()}"
+                )
+                self._disable_notice_last = now
+            return False, []
+        request = UartTxRequest(wire, reason=reason, read_ms=read_ms)
+        if not request.wire:
+            return False, []
+        self.tx_queue.put(request)
+        wait_timeout = timeout_sec
+        if wait_timeout is None:
+            wait_timeout = self._configured_tx_timeout(request.read_ms)
+        if not request.done.wait(max(0.1, wait_timeout)):
+            request.cancelled = True
+            request.finish(False)
+            self._note_tx_failure("tx timeout")
+            print(f"WARNING: FRDM UART bus TX timed out: {request.wire}")
+            return False, list(request.rx_lines)
+        return request.ok, list(request.rx_lines)
+
+    def _resolve_port(self) -> str:
+        requested = str(getattr(self.args, "uart_port", "auto") or "auto")
+        if self._cached_port and Path(self._cached_port).exists():
+            return self._cached_port
+        self._cached_port = bridge.resolve_uart_port(requested)
+        return self._cached_port
+
+    def _dispatch_line(self, line: str, request: UartTxRequest | None = None) -> None:
+        text = str(line or "").strip()
+        if not text:
+            return
+        if request is not None:
+            request.rx_lines.append(text)
+        self.rx_queue.put(text)
+
+    def _read_available_lines(self, ser: Any, *, request: UartTxRequest | None = None, read_ms: int = 0) -> None:
+        deadline = time.monotonic() + max(0.0, read_ms / 1000.0)
+        while read_ms > 0 and time.monotonic() < deadline and not self.stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            ser.timeout = max(0.001, min(0.02, remaining))
+            raw = ser.readline()
+            if not raw:
+                continue
+            self._dispatch_line(raw.decode("utf-8", errors="replace"), request=request)
+
+    def _serial_loop(self) -> None:
+        try:
+            import serial
+        except ImportError as exc:
+            print(f"WARNING: FRDM UART event bus disabled: pyserial missing: {exc}")
+            return
+
+        ser: Any | None = None
+        current_request: UartTxRequest | None = None
+        reconnect_sec = max(0.1, min(5.0, float(getattr(self.args, "frdm_uart_reconnect_sec", 1.0) or 1.0)))
+        while not self.stop_event.is_set():
+            try:
+                if ser is None:
+                    port = self._resolve_port()
+                    ser = serial.Serial(
+                        port=port,
+                        baudrate=getattr(self.args, "uart_baudrate", 115200),
+                        timeout=0.02,
+                        write_timeout=min(float(getattr(self.args, "uart_timeout", 0.2) or 0.2), 0.2),
+                    )
+                    time.sleep(0.04)
+                    try:
+                        ser.reset_input_buffer()
+                    except Exception:
+                        pass
+                    try:
+                        ser.reset_output_buffer()
+                    except Exception:
+                        pass
+                    if port != self._last_open_log:
+                        print(f"FRDM UART bus opened {port}.")
+                        self._last_open_log = port
+
+                try:
+                    current_request = self.tx_queue.get(timeout=0.02)
+                except queue.Empty:
+                    current_request = None
+                    ser.timeout = 0.02
+                    raw = ser.readline()
+                    if raw:
+                        self._dispatch_line(raw.decode("utf-8", errors="replace"))
+                    continue
+
+                if current_request.cancelled:
+                    current_request.finish(False)
+                    self.tx_queue.task_done()
+                    current_request = None
+                    continue
+                ser.write(current_request.wire.encode("utf-8") + bridge.line_ending_bytes(getattr(self.args, "uart_line_ending", "crlf")))
+                print(f"FRDM UART TX: {current_request.wire}" + (f" ({current_request.reason})" if current_request.reason else ""))
+                self._read_available_lines(ser, request=current_request, read_ms=current_request.read_ms)
+                self._note_tx_success()
+                current_request.finish(True)
+                self.tx_queue.task_done()
+                current_request = None
+            except Exception as exc:
+                request_cancelled = current_request.cancelled if current_request is not None else False
+                if ser is not None:
+                    try:
+                        ser.reset_output_buffer()
+                    except Exception:
+                        pass
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    ser = None
+                self._cached_port = ""
+                if current_request is not None and not current_request.done.is_set():
+                    current_request.finish(False)
+                    try:
+                        self.tx_queue.task_done()
+                    except ValueError:
+                        pass
+                    current_request = None
+                if not request_cancelled:
+                    self._note_tx_failure(str(exc))
+                if getattr(self.args, "uart_debug", False):
+                    print(f"FRDM UART bus reconnect after error: {exc}")
+                self.stop_event.wait(reconnect_sec)
+
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def _dispatch_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                line = self.rx_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if getattr(self.args, "uart_debug", False):
+                print(f"FRDM UART RX: {line}")
+            if self.line_handler is not None:
+                try:
+                    self.line_handler(line)
+                except Exception as exc:
+                    print(f"WARNING: FRDM UART event dispatch failed for {line!r}: {exc}")
+
+
 class RobotUartController:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -3392,10 +3773,16 @@ class RobotUartController:
         self._last_motor_step: MotorStep | None = None
         self._screen_state = ""
         self._screen_state_at = 0.0
-        self.inbound_line_handler: Any | None = None
+        self.uart_bus: FrdmUartBus | None = None
 
-    def set_inbound_line_handler(self, handler: Any | None) -> None:
-        self.inbound_line_handler = handler
+    def attach_uart_bus(self, uart_bus: FrdmUartBus | None) -> None:
+        self.uart_bus = uart_bus
+
+    def _active_uart_bus(self) -> FrdmUartBus | None:
+        bus = self.uart_bus
+        if bus is None or not bus.is_enabled():
+            return None
+        return bus
 
     def motor_step_delay(self) -> float:
         requested = float(getattr(self.args, "motor_step_delay", MOTOR_STEP_DELAY_SEC) or MOTOR_STEP_DELAY_SEC)
@@ -3491,6 +3878,7 @@ class RobotUartController:
             "todoend": "TodoEnd",
             "todo_end": "TodoEnd",
             "health": "Health",
+            "device": "Device",
             "weather": "Weather",
             "weatherinfo": "Weather",
             "motorpitch": "MotorPitch",
@@ -3539,6 +3927,57 @@ class RobotUartController:
     def _line_ending(self) -> bytes:
         return bridge.line_ending_bytes(getattr(self.args, "uart_line_ending", "crlf"))
 
+    def _uart_read_config(self, read_ms: int | None) -> tuple[int, float, float, float]:
+        safe_read_ms = min(int(read_ms if read_ms is not None else getattr(self.args, "uart_read_ms", 30)), 120)
+        read_window_sec = max(0.0, safe_read_ms / 1000.0)
+        configured_timeout = float(getattr(self.args, "uart_timeout", 0.2) or 0.2)
+        per_read_timeout = max(0.005, min(configured_timeout, read_window_sec if read_window_sec > 0 else 0.005))
+        return safe_read_ms, read_window_sec, configured_timeout, per_read_timeout
+
+    def _uart_tx_timeout(self, configured_timeout: float, read_window_sec: float) -> float:
+        base_timeout = float(getattr(self.args, "frdm_uart_tx_timeout", 0.45) or 0.45)
+        return max(0.05, min(5.0, base_timeout + max(0.0, read_window_sec)))
+
+    def _send_wire_via_bus(
+        self,
+        wire: str,
+        *,
+        reason: str,
+        read_ms: int,
+        configured_timeout: float,
+        read_window_sec: float,
+    ) -> tuple[bool, list[str]]:
+        bus = self._active_uart_bus()
+        if bus is None:
+            return False, []
+        return bus.send_line(
+            wire,
+            reason=reason,
+            read_ms=read_ms,
+            timeout_sec=self._uart_tx_timeout(configured_timeout, read_window_sec),
+        )
+
+    def _handle_motor_ack_problem(
+        self,
+        command: str,
+        expected_value: int,
+        expected_value2: int,
+        rx_lines: list[str],
+        stop_event: threading.Event | None = None,
+    ) -> bool:
+        problem = motor_ack_problem(command, expected_value, rx_lines, expected_value2)
+        if not problem:
+            return True
+        self._motor_safety_lockout_reason = problem
+        print(f"ERROR: {problem}")
+        print(
+            "ERROR: Disabling further head motor commands in this process. "
+            "Fix the FRDM MotorControlPitch/MotorControlYaw/MotorControlYawPitch parser, then restart this bridge."
+        )
+        if stop_event is not None:
+            stop_event.set()
+        return False
+
     def send_uart_sequence(
         self,
         steps: list[tuple[str, int, int]],
@@ -3547,7 +3986,7 @@ class RobotUartController:
         delay_sec: float | list[float] | tuple[float, ...] = 0.0,
         read_ms: int | None = None,
         stop_event: threading.Event | None = None,
-        ) -> bool:
+    ) -> bool:
         valid_steps: list[tuple[str, int, int, str]] = []
         invalid_count = 0
         skipped_disabled_motor_count = 0
@@ -3577,10 +4016,7 @@ class RobotUartController:
                 print(f"FRDM UART skipped (--no-uart): {wire}")
             return True
 
-        read_ms = min(int(read_ms if read_ms is not None else getattr(self.args, "uart_read_ms", 30)), 120)
-        read_window_sec = max(0.0, read_ms / 1000.0)
-        configured_timeout = float(getattr(self.args, "uart_timeout", 0.2) or 0.2)
-        per_read_timeout = max(0.005, min(configured_timeout, read_window_sec if read_window_sec > 0 else 0.005))
+        read_ms, read_window_sec, configured_timeout, per_read_timeout = self._uart_read_config(read_ms)
 
         def step_delay_at(index: int) -> float:
             if isinstance(delay_sec, (list, tuple)):
@@ -3589,6 +4025,34 @@ class RobotUartController:
                 safe_index = min(index, len(delay_sec) - 1)
                 return max(0.0, float(delay_sec[safe_index] or 0.0))
             return max(0.0, float(delay_sec or 0.0))
+
+        bus = self._active_uart_bus()
+        if bus is not None:
+            all_ok = True
+            for index, (name, safe_v1, safe_v2, wire) in enumerate(valid_steps):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                ok, rx_lines = self._send_wire_via_bus(
+                    wire,
+                    reason=reason,
+                    read_ms=read_ms,
+                    configured_timeout=configured_timeout,
+                    read_window_sec=read_window_sec,
+                )
+                if not ok:
+                    all_ok = False
+                    if getattr(self.args, "require_uart", False):
+                        return False
+                    if name in MOTOR_COMMANDS:
+                        break
+                if not self._handle_motor_ack_problem(name, safe_v1, safe_v2, rx_lines, stop_event):
+                    return False
+                if ok:
+                    self._note_motor_step(name, safe_v1, safe_v2)
+                current_delay = step_delay_at(index)
+                if current_delay > 0 and not sleep_interruptible(current_delay, stop_event):
+                    break
+            return all_ok
 
         try:
             with self._lock:
@@ -3637,16 +4101,7 @@ class RobotUartController:
                         if getattr(self.args, "uart_debug", False):
                             for line in rx_lines:
                                 print(f"FRDM UART RX: {line}")
-                        problem = motor_ack_problem(_name, _v1, rx_lines, _v2)
-                        if problem:
-                            self._motor_safety_lockout_reason = problem
-                            print(f"ERROR: {problem}")
-                            print(
-                                "ERROR: Disabling further head motor commands in this process. "
-                                "Fix the FRDM MotorControlPitch/MotorControlYaw/MotorControlYawPitch parser, then restart this bridge."
-                            )
-                            if stop_event is not None:
-                                stop_event.set()
+                        if not self._handle_motor_ack_problem(_name, _v1, _v2, rx_lines, stop_event):
                             return False
                         self._note_motor_step(_name, _v1, _v2)
                         current_delay = step_delay_at(index)
@@ -3679,10 +4134,17 @@ class RobotUartController:
             print(f"FRDM UART skipped (--no-uart): {wire}")
             return True
 
-        read_ms = min(int(read_ms if read_ms is not None else getattr(self.args, "uart_read_ms", 30)), 120)
-        read_window_sec = max(0.0, read_ms / 1000.0)
-        configured_timeout = float(getattr(self.args, "uart_timeout", 0.2) or 0.2)
-        per_read_timeout = max(0.005, min(configured_timeout, read_window_sec if read_window_sec > 0 else 0.005))
+        read_ms, read_window_sec, configured_timeout, per_read_timeout = self._uart_read_config(read_ms)
+        bus = self._active_uart_bus()
+        if bus is not None:
+            ok, _rx_lines = self._send_wire_via_bus(
+                wire,
+                reason=reason,
+                read_ms=read_ms,
+                configured_timeout=configured_timeout,
+                read_window_sec=read_window_sec,
+            )
+            return ok
         try:
             with self._lock:
                 if getattr(self.args, "uart_dry_run", False):
@@ -3905,7 +4367,7 @@ class RobotUartController:
                     stop_event=stop_event,
                 )
                 all_ok = ok and all_ok
-                if not ok and getattr(self.args, "require_uart", False):
+                if not ok:
                     break
                 if not sleep_interruptible(0.02, stop_event):
                     break
@@ -3951,10 +4413,115 @@ class RobotUartController:
             self.reset_head_position(reason=reason)
 
 
+class FrdmUartProxyServer:
+    def __init__(self, args: argparse.Namespace, robot: RobotUartController) -> None:
+        self.args = args
+        self.robot = robot
+        self.server: ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+        self.url = ""
+
+    def start(self) -> str:
+        if getattr(self.args, "no_uart", False) or getattr(self.args, "uart_dry_run", False):
+            return ""
+        if self.server is not None:
+            return self.url
+        proxy = self
+
+        class UartProxyHandler(BaseHTTPRequestHandler):
+            server_version = "WakeBridgeUartProxy/1.0"
+
+            def log_message(self, format: str, *args: Any) -> None:
+                if getattr(proxy.args, "uart_debug", False):
+                    super().log_message(format, *args)
+
+            def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                parsed = urllib.parse.urlsplit(self.path)
+                if parsed.path.rstrip("/") != "/uart":
+                    self._send_json(404, {"ok": False, "error": "not_found"})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or 0)
+                except ValueError:
+                    length = 0
+                raw = self.rfile.read(min(length, 4096)).decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    self._send_json(400, {"ok": False, "error": "invalid_json"})
+                    return
+                line = str(payload.get("line", "") or "").strip()
+                reason = str(payload.get("reason", "focus uart proxy") or "focus uart proxy")
+                try:
+                    read_ms = int(payload.get("read_ms", 80) or 80)
+                except (TypeError, ValueError):
+                    read_ms = 80
+                if not line:
+                    self._send_json(400, {"ok": False, "error": "empty_line"})
+                    return
+                ok = proxy.robot.send_uart_raw_line(line, reason=reason, read_ms=read_ms)
+                self._send_json(200 if ok else 503, {"ok": ok})
+
+        host = str(getattr(self.args, "uart_proxy_host", "127.0.0.1") or "127.0.0.1")
+        port = int(getattr(self.args, "uart_proxy_port", 0) or 0)
+        try:
+            self.server = ThreadingHTTPServer((host, port), UartProxyHandler)
+        except OSError as exc:
+            print(f"WARNING: could not start FRDM UART proxy: {exc}")
+            return ""
+        actual_host, actual_port = self.server.server_address[:2]
+        self.url = f"http://{actual_host}:{actual_port}/uart"
+        self.thread = threading.Thread(target=self.server.serve_forever, name="frdm_uart_proxy", daemon=True)
+        self.thread.start()
+        print(f"FRDM UART proxy: {self.url}")
+        return self.url
+
+    def stop(self) -> None:
+        server = self.server
+        self.server = None
+        if server is not None:
+            def shutdown_server() -> None:
+                try:
+                    server.shutdown()
+                except Exception as exc:
+                    if getattr(self.args, "uart_debug", False):
+                        print(f"FRDM UART proxy shutdown warning: {exc}")
+
+            shutdown_thread = threading.Thread(target=shutdown_server, name="frdm_uart_proxy_shutdown", daemon=True)
+            shutdown_thread.start()
+            try:
+                shutdown_thread.join(timeout=1.0)
+            except KeyboardInterrupt:
+                print("FRDM UART proxy cleanup interrupted; continuing shutdown.")
+            if shutdown_thread.is_alive():
+                print("WARNING: FRDM UART proxy shutdown timed out; closing server socket.")
+            try:
+                server.server_close()
+            except Exception as exc:
+                if getattr(self.args, "uart_debug", False):
+                    print(f"FRDM UART proxy close warning: {exc}")
+        thread = self.thread
+        self.thread = None
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(timeout=1.0)
+            except KeyboardInterrupt:
+                print("FRDM UART proxy thread cleanup interrupted; continuing shutdown.")
+
+
 class FocusModeManager:
-    def __init__(self, args: argparse.Namespace, camera_manager: Any | None = None) -> None:
+    def __init__(self, args: argparse.Namespace, camera_manager: Any | None = None, *, uart_proxy_url: str = "") -> None:
         self.args = args
         self.camera_manager = camera_manager
+        self.uart_proxy_url = str(uart_proxy_url or "")
         self.process: subprocess.Popen[Any] | None = None
         self.camera_released_for_focus = False
         self.dashboard_state = "idle"
@@ -4099,6 +4666,8 @@ class FocusModeManager:
             str(getattr(self.args, "tts_timeout", 5.0)),
             "--alert-volume-gain",
             str(getattr(self.args, "tts_volume_gain", 2.25)),
+            "--first-sample-delay-sec",
+            str(getattr(self.args, "focus_first_sample_delay_sec", -1.0)),
             "--todo-list-path",
             str(getattr(self.args, "todo_list_path", THIS_DIR / "logs" / "todo_list.json")),
             "--notify-mode",
@@ -4121,8 +4690,12 @@ class FocusModeManager:
             command.append("--uart-dry-run")
         if getattr(self.args, "uart_debug", False):
             command.append("--uart-debug")
+        if self.uart_proxy_url:
+            command.extend(["--uart-proxy-url", self.uart_proxy_url])
         if getattr(self.args, "no_tts", False) or getattr(self.args, "no_focus_alert_tts", False):
             command.append("--no-alert-tts")
+        else:
+            command.append("--alert-tts-no-interrupt")
         if getattr(self.args, "no_focus_alert_motion", False):
             command.append("--no-alert-motion")
         command.append("--no-active-screen-uart")
@@ -4419,12 +4992,18 @@ class PetIdleReflectionManager:
             print_control_summary(control)
 
         timing = TimingLogger()
-        self.robot.send_speaking_and_emotion(control["emotion"])
-        head_thread, head_stop = self.robot.start_speaking_head_motion(control["head_motion"])
+        speaking_cue = SpeakingPlaybackCue(
+            self.robot,
+            control["emotion"],
+            control["head_motion"],
+            timing,
+            timing_label="UART Speaking emotion code sent",
+            reset_reason="speaking_head_motion pet idle reset",
+        )
         try:
-            speak_reply_and_wait(response, self.args)
+            speak_reply_and_wait(response, self.args, on_playback_start=speaking_cue.start)
         finally:
-            self.robot.stop_speaking_head_motion(head_thread, head_stop, reason="speaking_head_motion pet idle reset")
+            speaking_cue.stop()
         timing.mark("pet idle TTS finished")
         if not self._focus_running():
             self.robot.restore_persistent_screen_state()
@@ -4704,18 +5283,23 @@ class TodoListManager:
         return result
 
 
-def parse_frdm_todo_done_event(line: str) -> int | None:
+def frdm_event_parts(line: str) -> list[str]:
     text = str(line or "").strip()
     if not text:
-        return None
+        return []
     if text.startswith("$") and "*" in text:
         text = text[1:].split("*", 1)[0]
     normalized = re.sub(r"[,=:]+", " ", text)
     parts = normalized.split()
     if not parts:
-        return None
+        return []
     if parts[0].upper() == "EVT":
         parts = parts[1:]
+    return parts
+
+
+def parse_frdm_todo_done_event(line: str) -> int | None:
+    parts = frdm_event_parts(line)
     if not parts:
         return None
     command = parts[0].strip().lower()
@@ -4730,14 +5314,83 @@ def parse_frdm_todo_done_event(line: str) -> int | None:
     return item_id if item_id > 0 else None
 
 
+def parse_bool_token(value: str) -> bool | None:
+    token = str(value or "").strip().lower()
+    if token in {"1", "on", "true", "yes", "y", "open", "enable", "enabled", "開", "开", "開啟", "开启"}:
+        return True
+    if token in {"0", "off", "false", "no", "n", "close", "closed", "disable", "disabled", "關", "关", "關閉", "关闭"}:
+        return False
+    return None
+
+
+def parse_frdm_fan_event(line: str, *, speed_max: int = 3) -> dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    parts = frdm_event_parts(text)
+    if not parts:
+        return None
+
+    command = parts[0].strip().lower()
+    power: bool | None = None
+    speed: int | None = None
+
+    if command in {"fan", "fanset", "fancontrol"}:
+        if len(parts) < 2:
+            return None
+        power = parse_bool_token(parts[1])
+        if power is None:
+            try:
+                speed = int(float(parts[1]))
+            except (TypeError, ValueError):
+                return None
+            power = speed > 0
+        if len(parts) >= 3:
+            try:
+                speed = int(float(parts[2]))
+            except (TypeError, ValueError):
+                speed = None
+    elif command in {"fanpower", "fanswitch", "fanonoff"}:
+        if len(parts) < 2:
+            return None
+        power = parse_bool_token(parts[1])
+        if power is None:
+            return None
+    elif command in {"fanspeed", "fanlevel"}:
+        if len(parts) < 2:
+            return None
+        try:
+            speed = int(float(parts[1]))
+        except (TypeError, ValueError):
+            return None
+        power = speed > 0
+    else:
+        return None
+
+    safe_speed_max = max(1, int(speed_max or 3))
+    if speed is None:
+        speed = safe_speed_max if power else 0
+    speed = max(0, int(speed))
+    if not power:
+        speed = 0
+    if speed <= safe_speed_max:
+        percent = int(round((speed / safe_speed_max) * 100.0))
+    else:
+        percent = max(0, min(100, speed))
+    return {
+        "power": bool(power),
+        "state": "on" if power else "off",
+        "speed": speed,
+        "percent": percent,
+        "raw": text,
+    }
+
+
 class FrdmTodoEventListener:
     def __init__(self, args: argparse.Namespace, robot: RobotUartController, todo_manager: TodoListManager) -> None:
         self.args = args
         self.robot = robot
         self.todo_manager = todo_manager
-        self.stop_event = threading.Event()
-        self.thread: threading.Thread | None = None
-        self._cached_port = ""
 
     def start(self) -> None:
         if getattr(self.args, "no_frdm_todo_events", False):
@@ -4746,24 +5399,27 @@ class FrdmTodoEventListener:
         if getattr(self.args, "no_dashboard_uart", False):
             print("FRDM to-do checkbox events: skipped because dashboard UART sync is disabled.")
             return
+        if not frdm_uart_events_active(self.args):
+            print("FRDM to-do checkbox events: skipped because UART event bus is inactive.")
+            return
         if getattr(self.args, "no_uart", False) or getattr(self.args, "uart_dry_run", False):
             print("FRDM to-do checkbox events: skipped without live UART.")
             return
         if not self.todo_manager.is_enabled():
             print("FRDM to-do checkbox events: skipped because to-do list is disabled.")
             return
-        self.thread = threading.Thread(target=self._run, name="frdm_todo_events", daemon=True)
-        self.thread.start()
-        print("FRDM to-do checkbox events: listening for TodoDone <id>.")
+        print("FRDM to-do checkbox events: listening on UART bus for TodoDone <id>.")
 
     def stop(self) -> None:
-        self.stop_event.set()
-        thread = self.thread
-        self.thread = None
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=1.5)
+        return
 
     def handle_line(self, line: str) -> bool:
+        if not frdm_uart_events_active(self.args):
+            return False
+        if getattr(self.args, "no_frdm_todo_events", False) or getattr(self.args, "no_dashboard_uart", False):
+            return False
+        if not self.todo_manager.is_enabled():
+            return False
         item_id = parse_frdm_todo_done_event(line)
         if item_id is None:
             return False
@@ -4777,50 +5433,138 @@ class FrdmTodoEventListener:
         send_todo_uart_update(self.args, self.robot, self.todo_manager, reason=f"frdm todo done {item_id}")
         return True
 
-    def _resolve_port(self) -> str:
-        requested = str(getattr(self.args, "uart_port", "auto") or "auto")
-        if self._cached_port and Path(self._cached_port).exists():
-            return self._cached_port
-        self._cached_port = bridge.resolve_uart_port(requested)
-        return self._cached_port
 
-    def _read_lines_once(self) -> list[str]:
+class FrdmFanControlManager:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.last_event_key = ""
+        self.last_event_at = 0.0
+
+    def is_enabled(self) -> bool:
+        return not bool(getattr(self.args, "no_frdm_fan_events", False))
+
+    def start(self) -> None:
+        if not self.is_enabled():
+            print("FRDM fan events: disabled.")
+            return
+        if not frdm_uart_events_active(self.args):
+            print("FRDM fan events: skipped because UART event bus is inactive.")
+            return
+        if getattr(self.args, "no_uart", False) or getattr(self.args, "uart_dry_run", False):
+            print("FRDM fan events: skipped without live UART.")
+            return
+        print(
+            "FRDM fan events: listening on UART bus for "
+            "Fan <on/off>,<speed> or EVT,Fan,<on/off>,<speed>."
+        )
+
+    def stop(self) -> None:
+        return
+
+    def handle_line(self, line: str) -> bool:
+        if not frdm_uart_events_active(self.args):
+            return False
+        if not self.is_enabled():
+            return False
+        event = parse_frdm_fan_event(line, speed_max=int(getattr(self.args, "fan_speed_max", 3) or 3))
+        if event is None:
+            return False
+        key = f"{event['state']}:{event['speed']}:{event['percent']}"
+        now = time.monotonic()
+        if key == self.last_event_key and now - self.last_event_at < 0.15:
+            return True
+        self.last_event_key = key
+        self.last_event_at = now
+        print(
+            "FRDM fan event: "
+            f"state={event['state']} speed={event['speed']} percent={event['percent']} raw={event['raw']!r}"
+        )
+        dashboard_ok = self._sync_dashboard(event)
+        command_ok = self._run_control_command(event)
+        if not dashboard_ok and not command_ok and not str(getattr(self.args, "fan_control_command", "") or "").strip():
+            print("FRDM fan event handled in software only; configure --fan-control-command for GPIO/PWM hardware control.")
+        return True
+
+    def _dashboard_url(self) -> str:
+        template = str(getattr(self.args, "fan_dashboard_url", "") or DEFAULT_FAN_DASHBOARD_URL)
+        device_id = str(getattr(self.args, "fan_device_id", "desk_fan") or "desk_fan")
+        quoted = urllib.parse.quote(device_id, safe="")
         try:
-            import serial
-        except ImportError:
-            return []
-        lines: list[str] = []
+            return template.format(device_id=quoted)
+        except Exception:
+            return template
+
+    def _sync_dashboard(self, event: dict[str, Any]) -> bool:
+        if getattr(self.args, "no_fan_dashboard_sync", False):
+            return False
+        url = self._dashboard_url()
+        if not url:
+            return False
+        payload = {
+            "state": event["state"],
+            "value": int(event["percent"]),
+            "online": True,
+            "source": "frdm_uart",
+        }
         try:
-            with self.robot._lock:
-                port = self._resolve_port()
-                with serial.Serial(
-                    port=port,
-                    baudrate=getattr(self.args, "uart_baudrate", 115200),
-                    timeout=0.02,
-                    write_timeout=0.02,
-                ) as ser:
-                    deadline = time.monotonic() + 0.08
-                    while time.monotonic() < deadline:
-                        raw = ser.readline()
-                        if not raw:
-                            break
-                        text = raw.decode("utf-8", errors="replace").strip()
-                        if text:
-                            lines.append(text)
+            result = voice_chat.post_json(
+                url,
+                payload,
+                timeout_sec=max(0.1, float(getattr(self.args, "fan_dashboard_timeout", 1.5) or 1.5)),
+            )
         except Exception as exc:
-            if getattr(self.args, "uart_debug", False):
-                print(f"FRDM to-do event poll skipped: {exc}")
-            self._cached_port = ""
-        return lines
+            print(f"WARNING: fan dashboard sync failed: {exc}")
+            return False
+        print(f"Fan dashboard sync: ok={result.get('ok')} url={url}")
+        return bool(result.get("ok", True))
 
-    def _run(self) -> None:
-        interval = max(0.05, min(2.0, float(getattr(self.args, "frdm_event_poll_interval", 0.25) or 0.25)))
-        while not self.stop_event.is_set():
-            for line in self._read_lines_once():
-                if getattr(self.args, "uart_debug", False):
-                    print(f"FRDM UART event RX: {line}")
-                self.handle_line(line)
-            self.stop_event.wait(interval)
+    def _run_control_command(self, event: dict[str, Any]) -> bool:
+        template = str(getattr(self.args, "fan_control_command", "") or "").strip()
+        if not template:
+            return False
+        values = {
+            "state": event["state"],
+            "power": "1" if event["power"] else "0",
+            "speed": str(event["speed"]),
+            "percent": str(event["percent"]),
+            "device_id": str(getattr(self.args, "fan_device_id", "desk_fan") or "desk_fan"),
+        }
+        try:
+            command = shlex.split(template.format(**values))
+        except Exception as exc:
+            print(f"WARNING: fan control command format failed: {exc}")
+            return False
+        if not command:
+            return False
+        env = os.environ.copy()
+        env.update(
+            {
+                "FAN_STATE": values["state"],
+                "FAN_POWER": values["power"],
+                "FAN_SPEED": values["speed"],
+                "FAN_PERCENT": values["percent"],
+                "FAN_DEVICE_ID": values["device_id"],
+            }
+        )
+        try:
+            completed = subprocess.run(
+                command,
+                env=env,
+                timeout=max(0.1, float(getattr(self.args, "fan_command_timeout", 2.0) or 2.0)),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            print(f"WARNING: fan control command failed: {exc}")
+            return False
+        if completed.returncode != 0:
+            stderr = short_preview(completed.stderr, 160)
+            print(f"WARNING: fan control command exited {completed.returncode}: {stderr}")
+            return False
+        stdout = short_preview(completed.stdout, 120)
+        print(f"Fan control command OK" + (f": {stdout}" if stdout else ""))
+        return True
 
 
 def parse_camera_id(raw: str) -> str | int:
@@ -4833,52 +5577,201 @@ def parse_camera_id(raw: str) -> str | int:
         return value
 
 
+def pulse_sink_by_keyword(keyword: str) -> str:
+    if not shutil.which("pactl"):
+        return ""
+    keyword = str(keyword or "").strip().lower()
+    if not keyword:
+        return ""
+    try:
+        completed = subprocess.run(
+            ["pactl", "list", "short", "sinks"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=0.3,
+        )
+    except Exception:
+        return ""
+    for line in completed.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 2:
+            sink = fields[1].strip()
+            if keyword in sink.lower() or keyword.replace(" ", "_") in sink.lower():
+                return sink
+    return ""
+
+
+def alsa_playback_device_by_keyword(keyword: str) -> str:
+    keyword = str(keyword or "").strip()
+    if not keyword:
+        return ""
+    try:
+        cards_text = Path("/proc/asound/cards").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    keyword_lower = keyword.lower()
+    for line in cards_text.splitlines():
+        match = re.match(r"\s*\d+\s+\[([^\]]+)\]\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        card_name = match.group(1).strip()
+        description = match.group(2).strip()
+        if keyword_lower in card_name.lower() or keyword_lower in description.lower():
+            return f"plughw:CARD={card_name},DEV=0"
+    return ""
+
+
+def write_beep_wav(path: Path, *, duration_ms: int, frequency_hz: float, volume: float, sample_rate: int = 48_000) -> None:
+    sample_count = max(1, int(round(sample_rate * duration_ms / 1000.0)))
+    t = np.arange(sample_count, dtype=np.float32) / float(sample_rate)
+    base = np.sin(2.0 * np.pi * float(frequency_hz) * t)
+    harmonic = 0.25 * np.sin(2.0 * np.pi * float(frequency_hz) * 2.0 * t)
+    tone = (base + harmonic).astype(np.float32)
+    tone /= max(1.0, float(np.max(np.abs(tone))))
+    tone *= float(max(0.0, min(volume, 1.0)))
+    fade = max(1, int(round(sample_rate * 0.005)))
+    if sample_count > fade * 2:
+        ramp = np.linspace(0.0, 1.0, num=fade, dtype=np.float32)
+        tone[:fade] *= ramp
+        tone[-fade:] *= ramp[::-1]
+    pcm = np.clip(tone * 32767.0, -32768, 32767).astype("<i2")
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+
+
+def run_external_beep_player(
+    *,
+    wav_path: Path,
+    player: str,
+    keyword: str,
+    timeout_sec: float,
+) -> tuple[bool, str]:
+    requested = str(player or "auto").strip().lower()
+    attempts: list[tuple[str, list[str]]] = []
+    pulse_sink = pulse_sink_by_keyword(keyword)
+    if requested in {"auto", "pulse", "paplay"} and shutil.which("paplay"):
+        command = [
+            "paplay",
+            "--client-name=MakeNTU Wake Beep",
+            "--stream-name=recording-cue",
+            "--latency-msec=20",
+            "--process-time-msec=5",
+        ]
+        if pulse_sink:
+            command.append(f"--device={pulse_sink}")
+        command.append(str(wav_path))
+        attempts.append(("paplay", command))
+    if requested in {"auto", "aplay"} and shutil.which("aplay"):
+        alsa_device = alsa_playback_device_by_keyword(keyword)
+        for device_name in ([alsa_device] if alsa_device else []) + ["pulse", "default"]:
+            attempts.append(("aplay", ["aplay", "-q", "-D", device_name, str(wav_path)]))
+    if requested not in {"auto", "pulse", "paplay", "aplay", "sounddevice"}:
+        return False, f"unknown beep player: {player}"
+    if not attempts:
+        return False, "no external beep player available"
+
+    last_error = ""
+    for label, command in attempts:
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            last_error = f"{label} timed out"
+            continue
+        except Exception as exc:
+            last_error = f"{label} failed: {exc}"
+            continue
+        if completed.returncode == 0:
+            return True, label
+        last_error = f"{label} exited {completed.returncode}: {short_preview(completed.stderr, 160)}"
+    return False, last_error
+
+
+def play_recording_beep_sounddevice(
+    *,
+    duration_ms: int,
+    frequency_hz: float,
+    volume: float,
+    device: int | None = None,
+) -> bool:
+    import sounddevice as sd
+
+    sample_rates: list[int] = []
+    if device is not None:
+        try:
+            info = sd.query_devices(device, "output")
+            sample_rates.append(int(round(float(info.get("default_samplerate", 0)))))
+        except Exception:
+            pass
+    sample_rates.extend([48_000, 44_100, 32_000])
+    for sample_rate in dict.fromkeys(rate for rate in sample_rates if rate > 0):
+        sample_count = max(1, int(round(sample_rate * duration_ms / 1000.0)))
+        t = np.arange(sample_count, dtype=np.float32) / float(sample_rate)
+        base = np.sin(2.0 * np.pi * float(frequency_hz) * t)
+        harmonic = 0.25 * np.sin(2.0 * np.pi * float(frequency_hz) * 2.0 * t)
+        tone = (base + harmonic).astype(np.float32)
+        tone /= max(1.0, float(np.max(np.abs(tone))))
+        tone *= float(max(0.0, min(volume, 1.0)))
+        fade = max(1, int(round(sample_rate * 0.005)))
+        if sample_count > fade * 2:
+            ramp = np.linspace(0.0, 1.0, num=fade, dtype=np.float32)
+            tone[:fade] *= ramp
+            tone[-fade:] *= ramp[::-1]
+        sd.play(tone, samplerate=sample_rate, device=device, blocking=True)
+        return True
+    return False
+
+
 def play_recording_beep(
     *,
     duration_ms: int = 180,
     frequency_hz: float = 1320.0,
     volume: float = 0.55,
     device: int | None = None,
+    keyword: str = "UACDemo",
+    player: str = "auto",
 ) -> bool:
     """Play a short local cue without making recording depend on audio output."""
     if duration_ms <= 0 or volume <= 0.0:
         return True
+    requested_player = str(player or "auto").strip().lower()
     try:
-        import sounddevice as sd
+        if requested_player == "sounddevice":
+            return play_recording_beep_sounddevice(
+                duration_ms=duration_ms,
+                frequency_hz=frequency_hz,
+                volume=volume,
+                device=device,
+            )
 
-        sample_rates: list[int] = []
-        if device is not None:
-            try:
-                info = sd.query_devices(device, "output")
-                sample_rates.append(int(round(float(info.get("default_samplerate", 0)))))
-            except Exception:
-                pass
-        sample_rates.extend([48_000, 44_100, 32_000])
-
-        last_error: Exception | None = None
-        for sample_rate in dict.fromkeys(rate for rate in sample_rates if rate > 0):
-            try:
-                sample_count = max(1, int(round(sample_rate * duration_ms / 1000.0)))
-                t = np.arange(sample_count, dtype=np.float32) / float(sample_rate)
-                base = np.sin(2.0 * np.pi * float(frequency_hz) * t)
-                harmonic = 0.25 * np.sin(2.0 * np.pi * float(frequency_hz) * 2.0 * t)
-                tone = (base + harmonic).astype(np.float32)
-                tone /= max(1.0, float(np.max(np.abs(tone))))
-                tone *= float(max(0.0, min(volume, 1.0)))
-
-                fade = max(1, int(round(sample_rate * 0.005)))
-                if sample_count > fade * 2:
-                    ramp = np.linspace(0.0, 1.0, num=fade, dtype=np.float32)
-                    tone[:fade] *= ramp
-                    tone[-fade:] *= ramp[::-1]
-
-                sd.play(tone, samplerate=sample_rate, device=device, blocking=True)
+        with tempfile.NamedTemporaryFile(prefix="makentu_beep_", suffix=".wav", delete=False) as tmp:
+            wav_path = Path(tmp.name)
+        try:
+            write_beep_wav(wav_path, duration_ms=duration_ms, frequency_hz=frequency_hz, volume=volume)
+            ok, detail = run_external_beep_player(
+                wav_path=wav_path,
+                player=requested_player,
+                keyword=keyword,
+                timeout_sec=max(0.2, duration_ms / 1000.0 + 0.35),
+            )
+            if ok:
                 return True
-            except Exception as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("no usable output sample rate")
+            raise RuntimeError(detail)
+        finally:
+            try:
+                wav_path.unlink()
+            except OSError:
+                pass
     except Exception as exc:
         print(f"WARNING: recording beep failed: {exc}")
         return False
@@ -5399,6 +6292,10 @@ class WakeVolumeRecorder:
         peak_volume = 0
         last_audio_timeout_warn_at = 0.0
         audio_status_warn_at = 0.0
+        music_guard_active = False
+        music_guard_checked_at = 0.0
+        music_guard_confirm_chunks = 0
+        music_guard_notice_at = 0.0
         max_queue_chunks = max(20, int(round(3.0 * self.sample_rate / self.frames_per_chunk)))
         audio_read_timeout = max(0.1, float(getattr(self.args, "audio_read_timeout", 1.0) or 1.0))
         progress_interval = max(0.25, float(getattr(self.args, "recording_progress_interval", 1.0) or 1.0))
@@ -5521,10 +6418,44 @@ class WakeVolumeRecorder:
                         ambient_volumes,
                         fallback_volume=volume,
                     )
+                    music_guard_enabled = (
+                        bool(getattr(self.args, "music_wake_guard", False))
+                        and not getattr(self.args, "no_music_wake_guard", False)
+                        and not getattr(self.args, "no_music", False)
+                        and not getattr(self.args, "no_wake_word", False)
+                    )
+                    if music_guard_enabled:
+                        health_interval = max(
+                            0.2,
+                            float(getattr(self.args, "music_wake_health_interval", 1.0) or 1.0),
+                        )
+                        if now - music_guard_checked_at >= health_interval:
+                            music_guard_active = music_playback_active(self.args, timeout_sec=0.12)
+                            music_guard_checked_at = now
+                            if not music_guard_active:
+                                music_guard_confirm_chunks = 0
+                    else:
+                        music_guard_active = False
+                        music_guard_confirm_chunks = 0
+
+                    active_wake_threshold = float(self.args.wake_threshold)
+                    required_confirm_chunks = 1
+                    if music_guard_active:
+                        active_wake_threshold = max(
+                            active_wake_threshold,
+                            float(getattr(self.args, "music_wake_threshold", 0.98) or 0.98),
+                        )
+                        required_confirm_chunks = max(
+                            1,
+                            int(getattr(self.args, "music_wake_confirm_chunks", 2) or 2),
+                        )
+                        music_wake_volume_min = int(getattr(self.args, "music_wake_volume_min", 0) or 0)
+                        if music_wake_volume_min > 0:
+                            wake_volume_threshold = max(wake_volume_threshold, music_wake_volume_min)
                     if self.args.listen_debug:
                         print(
                             f"vol={volume:5d} | recent_peak={wake_gate_volume:5d} | wake={score:.3f} | "
-                            f"wake_vol>={wake_volume_threshold} | standby",
+                            f"wake>={active_wake_threshold:.2f} | wake_vol>={wake_volume_threshold} | standby",
                             end="\r",
                             file=sys.stderr,
                         )
@@ -5536,11 +6467,28 @@ class WakeVolumeRecorder:
                         print(
                             "Standby audio: "
                             f"volume={volume}, recent_peak={wake_gate_volume}, wake={score:.3f}, "
+                            f"wake_threshold={active_wake_threshold:.2f}, "
                             f"wake_volume_threshold={wake_volume_threshold}, noise_floor={wake_noise_floor}"
+                            + (
+                                f", music_guard=on confirm={music_guard_confirm_chunks}/{required_confirm_chunks}"
+                                if music_guard_active
+                                else ""
+                            )
                         )
                         last_standby_progress_log_at = now
 
-                    if score >= self.args.wake_threshold and wake_gate_volume < wake_volume_threshold:
+                    if music_guard_active and self.args.wake_threshold <= score < active_wake_threshold:
+                        music_guard_confirm_chunks = 0
+                        if now - music_guard_notice_at >= 2.0:
+                            print(
+                                "\nMusic wake-like score ignored: "
+                                f"score={score:.2f} < music_wake_threshold={active_wake_threshold:.2f}. "
+                                "Say Hey Jarvis louder/closer to interrupt music."
+                            )
+                            music_guard_notice_at = now
+
+                    if score >= active_wake_threshold and wake_gate_volume < wake_volume_threshold:
+                        music_guard_confirm_chunks = 0
                         if now - last_ignored_wake_at >= 2.0:
                             print(
                                 f"\nLow-volume wake-like score ignored: score={score:.2f}, "
@@ -5551,7 +6499,27 @@ class WakeVolumeRecorder:
                             )
                             last_ignored_wake_at = now
 
-                    if score >= self.args.wake_threshold and wake_gate_volume >= wake_volume_threshold:
+                    wake_candidate = score >= active_wake_threshold and wake_gate_volume >= wake_volume_threshold
+                    if music_guard_active:
+                        if wake_candidate:
+                            music_guard_confirm_chunks += 1
+                            if music_guard_confirm_chunks < required_confirm_chunks:
+                                if now - music_guard_notice_at >= 2.0:
+                                    print(
+                                        "\nMusic wake candidate needs confirmation: "
+                                        f"score={score:.2f}, "
+                                        f"confirm={music_guard_confirm_chunks}/{required_confirm_chunks}."
+                                    )
+                                    music_guard_notice_at = now
+                                ambient_volumes.append(volume)
+                                self.remember_ambient(volume)
+                                if len(ambient_volumes) > ambient_max_chunks:
+                                    del ambient_volumes[: len(ambient_volumes) - ambient_max_chunks]
+                                continue
+                        else:
+                            music_guard_confirm_chunks = 0
+
+                    if wake_candidate:
                         noise_floor, speech_start_threshold, silence_base_threshold = adaptive_recording_thresholds(
                             self.args,
                             ambient_volumes,
@@ -5576,6 +6544,7 @@ class WakeVolumeRecorder:
                             f"silence_base_threshold={silence_base_threshold}, "
                             f"wake_volume_threshold={wake_volume_threshold}, "
                             f"wake_gate_volume={wake_gate_volume}, "
+                            f"music_guard={'on' if music_guard_active else 'off'}, "
                             f"adaptive={'off' if self.args.no_adaptive_volume else 'on'}"
                         )
                         if self.wake_hook is not None:
@@ -5589,6 +6558,30 @@ class WakeVolumeRecorder:
                                 )
                                 if isinstance(hook_result, dict):
                                     wake_context = hook_result
+                                    music_pause_result = hook_result.get("music_pause_result")
+                                    if (
+                                        getattr(self.args, "music_reset_recording_gate_on_wake", True)
+                                        and isinstance(music_pause_result, dict)
+                                        and (music_pause_result.get("paused") or music_pause_result.get("stopped"))
+                                    ):
+                                        (
+                                            noise_floor,
+                                            speech_start_threshold,
+                                            silence_base_threshold,
+                                        ) = adaptive_recording_thresholds(
+                                            self.args,
+                                            [],
+                                            fallback_volume=int(getattr(self.args, "volume_min", 700)),
+                                        )
+                                        ambient_volumes.clear()
+                                        self.ambient_volumes.clear()
+                                        if getattr(self.args, "music_debug", False):
+                                            print(
+                                                "Music wake gate reset after pause: "
+                                                f"noise_floor={noise_floor}, "
+                                                f"speech_start_threshold={speech_start_threshold}, "
+                                                f"silence_base_threshold={silence_base_threshold}"
+                                            )
                             except Exception as exc:
                                 print(f"WARNING: wake hook failed: {exc}")
                         drained_chunks = drain_audio_queue()
@@ -6075,6 +7068,10 @@ def select_beep_output_device(args: argparse.Namespace) -> int | None:
     if args.no_beep:
         return None
 
+    cached_device = getattr(args, "_last_selected_beep_device", None)
+    if cached_device is not None and output_device_info(cached_device) is not None:
+        return int(cached_device)
+
     manual_device = bool(getattr(args, "_manual_beep_device", args.beep_device is not None))
     if manual_device and args.beep_device is not None:
         if output_device_info(args.beep_device) is not None:
@@ -6092,7 +7089,7 @@ def select_beep_output_device(args: argparse.Namespace) -> int | None:
         found = wait_for_sounddevice_keyword(
             keyword,
             output=True,
-            timeout_sec=float(getattr(args, "device_ready_timeout", 12.0) or 0.0),
+            timeout_sec=float(getattr(args, "beep_device_lookup_timeout", 0.25) or 0.0),
             label="output",
         )
     if found is not None:
@@ -6115,14 +7112,21 @@ def play_recording_cue(args: argparse.Namespace, *, label: str = "Recording") ->
         print(f"{label} beep skipped.")
         return True
 
-    args.beep_device = select_beep_output_device(args)
+    beep_player = str(getattr(args, "beep_player", "auto") or "auto").strip().lower()
+    if beep_player == "sounddevice":
+        args.beep_device = select_beep_output_device(args)
+        beep_device = args.beep_device
+    else:
+        beep_device = None
     ok = play_recording_beep(
         duration_ms=args.beep_duration_ms,
         frequency_hz=args.beep_frequency,
         volume=args.beep_volume,
-        device=args.beep_device,
+        device=beep_device,
+        keyword=str(getattr(args, "beep_keyword", "") or getattr(args, "mic_keyword", "") or "UACDemo"),
+        player=beep_player,
     )
-    if not ok and args.beep_device is not None and not getattr(args, "no_beep_default_retry", False):
+    if not ok and beep_player == "sounddevice" and args.beep_device is not None and not getattr(args, "no_beep_default_retry", False):
         retry_delay = max(0.0, float(getattr(args, "beep_retry_delay", 0.12) or 0.0))
         if retry_delay > 0.0:
             time.sleep(retry_delay)
@@ -6132,6 +7136,8 @@ def play_recording_cue(args: argparse.Namespace, *, label: str = "Recording") ->
             frequency_hz=args.beep_frequency,
             volume=args.beep_volume,
             device=None,
+            keyword=str(getattr(args, "beep_keyword", "") or getattr(args, "mic_keyword", "") or "UACDemo"),
+            player="sounddevice",
         )
 
     if ok:
@@ -6158,8 +7164,6 @@ def build_wake_hook(
 
         pause_result = pause_music_for_wake(args)
         timing.mark("music paused for wake")
-        if pause_result is not None and (pause_result.get("paused") or pause_result.get("stopped")):
-            send_music_uart_update(args, robot, pause_result, reason="wake paused music dashboard")
         settle_after_music_wake_pause(args, pause_result)
 
         metadata: dict[str, Any] = {
@@ -6181,6 +7185,14 @@ def build_wake_hook(
         play_recording_cue(args, label="Recording")
         timing.mark("beep done")
 
+        if (
+            getattr(args, "music_wake_dashboard_update", False)
+            and pause_result is not None
+            and (pause_result.get("paused") or pause_result.get("stopped"))
+        ):
+            send_music_uart_update(args, robot, pause_result, reason="wake paused music dashboard")
+            timing.mark("music pause dashboard sent")
+
         if robot.set_screen_state("Thinking"):
             print("UART Thinking sent.")
         else:
@@ -6191,6 +7203,7 @@ def build_wake_hook(
             "image_future": None,
             "metadata": metadata,
             "timing": timing,
+            "music_pause_result": pause_result,
         }
 
     return on_wake
@@ -6291,8 +7304,30 @@ def tts_queue_url(tts_url: str) -> str:
     return urllib.parse.urljoin(voice_chat.tts_base_url(tts_url) + "/", "queue")
 
 
-def wait_for_tts_job(job_id: str, args: argparse.Namespace, *, timeout_sec: float) -> bool:
+def tts_health_url(tts_url: str) -> str:
+    return urllib.parse.urljoin(voice_chat.tts_base_url(tts_url) + "/", "health")
+
+
+def tts_audio_playing(args: argparse.Namespace) -> bool:
+    health_url = tts_health_url(args.tts_url)
+    try:
+        health = voice_chat.get_json(health_url, timeout_sec=min(float(getattr(args, "tts_timeout", 5.0) or 5.0), 0.6))
+    except Exception:
+        return False
+    audio = health.get("audio") if isinstance(health.get("audio"), dict) else {}
+    return bool(audio.get("playing"))
+
+
+def wait_for_tts_job(
+    job_id: str,
+    args: argparse.Namespace,
+    *,
+    timeout_sec: float,
+    on_playback_start: Callable[[], None] | None = None,
+) -> bool:
     if not job_id:
+        if on_playback_start is not None:
+            on_playback_start()
         time.sleep(timeout_sec)
         print(f"TTS estimated finished after {timeout_sec:.1f}s (no job id).")
         return True
@@ -6301,17 +7336,36 @@ def wait_for_tts_job(job_id: str, args: argparse.Namespace, *, timeout_sec: floa
     deadline = time.monotonic() + timeout_sec
     last_error = ""
     saw_current_job = False
+    current_job_seen_at = 0.0
+    playback_start_notified = False
     poll_interval = max(0.1, min(float(getattr(args, "tts_poll_interval", 0.75) or 0.75), 2.0))
+    start_poll_interval = max(
+        0.05,
+        min(float(getattr(args, "tts_start_poll_interval", 0.12) or 0.12), poll_interval, 0.25),
+    )
+    start_fallback_sec = max(0.2, min(float(getattr(args, "tts_speaking_start_timeout", 1.2) or 1.2), 4.0))
+
+    def notify_playback_start(detail: str) -> None:
+        nonlocal playback_start_notified
+        if playback_start_notified:
+            return
+        playback_start_notified = True
+        if getattr(args, "tts_debug", False):
+            print(f"TTS playback observed: {detail}")
+        if on_playback_start is not None:
+            on_playback_start()
+
     while time.monotonic() < deadline:
         try:
             status = voice_chat.get_json(queue_url, timeout_sec=min(args.tts_timeout, 2.0))
         except Exception as exc:
             last_error = str(exc)
-            time.sleep(poll_interval)
+            time.sleep(start_poll_interval if not playback_start_notified else poll_interval)
             continue
 
         last_result = status.get("last_result") if isinstance(status.get("last_result"), dict) else {}
         if last_result.get("job_id") == job_id:
+            notify_playback_start("job finished before start poll observed output")
             if getattr(args, "tts_debug", False):
                 playback = last_result.get("playback") if isinstance(last_result.get("playback"), dict) else {}
                 print(f"TTS finished: job_id={job_id}, playback_volume_gain={playback.get('volume_gain', 'unknown')}")
@@ -6321,14 +7375,57 @@ def wait_for_tts_job(job_id: str, args: argparse.Namespace, *, timeout_sec: floa
         current = status.get("current") if isinstance(status.get("current"), dict) else {}
         if current.get("id") == job_id:
             saw_current_job = True
+            if current_job_seen_at <= 0.0:
+                current_job_seen_at = time.monotonic()
+            if not playback_start_notified:
+                if tts_audio_playing(args):
+                    notify_playback_start("TTS audio player reports output")
+                elif time.monotonic() - current_job_seen_at >= start_fallback_sec:
+                    notify_playback_start("TTS queue current fallback")
         last_error_value = str(status.get("last_error", "") or "").strip()
         if last_error_value and saw_current_job and not status.get("running"):
             print(f"WARNING: TTS worker error for job_id={job_id}: {last_error_value}")
             return False
-        time.sleep(poll_interval)
+        time.sleep(start_poll_interval if not playback_start_notified else poll_interval)
 
     print(f"WARNING: TTS wait timed out after {timeout_sec:.1f}s for job_id={job_id}. last_error={last_error}")
     return False
+
+
+class SpeakingPlaybackCue:
+    def __init__(
+        self,
+        robot: RobotUartController,
+        emotion: str,
+        head_motion: str,
+        timing: TimingLogger | None,
+        *,
+        timing_label: str = "UART Speaking emotion code sent",
+        reset_reason: str = "speaking_head_motion stop reset",
+    ) -> None:
+        self.robot = robot
+        self.emotion = emotion
+        self.head_motion = head_motion
+        self.timing = timing
+        self.timing_label = timing_label
+        self.reset_reason = reset_reason
+        self.started = False
+        self.head_thread: threading.Thread | None = None
+        self.head_stop: threading.Event | None = None
+
+    def start(self) -> None:
+        if self.started:
+            return
+        self.started = True
+        self.robot.send_speaking_and_emotion(self.emotion)
+        self.head_thread, self.head_stop = self.robot.start_speaking_head_motion(self.head_motion)
+        if self.timing is not None:
+            self.timing.mark(self.timing_label)
+
+    def stop(self) -> None:
+        if not self.started:
+            return
+        self.robot.stop_speaking_head_motion(self.head_thread, self.head_stop, reason=self.reset_reason)
 
 
 def run_self_test() -> int:
@@ -6471,9 +7568,18 @@ def run_self_test() -> int:
         uart_read_ms=30,
         uart_line_ending="crlf",
         uart_debug=False,
+        no_frdm_uart_bus=False,
+        frdm_uart_tx_timeout=0.45,
+        frdm_uart_failure_threshold=2,
+        frdm_uart_circuit_breaker_sec=4.0,
+        _frdm_uart_bus_active=True,
         no_dashboard_uart=False,
         dashboard_todo_item_limit=8,
         no_frdm_todo_events=False,
+        no_frdm_fan_events=False,
+        no_fan_dashboard_sync=True,
+        fan_speed_max=3,
+        fan_control_command="",
         motor_step_delay=0.02,
         motor_smooth_step_deg=MOTOR_SMOOTH_STEP_DEG,
         motor_reset_repeats=2,
@@ -6513,6 +7619,8 @@ def run_self_test() -> int:
         raise AssertionError("Focus dashboard raw dry-run failed")
     if not robot.send_uart_raw_line("Health win=1,tts=1,music=1,camera=1", reason="self-test"):
         raise AssertionError("Health raw dry-run failed")
+    if not robot.send_uart_raw_line("Device desk_fan,on,67", reason="self-test"):
+        raise AssertionError("Device raw dry-run failed")
     if robot.send_uart_command("UnknownCommand", 0, 0, reason="self-test"):
         raise AssertionError("unknown UART command should be rejected")
     if robot.send_uart_command("Happy", 0, 0, reason="self-test"):
@@ -6563,6 +7671,28 @@ def run_self_test() -> int:
         raise AssertionError("FRDM TodoDone event parsing failed")
     if parse_frdm_todo_done_event("EVT,TodoDone,42") != 42:
         raise AssertionError("FRDM comma TodoDone event parsing failed")
+    if frdm_event_parts("$EVT,Fan,1,2*00") != ["Fan", "1", "2"]:
+        raise AssertionError("FRDM event part normalization failed")
+    fan_event = parse_frdm_fan_event("EVT,Fan,1,2", speed_max=3)
+    if not fan_event or fan_event["state"] != "on" or fan_event["speed"] != 2 or fan_event["percent"] != 67:
+        raise AssertionError(f"FRDM fan event parsing failed: {fan_event}")
+    fan_off = parse_frdm_fan_event("Fan off,0", speed_max=3)
+    if not fan_off or fan_off["state"] != "off" or fan_off["percent"] != 0:
+        raise AssertionError(f"FRDM fan off parsing failed: {fan_off}")
+    fan_manager = FrdmFanControlManager(dry_args)
+    if not fan_manager.handle_line("EVT,Fan,1,2"):
+        raise AssertionError("FRDM fan manager should handle fan event")
+    if fan_manager.handle_line("TodoDone 42"):
+        raise AssertionError("FRDM fan manager should ignore non-fan event")
+    router_hits: list[str] = []
+    router = FrdmUartEventRouter(dry_args)
+    router.add_handler("test", lambda line: router_hits.append(line) or True)
+    if not router.handle_line("EVT,Fan,1,2") or router_hits != ["EVT,Fan,1,2"]:
+        raise AssertionError("FRDM UART event router failed")
+    if command_matches_stale_demo_process("python3 music_web_player.py --server --backend mpv", ("mpv",)):
+        raise AssertionError("preflight must not kill music_web_player just because --backend mpv is present")
+    if not command_matches_stale_demo_process("/usr/bin/mpv --no-video ytdl://ytsearch1:test", ("mpv",)):
+        raise AssertionError("preflight should still detect real mpv playback processes")
     expected_emotion_codes = {
         "neutral": 0,
         "concerned": 1,
@@ -6859,7 +7989,16 @@ def run_self_test() -> int:
     return 0
 
 
-def speak_reply_and_wait(response: dict[str, Any], args: argparse.Namespace) -> bool:
+def speak_reply_and_wait(
+    response: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    on_playback_start: Callable[[], None] | None = None,
+) -> bool:
+    response["_client_tts_attempted"] = False
+    response["_client_tts_ok"] = True
+    response["_client_tts_error"] = ""
+    response["_client_tts_playback_started"] = False
     if args.no_tts:
         print("TTS skipped by --no-tts.")
         return True
@@ -6874,13 +8013,23 @@ def speak_reply_and_wait(response: dict[str, Any], args: argparse.Namespace) -> 
     timeout_sec = max(float(getattr(args, "tts_playback_timeout", 0.0) or 0.0), estimated_sec + 25.0)
     timeout_sec = min(max(timeout_sec, 8.0), 60.0)
 
+    def notify_playback_start() -> None:
+        if response.get("_client_tts_playback_started"):
+            return
+        response["_client_tts_playback_started"] = True
+        if on_playback_start is not None:
+            on_playback_start()
+
     print(f"TTS started: estimated={estimated_sec:.1f}s timeout={timeout_sec:.1f}s")
+    response["_client_tts_attempted"] = True
     started = time.monotonic()
     try:
         tts_path = urllib.parse.urlsplit(args.tts_url).path.rstrip("/")
         post_timeout = timeout_sec if tts_path.endswith("/speak") else args.tts_timeout
         result = voice_chat.post_json(args.tts_url, payload, timeout_sec=post_timeout)
     except Exception as exc:
+        response["_client_tts_ok"] = False
+        response["_client_tts_error"] = str(exc)
         print(f"WARNING: TTS speak failed: {exc}")
         return False
 
@@ -6896,16 +8045,24 @@ def speak_reply_and_wait(response: dict[str, Any], args: argparse.Namespace) -> 
         if job_id:
             print(f"  job_id       : {job_id}")
     if result.get("queued") and job_id:
-        return wait_for_tts_job(job_id, args, timeout_sec=timeout_sec)
+        ok = wait_for_tts_job(job_id, args, timeout_sec=timeout_sec, on_playback_start=notify_playback_start)
+        response["_client_tts_ok"] = ok
+        if not ok:
+            response["_client_tts_error"] = f"queue wait failed for job_id={job_id}"
+        return ok
 
     # /speak blocking path: returning from POST means playback is done.
     playback = result.get("playback") if isinstance(result.get("playback"), dict) else {}
     if playback:
+        notify_playback_start()
         print("TTS finished: blocking playback returned.")
+        response["_client_tts_ok"] = True
         return True
 
+    notify_playback_start()
     time.sleep(estimated_sec)
     print(f"TTS estimated finished after {estimated_sec:.1f}s.")
+    response["_client_tts_ok"] = True
     return True
 
 
@@ -7068,6 +8225,8 @@ def handle_focus_mode_response(
         intent = "stop"
     if intent is None and not focus_manager.is_running():
         return None
+    if intent is None and focus_manager.is_running():
+        return None
     if focus_manager.is_running():
         focus_manager.close_uart_gate()
 
@@ -7105,25 +8264,40 @@ def handle_focus_mode_response(
         print(f"parsed control: {json.dumps(control, ensure_ascii=False)}")
         voice_chat.print_result(response, verbose_debug=args.debug)
 
-    robot.send_speaking_and_emotion(emotion)
-    head_thread, head_stop = robot.start_speaking_head_motion(head_motion)
+    speaking_cue = SpeakingPlaybackCue(
+        robot,
+        emotion,
+        head_motion,
+        timing,
+        timing_label="UART Speaking emotion code sent",
+        reset_reason="speaking_head_motion focus stop reset",
+    )
     if timing is not None:
         timing.mark("focus mode command handled")
-
     tts_ok = False
     try:
-        tts_ok = speak_reply_and_wait(response, args)
+        tts_ok = speak_reply_and_wait(response, args, on_playback_start=speaking_cue.start)
     except Exception as exc:
         print(f"WARNING: focus mode TTS failed unexpectedly: {exc}")
+        response["_client_tts_attempted"] = True
+        response["_client_tts_ok"] = False
+        response["_client_tts_error"] = str(exc)
         tts_ok = False
     finally:
         try:
-            robot.stop_speaking_head_motion(head_thread, head_stop, reason="speaking_head_motion focus stop reset")
+            speaking_cue.stop()
         finally:
             if timing is not None:
                 timing.mark("TTS finished or estimated finished")
-            if intent != "stop" and focus_manager.is_running():
-                focus_manager.open_uart_gate()
+            if intent == "stop":
+                send_focus_uart_update(
+                    args,
+                    robot,
+                    state=focus_manager.dashboard_state,
+                    remaining_min=focus_manager.dashboard_remaining_min,
+                    streak=focus_manager.dashboard_streak,
+                    reason="focus mode stop dashboard",
+                )
             set_post_reply_screen(
                 args,
                 robot,
@@ -7133,7 +8307,7 @@ def handle_focus_mode_response(
                 focus_stopped=intent == "stop",
                 reason="focus mode reply complete",
             )
-            if intent == "stop" or focus_manager.is_running():
+            if intent != "stop" and focus_manager.is_running():
                 send_focus_uart_update(
                     args,
                     robot,
@@ -7142,6 +8316,7 @@ def handle_focus_mode_response(
                     streak=focus_manager.dashboard_streak,
                     reason=f"focus mode {intent or 'active'} dashboard",
                 )
+                focus_manager.open_uart_gate()
     return tts_ok or not getattr(args, "require_tts", False)
 
 
@@ -7196,15 +8371,21 @@ def handle_todo_response(
 
     send_todo_uart_update(args, robot, todo_manager, reason=f"to-do {action} dashboard")
 
-    robot.send_speaking_and_emotion(emotion)
-    head_thread, head_stop = robot.start_speaking_head_motion(head_motion)
+    speaking_cue = SpeakingPlaybackCue(
+        robot,
+        emotion,
+        head_motion,
+        timing,
+        timing_label="UART Speaking emotion code sent",
+        reset_reason="speaking_head_motion todo stop reset",
+    )
     if timing is not None:
         timing.mark("to-do list command handled")
 
     try:
-        tts_ok = speak_reply_and_wait(response, args)
+        tts_ok = speak_reply_and_wait(response, args, on_playback_start=speaking_cue.start)
     finally:
-        robot.stop_speaking_head_motion(head_thread, head_stop, reason="speaking_head_motion todo stop reset")
+        speaking_cue.stop()
     if timing is not None:
         timing.mark("TTS finished or estimated finished")
 
@@ -7220,9 +8401,15 @@ def handle_wake_chat_response(
     focus_manager: FocusModeManager | None = None,
     todo_manager: TodoListManager | None = None,
 ) -> bool:
+    focus_gate_closed_for_turn = False
+    if focus_manager is not None and focus_manager.is_running():
+        focus_manager.close_uart_gate()
+        focus_gate_closed_for_turn = True
     if todo_manager is not None:
         handled = handle_todo_response(response, args, robot, timing, todo_manager)
         if handled is not None:
+            if focus_gate_closed_for_turn and focus_manager is not None and focus_manager.is_running():
+                focus_manager.open_uart_gate()
             return handled
 
     if focus_manager is not None:
@@ -7264,16 +8451,19 @@ def handle_wake_chat_response(
     if control["persistent_state"] in {"normal", "sleep"}:
         robot.set_persistent_state(control["persistent_state"])
 
-    robot.send_speaking_and_emotion(control["emotion"])
-
-    head_thread, head_stop = robot.start_speaking_head_motion(control["head_motion"])
-    if timing is not None:
-        timing.mark("UART Speaking emotion code sent")
+    speaking_cue = SpeakingPlaybackCue(
+        robot,
+        control["emotion"],
+        control["head_motion"],
+        timing,
+        timing_label="UART Speaking emotion code sent",
+        reset_reason="speaking_head_motion stop reset",
+    )
 
     try:
-        tts_ok = speak_reply_and_wait(response, args)
+        tts_ok = speak_reply_and_wait(response, args, on_playback_start=speaking_cue.start)
     finally:
-        robot.stop_speaking_head_motion(head_thread, head_stop, reason="speaking_head_motion stop reset")
+        speaking_cue.stop()
     if timing is not None:
         timing.mark("TTS finished or estimated finished")
 
@@ -7292,6 +8482,8 @@ def handle_wake_chat_response(
         focus_running=focus_manager.is_running() if focus_manager is not None else False,
         reason="chat reply complete",
     )
+    if focus_gate_closed_for_turn and focus_manager is not None and focus_manager.is_running():
+        focus_manager.open_uart_gate()
     return tts_ok or not getattr(args, "require_tts", False)
 
 
@@ -7654,6 +8846,19 @@ def send_and_handle_audio_turn(
             recorder.reset_wake()
             post_music_standby_cooldown(args, music_end_action)
             return ok, True
+        if getattr(args, "conversation_mode", False) and response.get("_client_tts_ok") is False:
+            tts_error = str(response.get("_client_tts_error", "") or "").strip()
+            detail = f" ({tts_error})" if tts_error else ""
+            print(
+                "TTS failed during this reply"
+                f"{detail}; ending conversation follow-up so the next command requires Hey Jarvis."
+            )
+            if focus_manager is not None and focus_manager.is_running():
+                robot.set_screen_mode("focus", reason="TTS failed; focus still running")
+            else:
+                robot.restore_persistent_screen_state()
+            recorder.reset_wake()
+            return ok, True
         return ok, False
     finally:
         if wav_path is not None:
@@ -7680,6 +8885,9 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     focus_manager: FocusModeManager | None = None
     pet_idle_manager: PetIdleReflectionManager | None = None
     todo_event_listener: FrdmTodoEventListener | None = None
+    fan_event_manager: FrdmFanControlManager | None = None
+    uart_bus: FrdmUartBus | None = None
+    uart_proxy_server: FrdmUartProxyServer | None = None
     temperature_receiver: Esp32TemperatureReceiver | None = None
     try:
         temperature_receiver = maybe_start_esp32_temperature_receiver(args)
@@ -7737,12 +8945,23 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         print("Camera disabled by --no-camera.")
 
     robot = RobotUartController(args)
-    focus_manager = FocusModeManager(args, camera_manager)
+    event_router = FrdmUartEventRouter(args)
+    uart_bus = FrdmUartBus(args, line_handler=event_router.handle_line)
+    uart_bus_started = uart_bus.start()
+    setattr(args, "_frdm_uart_bus_active", uart_bus_started)
+    if uart_bus_started:
+        robot.attach_uart_bus(uart_bus)
+        uart_proxy_server = FrdmUartProxyServer(args, robot)
+        uart_proxy_server.start()
+    focus_manager = FocusModeManager(args, camera_manager, uart_proxy_url=uart_proxy_server.url if uart_proxy_server is not None else "")
     pet_idle_manager = PetIdleReflectionManager(args, robot, focus_manager)
     todo_manager = TodoListManager(args)
     todo_event_listener = FrdmTodoEventListener(args, robot, todo_manager)
-    robot.set_inbound_line_handler(todo_event_listener.handle_line)
+    fan_event_manager = FrdmFanControlManager(args)
+    event_router.add_handler("todo", todo_event_listener.handle_line)
+    event_router.add_handler("fan", fan_event_manager.handle_line)
     todo_event_listener.start()
+    fan_event_manager.start()
     turn_state: dict[str, Any] = {}
     recorder = WakeVolumeRecorder(
         args,
@@ -7753,8 +8972,14 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         recorder.load_wake_model()
     except Exception as exc:
         print(f"ERROR: {exc}")
+        if fan_event_manager is not None:
+            fan_event_manager.stop()
         if todo_event_listener is not None:
             todo_event_listener.stop()
+        if uart_proxy_server is not None:
+            uart_proxy_server.stop()
+        if uart_bus is not None:
+            uart_bus.stop()
         if camera_manager is not None:
             camera_manager.release()
         if temperature_receiver is not None:
@@ -7768,7 +8993,11 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     print("AI path: Jetson wake/record locally -> Windows desktop local /voice-chat -> local ASR/Ollama.")
     print("No Gemini/OpenAI cloud API is used by this bridge.")
     print(f"Server URL: {args.server_url}")
-    print(f"FRDM UART: {args.uart_port} @ {args.uart_baudrate}, line_ending={args.uart_line_ending}")
+    print(
+        f"FRDM UART: {args.uart_port} @ {args.uart_baudrate}, "
+        f"line_ending={args.uart_line_ending}, "
+        f"bus_tx_timeout={getattr(args, 'frdm_uart_tx_timeout', 0.45):g}s"
+    )
     print(f"Input sample rate: {input_sample_rate} Hz; upload WAV sample rate: {voice_chat.SAMPLE_RATE} Hz")
     print(f"Wake word: {'disabled' if args.no_wake_word else args.wake_word}")
     print(
@@ -7806,7 +9035,8 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         if args.no_beep
         else (
             f"{args.beep_frequency:g} Hz, {args.beep_duration_ms} ms, "
-            f"volume={args.beep_volume:g}, device={args.beep_device if args.beep_device is not None else 'default'}"
+            f"volume={args.beep_volume:g}, player={args.beep_player}, "
+            f"device={args.beep_device if args.beep_device is not None else 'default'}"
         )
     )
     print(f"Recording beep: {beep_desc}")
@@ -7835,12 +9065,19 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     print(f"Pet idle reflection: {pet_idle_desc}")
     todo_desc = "disabled" if args.no_todo_list else f"enabled, path={args.todo_list_path}"
     print(f"To-do list: {todo_desc}")
-    todo_event_desc = "off" if args.no_frdm_todo_events or args.no_dashboard_uart else "on"
+    uart_event_desc = "on" if frdm_uart_events_active(args) else "off"
+    todo_event_desc = "off" if args.no_frdm_todo_events or args.no_dashboard_uart or not frdm_uart_events_active(args) else "on"
     print(
         f"Dashboard UART data sync: {'disabled' if args.no_dashboard_uart else 'enabled'}, "
         f"todo_item_limit={args.dashboard_todo_item_limit}, "
+        f"uart_event_bus={uart_event_desc}, "
         f"frdm_todo_events={todo_event_desc}"
     )
+    fan_desc = "disabled" if args.no_frdm_fan_events or not frdm_uart_events_active(args) else (
+        f"enabled, device={args.fan_device_id}, speed_max={args.fan_speed_max}, "
+        f"dashboard_sync={not args.no_fan_dashboard_sync}, command={'set' if args.fan_control_command else 'not set'}"
+    )
+    print(f"FRDM fan touch events: {fan_desc}")
     print(
         "Recording cues: start beep before each turn; "
         f"speech-end beep + image capture before upload (delay={args.speech_end_image_delay:g}s)"
@@ -7851,8 +9088,12 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         music_desc = (
             f"{args.music_url}, backend={args.music_backend}->{resolve_music_backend(args)}, "
             f"autostart={not args.no_music_autostart}, "
+            f"mpv_audio={args.music_mpv_audio_device}, "
+            f"mpv_cookies={'set' if (args.music_mpv_ytdl_cookies or args.music_mpv_ytdl_cookies_from_browser) else 'not set'}, "
             f"pause_on_wake={not args.no_music_pause_on_wake}, "
+            f"wake_guard={f'threshold={args.music_wake_threshold:g}/confirm={args.music_wake_confirm_chunks}' if (args.music_wake_guard and not args.no_music_wake_guard) else 'off'}, "
             f"beep_settle={args.music_wake_beep_settle:g}s, "
+            f"wake_gate_reset={args.music_reset_recording_gate_on_wake}, "
             f"post_music_cooldown={args.post_music_standby_cooldown:g}s"
         )
     print(f"Music tool: {music_desc}")
@@ -7894,6 +9135,8 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     )
     print(
         f"TTS queue polling: every {args.tts_poll_interval:g}s, "
+        f"start_poll={args.tts_start_poll_interval:g}s, "
+        f"speaking_start_timeout={args.tts_speaking_start_timeout:g}s, "
         f"playback_timeout={args.tts_playback_timeout:g}s, "
         f"volume_gain={getattr(args, 'tts_volume_gain', 1.0):g}"
     )
@@ -8037,18 +9280,27 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                 print(f"ERROR: {exc}")
                 robot.restore_persistent_screen_state()
     finally:
-        if pet_idle_manager is not None:
-            pet_idle_manager.shutdown()
-        if todo_event_listener is not None:
-            todo_event_listener.stop()
-        if focus_manager is not None:
-            focus_manager.shutdown()
-        if temperature_receiver is not None:
-            temperature_receiver.stop()
-        if camera_manager is not None:
-            camera_manager.release()
-        signal.signal(signal.SIGINT, previous_sigint)
-        lock.release()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            if pet_idle_manager is not None:
+                pet_idle_manager.shutdown()
+            if fan_event_manager is not None:
+                fan_event_manager.stop()
+            if todo_event_listener is not None:
+                todo_event_listener.stop()
+            if focus_manager is not None:
+                focus_manager.shutdown()
+            if uart_proxy_server is not None:
+                uart_proxy_server.stop()
+            if uart_bus is not None:
+                uart_bus.stop()
+            if temperature_receiver is not None:
+                temperature_receiver.stop()
+            if camera_manager is not None:
+                camera_manager.release()
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            lock.release()
 
 
 def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -8291,8 +9543,15 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     beep_group.add_argument("--beep-duration-ms", type=int, default=_env_int("BEEP_DURATION_MS", 180))
     beep_group.add_argument("--beep-frequency", type=float, default=_env_float("BEEP_FREQUENCY", 1320.0))
     beep_group.add_argument("--beep-volume", type=float, default=_env_float("BEEP_VOLUME", 0.55))
+    beep_group.add_argument(
+        "--beep-player",
+        choices=["auto", "pulse", "paplay", "aplay", "sounddevice"],
+        default=os.getenv("BEEP_PLAYER", "auto"),
+        help="Recording cue playback backend. auto prefers paplay/PulseAudio and avoids PortAudio ALSA playback crashes.",
+    )
     beep_group.add_argument("--beep-device", type=int, default=None, help="Optional sounddevice output device index for the beep.")
     beep_group.add_argument("--beep-keyword", default=os.getenv("BEEP_KEYWORD", "UACDemo"), help="Output-device keyword used when --beep-device is omitted.")
+    beep_group.add_argument("--beep-device-lookup-timeout", type=float, default=_env_float("BEEP_DEVICE_LOOKUP_TIMEOUT", 0.25), help="Fast timeout for resolving the beep output device after startup.")
     beep_group.add_argument("--beep-retry-delay", type=float, default=_env_float("BEEP_RETRY_DELAY", 0.12))
     beep_group.add_argument("--no-beep-default-retry", action="store_true", help="Do not retry the beep on the default output device if the keyword output is busy.")
 
@@ -8330,10 +9589,16 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     focus_group.add_argument("--focus-script", default=str(DEFAULT_FOCUS_SCRIPT), help="Path to focus_work_mode.py.")
     focus_group.add_argument("--focus-server-url", default=os.getenv("FOCUS_SERVER_URL", ""), help="Optional /focus-check URL. Defaults to the current server base.")
     focus_group.add_argument("--focus-interval-sec", type=float, default=_env_float("FOCUS_INTERVAL_SEC", 60.0))
+    focus_group.add_argument(
+        "--focus-first-sample-delay-sec",
+        type=float,
+        default=_env_float("FOCUS_FIRST_SAMPLE_DELAY_SEC", -1.0),
+        help="Delay before the first focus camera sample after Focus screen activation. Negative means use --focus-interval-sec.",
+    )
     focus_group.add_argument("--focus-duration-min", type=float, default=_env_float("FOCUS_DURATION_MIN", 0.0), help="Default auto-stop duration. 0 means wait for voice stop.")
     focus_group.add_argument("--focus-log-root", default=os.getenv("FOCUS_LOG_ROOT", str(THIS_DIR / "logs" / "focus_sessions")))
     focus_group.add_argument("--focus-task", default=os.getenv("FOCUS_TASK", ""), help="Default focus task if the start command does not include one.")
-    focus_group.add_argument("--focus-alert-threshold", type=int, default=_env_int("FOCUS_ALERT_THRESHOLD", 2))
+    focus_group.add_argument("--focus-alert-threshold", type=int, default=_env_int("FOCUS_ALERT_THRESHOLD", 1))
     focus_group.add_argument("--focus-alert-cooldown-sec", type=float, default=_env_float("FOCUS_ALERT_COOLDOWN_SEC", 90.0))
     focus_group.add_argument("--no-focus-alert-tts", action="store_true", help="Disable spoken warnings from background focus monitoring.")
     focus_group.add_argument("--no-focus-alert-motion", action="store_true", help="Disable MotorYawPitch warnings from background focus monitoring.")
@@ -8357,17 +9622,36 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     music_group.add_argument("--music-url", default=os.getenv("MUSIC_TOOL_URL", DEFAULT_MUSIC_TOOL_URL), help="Music Web Player /music endpoint.")
     music_group.add_argument("--music-backend", choices=["auto", "browser", "mpv"], default=os.getenv("MUSIC_TOOL_BACKEND", "auto"))
     music_group.add_argument("--music-timeout", type=float, default=_env_float("MUSIC_TOOL_TIMEOUT", 3.0))
+    music_group.add_argument("--music-mpv-audio-device", default=os.getenv("MUSIC_MPV_AUDIO_DEVICE", os.getenv("MPV_AUDIO_DEVICE", "auto")), help="Audio device passed to auto-started music_web_player mpv backend.")
+    music_group.add_argument("--music-mpv-audio-keyword", default=os.getenv("MUSIC_MPV_AUDIO_KEYWORD", os.getenv("MPV_AUDIO_DEVICE_KEYWORD", "UACDemo")), help="Keyword for auto mpv audio device discovery.")
+    music_group.add_argument("--music-mpv-ytdl-cookies", default=os.getenv("MUSIC_MPV_YTDL_COOKIES", os.getenv("MPV_YTDL_COOKIES", os.getenv("YTDLP_COOKIES", ""))), help="Optional cookies.txt passed to auto-started mpv/yt-dlp for logged-in YouTube playback.")
+    music_group.add_argument("--music-mpv-ytdl-cookies-from-browser", default=os.getenv("MUSIC_MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("YTDLP_COOKIES_FROM_BROWSER", ""))), help="Optional yt-dlp browser cookie source for auto-started mpv, e.g. firefox or chrome:Profile 1.")
+    music_group.add_argument("--music-mpv-volume", type=int, default=_env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 100)), help="mpv music volume passed to auto-started sidecar.")
+    music_group.add_argument("--music-mpv-ready-timeout", type=float, default=_env_float("MUSIC_MPV_READY_TIMEOUT", _env_float("MPV_READY_TIMEOUT", 1.5)), help="Seconds the music sidecar waits for mpv playback status.")
     music_group.add_argument(
         "--music-wake-pause-timeout",
         type=float,
-        default=_env_float("MUSIC_WAKE_PAUSE_TIMEOUT", 0.6),
+        default=_env_float("MUSIC_WAKE_PAUSE_TIMEOUT", 0.25),
         help="Short local HTTP timeout for pausing music immediately after wake detection.",
     )
     music_group.add_argument(
         "--music-wake-beep-settle",
         type=float,
-        default=_env_float("MUSIC_WAKE_BEEP_SETTLE", 0.18),
+        default=_env_float("MUSIC_WAKE_BEEP_SETTLE", 0.05),
         help="Seconds to let mpv/music pause settle before playing the wake recording beep.",
+    )
+    music_group.add_argument(
+        "--music-wake-dashboard-update",
+        action="store_true",
+        default=_env_bool("MUSIC_WAKE_DASHBOARD_UPDATE", False),
+        help="Also send Music paused dashboard UART after a music wake pause. Disabled by default to keep the beep fast.",
+    )
+    music_group.add_argument(
+        "--no-music-reset-recording-gate-on-wake",
+        dest="music_reset_recording_gate_on_wake",
+        action="store_false",
+        default=_env_bool("MUSIC_RESET_RECORDING_GATE_ON_WAKE", True),
+        help="Do not lower speech/silence thresholds after music is paused by wake.",
     )
     music_group.add_argument(
         "--post-music-standby-cooldown",
@@ -8375,6 +9659,37 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=_env_float("POST_MUSIC_STANDBY_COOLDOWN", 0.8),
         help="After play/resume auto-ends conversation mode, wait briefly before accepting the next wake to avoid music false wakes.",
     )
+    music_group.add_argument(
+        "--music-wake-guard",
+        action="store_true",
+        default=_env_bool("MUSIC_WAKE_GUARD", False),
+        help="Enable stricter wake-word acceptance while music is playing. Disabled by default to preserve the 5aae453 demo behavior.",
+    )
+    music_group.add_argument(
+        "--music-wake-threshold",
+        type=float,
+        default=_env_float("MUSIC_WAKE_THRESHOLD", 0.88),
+        help="Wake score required while music wake guard is enabled.",
+    )
+    music_group.add_argument(
+        "--music-wake-confirm-chunks",
+        type=int,
+        default=_env_int("MUSIC_WAKE_CONFIRM_CHUNKS", 1),
+        help="Consecutive wake chunks required while music is actively playing.",
+    )
+    music_group.add_argument(
+        "--music-wake-volume-min",
+        type=int,
+        default=_env_int("MUSIC_WAKE_VOLUME_MIN", 0),
+        help="Optional minimum recent wake volume while music is playing. 0 keeps the adaptive wake gate.",
+    )
+    music_group.add_argument(
+        "--music-wake-health-interval",
+        type=float,
+        default=_env_float("MUSIC_WAKE_HEALTH_INTERVAL", 1.0),
+        help="Seconds between local music health checks used by the music wake guard.",
+    )
+    music_group.add_argument("--no-music-wake-guard", action="store_true", help="Compatibility flag; keeps stricter music wake guard disabled.")
     music_group.add_argument("--music-dry-run", action="store_true", help="Ask music sidecar to detect but not open/play.")
     music_group.add_argument("--music-always-call", action="store_true", help="POST every transcript to the music sidecar, even if local intent detection is false.")
     music_group.add_argument("--music-debug", action="store_true", help="Print music routing details even when no music intent was detected.")
@@ -8385,13 +9700,43 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     weather_group.add_argument("--weather-url", default=os.getenv("WEATHER_TOOL_URL", DEFAULT_WEATHER_TOOL_URL), help="Local tool /weather endpoint.")
     weather_group.add_argument("--weather-default-location", default=os.getenv("WEATHER_DEFAULT_LOCATION", DEFAULT_WEATHER_LOCATION), help="Location used for '所在地/這裡/here' weather requests.")
     weather_group.add_argument("--weather-timeout", type=float, default=_env_float("WEATHER_TOOL_TIMEOUT", 6.0), help="HTTP timeout for the local /weather endpoint.")
-    weather_group.add_argument("--weather-api-timeout", type=float, default=_env_float("WEATHER_API_TIMEOUT", 5.0), help="Open-Meteo request timeout inside the local weather tool.")
+    weather_group.add_argument("--weather-api-timeout", type=float, default=_env_float("WEATHER_API_TIMEOUT", 4.5), help="Open-Meteo geocoding+forecast timeout budget passed to the local /weather endpoint.")
     weather_group.add_argument("--weather-always-call", action="store_true", help="POST every transcript to /weather, even if local intent detection is false.")
     weather_group.add_argument("--weather-debug", action="store_true", help="Print weather routing details even when no weather intent was detected.")
     weather_group.add_argument("--no-dashboard-uart", action="store_true", help="Do not send dashboard data UART lines such as Todo/Music/Focus/Health.")
     weather_group.add_argument("--dashboard-todo-item-limit", type=int, default=int(os.getenv("DASHBOARD_TODO_ITEM_LIMIT", "8")), help="Maximum open to-do items sent to FRDM dashboard pages.")
+    weather_group.add_argument("--no-frdm-uart-bus", action="store_true", help="Disable the single-owner UART bus and use legacy per-command UART writes. FRDM-originated events will not be reliable.")
+    weather_group.add_argument("--frdm-uart-reconnect-sec", type=float, default=_env_float("FRDM_UART_RECONNECT_SEC", 1.0), help="Reconnect delay for the single-owner UART bus.")
+    weather_group.add_argument(
+        "--frdm-uart-tx-timeout",
+        type=float,
+        default=_env_float("FRDM_UART_TX_TIMEOUT", 0.45),
+        help="Max seconds to wait for one single-owner UART bus TX before failing fast. Keeps Speaking/Thinking from stalling if FRDM is wedged.",
+    )
+    weather_group.add_argument(
+        "--frdm-uart-failure-threshold",
+        type=int,
+        default=_env_int("FRDM_UART_FAILURE_THRESHOLD", 2),
+        help="Consecutive UART bus TX failures before temporarily bypassing TX while keeping RX monitoring alive.",
+    )
+    weather_group.add_argument(
+        "--frdm-uart-circuit-breaker-sec",
+        type=float,
+        default=_env_float("FRDM_UART_CIRCUIT_BREAKER_SEC", 4.0),
+        help="Seconds to bypass UART bus TX after repeated failures. Set 0 to disable the bypass window.",
+    )
+    weather_group.add_argument("--uart-proxy-host", default=os.getenv("UART_PROXY_HOST", "127.0.0.1"), help="Local host for child processes to proxy UART lines through Wake Bridge.")
+    weather_group.add_argument("--uart-proxy-port", type=int, default=_env_int("UART_PROXY_PORT", 0), help="Local UART proxy port. 0 chooses a free port.")
     weather_group.add_argument("--no-frdm-todo-events", action="store_true", help="Do not listen for FRDM checkbox events such as TodoDone <id>.")
     weather_group.add_argument("--frdm-event-poll-interval", type=float, default=_env_float("FRDM_EVENT_POLL_INTERVAL", 0.25), help="Seconds between short UART polls for FRDM-originated events.")
+    weather_group.add_argument("--no-frdm-fan-events", action="store_true", help="Do not listen for FRDM fan UI events.")
+    weather_group.add_argument("--fan-device-id", default=os.getenv("FAN_DEVICE_ID", "desk_fan"), help="Dashboard device id controlled by FRDM fan events.")
+    weather_group.add_argument("--fan-speed-max", type=int, default=_env_int("FAN_SPEED_MAX", 3), help="Maximum FRDM fan speed level. Levels are mapped to 0..100 percent for dashboard state.")
+    weather_group.add_argument("--fan-dashboard-url", default=DEFAULT_FAN_DASHBOARD_URL, help="Dashboard set-device URL template. Use {device_id} for the URL-escaped device id.")
+    weather_group.add_argument("--no-fan-dashboard-sync", action="store_true", help="Do not POST FRDM fan events to the Jetson dashboard API.")
+    weather_group.add_argument("--fan-dashboard-timeout", type=float, default=_env_float("FAN_DASHBOARD_TIMEOUT", 1.5))
+    weather_group.add_argument("--fan-control-command", default=os.getenv("FAN_CONTROL_COMMAND", ""), help="Optional hardware command template for fan control. Placeholders: {power}, {state}, {speed}, {percent}, {device_id}.")
+    weather_group.add_argument("--fan-command-timeout", type=float, default=_env_float("FAN_COMMAND_TIMEOUT", 2.0))
     weather_group.add_argument("--no-startup-time", action="store_true", help="Do not send Time UART once at bridge startup.")
     weather_group.add_argument("--no-startup-weather", action="store_true", help="Do not fetch weather and send Weather UART once at bridge startup.")
     weather_group.add_argument(
@@ -8527,6 +9872,18 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=_env_float("TTS_POLL_INTERVAL", 0.75),
         help="Seconds between /queue polls while waiting for /speak_async. Increase to reduce TTS terminal log spam.",
     )
+    tts_timing_group.add_argument(
+        "--tts-start-poll-interval",
+        type=float,
+        default=_env_float("TTS_START_POLL_INTERVAL", 0.12),
+        help="Fast /queue+/health poll interval until TTS audio playback is observed and Speaking mode can start.",
+    )
+    tts_timing_group.add_argument(
+        "--tts-speaking-start-timeout",
+        type=float,
+        default=_env_float("TTS_SPEAKING_START_TIMEOUT", 1.2),
+        help="Fallback seconds after a TTS job becomes current before entering Speaking if audio.playing cannot be observed.",
+    )
     return parser
 
 
@@ -8542,6 +9899,8 @@ def apply_conversation_latency_preset(args: argparse.Namespace) -> None:
         args.audio_read_timeout = 0.2
         args.recording_progress_interval = 1.5
         args.tts_poll_interval = 0.1
+        args.tts_start_poll_interval = min(float(args.tts_start_poll_interval), 0.08)
+        args.tts_speaking_start_timeout = min(float(args.tts_speaking_start_timeout), 0.8)
         args.tts_playback_timeout = min(float(args.tts_playback_timeout), 18.0)
         args.music_wake_pause_timeout = min(float(args.music_wake_pause_timeout), 0.15)
         args.camera_result_timeout = min(float(args.camera_result_timeout), 0.45 if args.force_vision else 0.18)
@@ -8579,6 +9938,8 @@ def apply_conversation_latency_preset(args: argparse.Namespace) -> None:
     args.audio_read_timeout = 0.35
     args.recording_progress_interval = 0.75
     args.tts_poll_interval = 0.2
+    args.tts_start_poll_interval = min(float(args.tts_start_poll_interval), 0.1)
+    args.tts_speaking_start_timeout = min(float(args.tts_speaking_start_timeout), 1.0)
     args.tts_playback_timeout = min(float(args.tts_playback_timeout), 25.0)
     args.music_wake_pause_timeout = min(float(args.music_wake_pause_timeout), 0.25)
     args.camera_result_timeout = min(float(args.camera_result_timeout), 0.7 if args.force_vision else 0.35)
@@ -8663,11 +10024,41 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
     if float(getattr(args, "beep_retry_delay", 0.0) or 0.0) < 0.0:
         print("ERROR: --beep-retry-delay must be >= 0.")
         return False
+    if float(getattr(args, "beep_device_lookup_timeout", 0.0) or 0.0) < 0.0:
+        print("ERROR: --beep-device-lookup-timeout must be >= 0.")
+        return False
+    if float(getattr(args, "tts_start_poll_interval", 0.0) or 0.0) <= 0.0:
+        print("ERROR: --tts-start-poll-interval must be > 0.")
+        return False
+    if float(getattr(args, "tts_speaking_start_timeout", 0.0) or 0.0) <= 0.0:
+        print("ERROR: --tts-speaking-start-timeout must be > 0.")
+        return False
+    if float(getattr(args, "music_wake_pause_timeout", 0.0) or 0.0) < 0.0:
+        print("ERROR: --music-wake-pause-timeout must be >= 0.")
+        return False
     if float(getattr(args, "music_wake_beep_settle", 0.0) or 0.0) < 0.0:
         print("ERROR: --music-wake-beep-settle must be >= 0.")
         return False
     if float(getattr(args, "post_music_standby_cooldown", 0.0) or 0.0) < 0.0:
         print("ERROR: --post-music-standby-cooldown must be >= 0.")
+        return False
+    if not (0.0 < float(getattr(args, "music_wake_threshold", 0.0) or 0.0) <= 1.0):
+        print("ERROR: --music-wake-threshold must be > 0 and <= 1.")
+        return False
+    if int(getattr(args, "music_wake_confirm_chunks", 0) or 0) <= 0:
+        print("ERROR: --music-wake-confirm-chunks must be > 0.")
+        return False
+    if int(getattr(args, "music_wake_volume_min", 0) or 0) < 0:
+        print("ERROR: --music-wake-volume-min must be >= 0.")
+        return False
+    if float(getattr(args, "music_wake_health_interval", 0.0) or 0.0) <= 0.0:
+        print("ERROR: --music-wake-health-interval must be > 0.")
+        return False
+    if int(getattr(args, "music_mpv_volume", 100) or 0) < 0:
+        print("ERROR: --music-mpv-volume must be >= 0.")
+        return False
+    if float(getattr(args, "music_mpv_ready_timeout", 0.0) or 0.0) < 0.0:
+        print("ERROR: --music-mpv-ready-timeout must be >= 0.")
         return False
     for attr, flag in (
         ("wake_volume_ratio", "--wake-volume-ratio"),
@@ -8691,12 +10082,39 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
         if float(getattr(args, "focus_interval_sec", 0.0) or 0.0) <= 0.0:
             print("ERROR: --focus-interval-sec must be > 0.")
             return False
+        if float(getattr(args, "focus_first_sample_delay_sec", 0.0) or 0.0) < -1.0:
+            print("ERROR: --focus-first-sample-delay-sec must be >= -1.")
+            return False
         if int(getattr(args, "focus_alert_threshold", 0) or 0) < 1:
             print("ERROR: --focus-alert-threshold must be >= 1.")
             return False
         if float(getattr(args, "focus_alert_cooldown_sec", 0.0) or 0.0) < 0.0:
             print("ERROR: --focus-alert-cooldown-sec must be >= 0.")
             return False
+    if float(getattr(args, "frdm_uart_reconnect_sec", 0.0) or 0.0) <= 0.0:
+        print("ERROR: --frdm-uart-reconnect-sec must be > 0.")
+        return False
+    if float(getattr(args, "frdm_uart_tx_timeout", 0.0) or 0.0) <= 0.0:
+        print("ERROR: --frdm-uart-tx-timeout must be > 0.")
+        return False
+    if int(getattr(args, "frdm_uart_failure_threshold", 0) or 0) <= 0:
+        print("ERROR: --frdm-uart-failure-threshold must be > 0.")
+        return False
+    if float(getattr(args, "frdm_uart_circuit_breaker_sec", 0.0) or 0.0) < 0.0:
+        print("ERROR: --frdm-uart-circuit-breaker-sec must be >= 0.")
+        return False
+    if int(getattr(args, "uart_proxy_port", 0) or 0) < 0:
+        print("ERROR: --uart-proxy-port must be >= 0.")
+        return False
+    if int(getattr(args, "fan_speed_max", 0) or 0) <= 0:
+        print("ERROR: --fan-speed-max must be > 0.")
+        return False
+    if float(getattr(args, "fan_dashboard_timeout", 0.0) or 0.0) <= 0.0:
+        print("ERROR: --fan-dashboard-timeout must be > 0.")
+        return False
+    if float(getattr(args, "fan_command_timeout", 0.0) or 0.0) <= 0.0:
+        print("ERROR: --fan-command-timeout must be > 0.")
+        return False
     if not getattr(args, "no_pet_idle_reflection", False):
         if float(getattr(args, "pet_idle_interval_sec", 0.0) or 0.0) <= 0.0:
             print("ERROR: --pet-idle-interval-sec must be > 0.")
@@ -8768,7 +10186,8 @@ def main() -> int:
         return run_self_test()
     if args.test_beep:
         apply_noisy_room_preset(args)
-        args.beep_device = select_beep_output_device(args)
+        if str(getattr(args, "beep_player", "auto") or "auto").strip().lower() == "sounddevice":
+            args.beep_device = select_beep_output_device(args)
         ok = play_recording_cue(args, label="Test")
         return 0 if ok else 1
     if args.test_head_motion or args.test_head_emotion or args.test_speaking_head_motion:

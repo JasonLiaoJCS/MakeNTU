@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import glob
@@ -1853,7 +1854,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.frdm_uart_port:
         args.no_frdm_uart = True
     state = DashboardState(args)
-    server = DashboardHTTPServer((args.host, args.port), DashboardHandler, state)
+    try:
+        server = DashboardHTTPServer((args.host, args.port), DashboardHandler, state)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print(f"ERROR: smart home dashboard port {args.port} is already in use.")
+            print("A smart_home_dashboard server is probably already running.")
+            print(f"Open it at: http://127.0.0.1:{args.port}/")
+            print(f"Check API status with: curl http://127.0.0.1:{args.port}/api/status")
+            print("Stop old dashboard servers with: pkill -f 'smart_home_dashboard/server.py'")
+            return 1
+        raise
     print("MakeNTU smart home dashboard API")
     print(f"  dashboard : http://{args.host}:{args.port}/dashboard")
     print(f"  API status: http://{args.host}:{args.port}/api/status")
