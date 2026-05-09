@@ -121,7 +121,7 @@ Recommended `.env`:
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=2.4
+DEFAULT_VOLUME_GAIN=4.8
 ENABLE_STREAM_PLAYBACK=true
 ```
 
@@ -278,7 +278,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --beep-keyword UACDemo \
   --beep-player auto \
   --noisy-room \
-  --tts-volume-gain 2.4 \
+  --tts-volume-gain 4.8 \
   --beep-volume 0.35 \
   --uart-port auto \
   --uart-baudrate 115200 \
@@ -438,7 +438,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 ## FRDM UART State Machine Quick Reference
 
 ```text
-bridge startup        -> wait 2s -> Time <payload> -> Weather <payload> -> Normal 0 0
+bridge startup        -> wait 2s -> Time <payload> -> Weather daily <payload> -> Weather current <payload> -> Normal 0 0
 Hey Jarvis detected   -> Thinking 0 0
 AI/TTS starts         -> Speaking <0..5>
 TTS speaking          -> MotorPitch <angle>, MotorYaw <angle>
@@ -473,6 +473,7 @@ Startup data commands update GUI data and do not switch screens by themselves:
 ```text
 Time 20260509,213005,6,+480
 Weather daily,23,29,40,61
+Weather current,27,27,0,2
 Todo 3,1                  # open_count, done_count
 TodoItem 1,17,open,Write%20report
 TodoEnd 1

@@ -31,7 +31,7 @@ camera                : auto, 320x240, JPEG quality 70, memory-only
 image_capture         : after end-of-speech beep, before upload
 uart                  : auto, 115200, CRLF
 tts                   : local Piper /speak_async, AUDIO_DEVICE=auto:UACDemo
-tts volume            : --tts-volume-gain 2.4, server accepts volume_gain 0.05..8.0
+tts volume            : --tts-volume-gain 4.8, server accepts volume_gain 0.05..8.0
 beep volume           : --beep-volume 0.35
 USB output volume     : PulseAudio UACDemo ~70%, ALSA PCM 70%
 music/weather         : local tool server on 127.0.0.1:8788, mpv + Open-Meteo
@@ -46,12 +46,12 @@ Do not pin numeric USB indexes. After a USB replug, `--device 25`, `--beep-devic
 Conservative on-site volume settings:
 
 ```text
-TTS .env default      : DEFAULT_VOLUME_GAIN=2.4
-Wake Bridge default   : --tts-volume-gain 2.4
+TTS .env default      : DEFAULT_VOLUME_GAIN=4.8
+Wake Bridge default   : --tts-volume-gain 4.8
 PulseAudio USB sink   : about 70%
 ALSA USB PCM          : 70%
-Too loud              : try 2.0 and --beep-volume 0.25
-Too quiet             : try 3.0 before going higher
+Too loud              : try 3.6 and --beep-volume 0.25
+Too quiet             : try 6.0 before going higher
 ```
 
 Volume is reset to absolute values in three places: `~/.config/systemd/user/makentu-uacdemo-volume.service` at boot/login with user linger enabled, `~/.config/autostart/makentu-uacdemo-volume.desktop` after the desktop session starts, and `~/.bashrc` whenever a new terminal opens. `set_uacdemo_volume.sh` rejects relative values such as `+5%`, so repeated boots or terminals do not drift louder or quieter.
@@ -71,7 +71,7 @@ Music/weather intent changed                  -> restart Jetson Terminal 4
 Bridge process starts
 -> FRDM startup waits 2 seconds
 -> Jetson sends Time <payload> over UART
--> Jetson calls local /weather once, merges latest ESP32 local temperature if available, and sends Weather <payload> over UART
+-> Jetson calls local /weather for daily and current data, merges latest ESP32 local temperature if available, and sends both Weather payloads over UART
 -> Normal 0 0
 -> while idle, every ~30 seconds Jetson may ask the model an internal pet-reflection question
 -> if the model answers PET_IDLE_SILENCE, nothing is spoken
@@ -125,7 +125,7 @@ MotorYawPitch
 The Wake Bridge rejects older emotion-screen commands such as `Happy 0 0` or `Curious 0 0`. Facial emotion is now encoded as the first argument to `Speaking`.
 
 ```text
-bridge startup                                      -> wait 2s -> Time <payload> -> Weather <payload> -> Normal 0 0
+bridge startup                                      -> wait 2s -> Time <payload> -> Weather daily <payload> -> Weather current <payload> -> Normal 0 0
 Hey Jarvis detected                                 -> Thinking 0 0
 AI/TTS starts                                       -> Speaking <0..5>
 TTS speaking                                        -> MotorYawPitch <yaw> <pitch> natural motion loop
@@ -180,6 +180,7 @@ Time yyyymmdd,hhmmss,isoweekday,utc_offset_min
 Weather daily,23,29,40,61
 Weather daily,23,29,40,61,254
 Weather current,27,27,0,2
+Weather current,27,27,0,2,254
 ```
 
 Payload format:
@@ -289,7 +290,7 @@ bash frdm_uart_context_sender/auto_demo_devices.sh
 `run_wake_bridge_full_demo.sh` exports the auto/keyword device settings, normalizes UACDemo volume, then launches the bridge. Override only when needed:
 
 ```bash
-TTS_VOLUME_GAIN=1.2 BEEP_VOLUME=0.25 MUSIC_MPV_VOLUME=60 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+MAKE_NTU_TTS_VOLUME_GAIN=3.6 BEEP_VOLUME=0.25 MUSIC_MPV_VOLUME=60 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
 ```
 
 Do not hand-type the last few parameters in manual mode; the common mistake is accidentally typing `--uart-debug\terval 0.75`. The correct tail is:
@@ -312,7 +313,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --beep-keyword UACDemo \
   --beep-player auto \
   --noisy-room \
-  --tts-volume-gain 2.4 \
+  --tts-volume-gain 4.8 \
   --beep-volume 0.35 \
   --uart-port auto \
   --uart-baudrate 115200 \
@@ -381,7 +382,7 @@ This full mode enables wake word, conversation mode, speech-end image capture, F
 
 For one-shot Q&A, remove `--conversation-mode`, `--turn-listen-timeout`, `--session-idle-timeout`, and `--max-session-turns`. For lower latency, add `--ultra-response`; if speech is cut too early, use the more conservative `--turbo-response`.
 
-Keep `--noisy-room` for loud demo spaces. It raises speech/silence gates; the live demo launcher also passes `--beep-volume 0.35` so the cue beep stays controlled. TTS uses a fixed absolute `--tts-volume-gain 2.4`, which is `1.5x` over the previous `1.6`. If TTS is too loud, try `2.0`; if it is still too quiet, try `3.0`.
+Keep `--noisy-room` for loud demo spaces. It raises speech/silence gates; the live demo launcher also passes `--beep-volume 0.35` so the cue beep stays controlled. TTS uses a fixed absolute `--tts-volume-gain 4.8`, which is `2x` over the previous `2.4`. If TTS is too loud, try `3.6`; if it is still too quiet, try `6.0`.
 
 Beep-only test:
 
@@ -635,12 +636,15 @@ ESP32 local-temperature merge:
 DS18B20 -> ESP32-S3 GPIO4 -> WiFi LAN -> Jetson Terminal 3 -> Weather UART -> FRDM
 ```
 
+Startup weather sends two payloads: one whole-day payload from "今天天氣如何" and one current payload from "現在天氣如何". Explicit whole-day questions such as "明天天氣如何" still produce `Weather daily,...`; current/location weather questions produce `Weather current,...`.
+
 Recommended live mode is `push`. Terminal 3 opens an HTTP receiver on the Jetson, and the ESP32 periodically POSTs its current DS18B20 reading:
 
 ```text
 Jetson receiver : http://JETSON_LAN_IP:8790/temperature
 ESP32 payload   : {"ok":true,"temperature_c":25.4}
-UART output     : Weather daily,23,29,40,61,254
+UART output     : Weather daily,19,23,76,53,254
+UART output     : Weather current,20,20,0,3,254
 ```
 
 Use `pull` only if the ESP32 already exposes its own HTTP API, for example `http://ESP32_IP/temperature`. In `both` mode, the Wake Bridge first uses a recent pushed reading and falls back to pulling the ESP32 URL. A pushed reading older than `--esp32-temperature-max-age-sec` is ignored.
@@ -658,7 +662,8 @@ Expected Terminal 3 log:
 ```text
 ESP32 temperature receiver: http://0.0.0.0:8790/temperature
 Weather local temperature: push receiver http://0.0.0.0:8790/temperature
-Weather UART sent: Weather daily,23,29,40,61,254 (local=25.4 C)
+Weather UART sent: Weather daily,19,23,76,53,254 (local=25.4 C)
+Weather UART sent: Weather current,20,20,0,3,254 (local=25.4 C)
 ```
 
 FRDM firmware note: update `WeatherGui` / `ParseWeatherPayload` to accept either 5 fields or 6 fields. The 6th field is `local_temp_c_x10`, not a float. Display it as integer Celsius plus one decimal digit, for example `254 -> 25.4 C`, in the desired LVGL label.
@@ -1504,7 +1509,7 @@ TTS `.env` recommendation:
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=2.4
+DEFAULT_VOLUME_GAIN=4.8
 ENABLE_STREAM_PLAYBACK=true
 ```
 
@@ -1590,7 +1595,7 @@ TTS volume API smoke test:
 ```bash
 curl -X POST http://127.0.0.1:8777/speak_async \
   -H "Content-Type: application/json" \
-  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":2.4}'
+  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":4.8}'
 ```
 
 Focus work mode self-test:
@@ -1722,7 +1727,7 @@ TTS ready but no sound
 -> Check /health. Confirm configured_device is auto:UACDemo and audio.device resolved to UACDemo. Restart TTS.
 
 TTS is audible but too quiet
--> Use --tts-volume-gain 2.4 first. If still too quiet, try 3.0 and restart Wake Bridge.
+-> Use --tts-volume-gain 4.8 first. If still too quiet, try 6.0 and restart Wake Bridge.
 -> If /speak_async with volume_gain returns 422, Terminal 2 is still the old TTS server; restart it.
 
 Music starts when the user is complaining about audio volume

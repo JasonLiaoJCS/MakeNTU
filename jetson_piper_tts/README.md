@@ -341,7 +341,7 @@ PIPER_MODEL=./models/zh_CN-chaowen-medium.onnx
 PIPER_CONFIG=./models/zh_CN-chaowen-medium.onnx.json
 
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=2.4
+DEFAULT_VOLUME_GAIN=4.8
 APLAY_BIN=aplay
 
 EXTRA_PYTHONPATH=
@@ -372,7 +372,7 @@ LOG_LEVEL=INFO
 - `AUDIO_DEVICE=auto:UACDemo`：每次播放前自動找 UACDemo USB speaker，最適合 demo 反覆重插 USB。
 - `AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0`：固定用目前這張 USB 喇叭；比 `plughw:1,0` 穩，但 USB 名稱變了就要改。
 - `AUDIO_DEVICE=default`：使用 ALSA default，只有 Jetson 預設音源已經正確時才建議。
-- `DEFAULT_VOLUME_GAIN=2.4`：目前 demo 固定音量，是前一版 `1.6` 的 `1.5x`；太大可降 `2.0`，太小再試 `3.0`。
+- `DEFAULT_VOLUME_GAIN=4.8`：目前 demo 固定音量，是前一版 `2.4` 的 `2x`；太大可降 `3.6`，太小再試 `6.0`。
 - `DEFAULT_LENGTH_SCALE=0.85`：語速更快。
 - `DEFAULT_LENGTH_SCALE=1.0`：語速較自然。
 - `MAX_TEXT_CHARS=600`：單次最多處理 600 字。
@@ -465,7 +465,7 @@ curl http://127.0.0.1:8777/queue | python -m json.tool
 ```bash
 curl -X POST http://127.0.0.1:8777/speak_async \
   -H "Content-Type: application/json" \
-  -d '{"text":"你好，我是桌面助手。","interrupt":true,"volume_gain":2.4}'
+  -d '{"text":"你好，我是桌面助手。","interrupt":true,"volume_gain":4.8}'
 ```
 
 常用 body：
@@ -476,7 +476,7 @@ curl -X POST http://127.0.0.1:8777/speak_async \
   "interrupt": true,
   "voice": "zh_CN-chaowen-medium",
   "length_scale": 0.9,
-  "volume_gain": 2.4,
+  "volume_gain": 4.8,
   "stream": true
 }
 ```
@@ -487,7 +487,7 @@ curl -X POST http://127.0.0.1:8777/speak_async \
 - `interrupt`: `true` 會停止目前播放並清空 queue，馬上講新句。
 - `voice`: 可選，指定 voice 名稱。
 - `length_scale`: 可選，越小越快。
-- `volume_gain`: 可選，raw playback 絕對音量增益，建議先試 `2.4`；太大降 `2.0`，仍太小再試 `3.0`，server 接受範圍是 `0.05` 到 `8.0`。
+- `volume_gain`: 可選，raw playback 絕對音量增益，建議先試 `4.8`；太大降 `3.6`，仍太小再試 `6.0`，server 接受範圍是 `0.05` 到 `8.0`。
 - `stream`: 可選，`true` 走 raw streaming；`false` 走 WAV 檔路徑。
 
 ### POST `/speak`
@@ -526,7 +526,7 @@ cat > /tmp/tts_payload.json <<'JSON'
 {
   "text": "房子大了電話小了 感覺越來越好 飯菜香了穿戴美了 生活越來越好",
   "interrupt": true,
-  "volume_gain": 2.4
+  "volume_gain": 4.8
 }
 JSON
 

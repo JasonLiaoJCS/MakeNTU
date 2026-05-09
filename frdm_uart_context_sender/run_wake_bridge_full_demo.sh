@@ -7,15 +7,13 @@ VENV_DIR="$ROOT_DIR/emotion_robot_controller/.venv"
 SERVER_URL="${SERVER_URL:-http://100.108.141.26:8766/voice-chat}"
 FOCUS_SERVER_URL="${FOCUS_SERVER_URL:-http://100.108.141.26:8766/focus-check}"
 DEVICE_READY_TIMEOUT="${DEVICE_READY_TIMEOUT:-30}"
-if [ -n "${MAKE_NTU_TTS_VOLUME_GAIN:-}" ]; then
-  TTS_VOLUME_GAIN="$MAKE_NTU_TTS_VOLUME_GAIN"
-else
-  TTS_VOLUME_GAIN="${TTS_VOLUME_GAIN:-2.4}"
-fi
+TTS_VOLUME_GAIN="${MAKE_NTU_TTS_VOLUME_GAIN:-4.8}"
 MUSIC_MPV_AUDIO_DEVICE="${MUSIC_MPV_AUDIO_DEVICE:-auto}"
 MUSIC_MPV_VOLUME="${MUSIC_MPV_VOLUME:-70}"
 MUSIC_MPV_READY_TIMEOUT="${MUSIC_MPV_READY_TIMEOUT:-1.5}"
 BEEP_VOLUME="${BEEP_VOLUME:-0.35}"
+STARTUP_WEATHER_TEXT="${STARTUP_WEATHER_TEXT:-今天天氣如何}"
+STARTUP_WEATHER_CURRENT_TEXT="${STARTUP_WEATHER_CURRENT_TEXT:-現在天氣如何}"
 export UACDEMO_PCM_VOLUME="${MAKE_NTU_UACDEMO_PCM_VOLUME:-70%}"
 export UACDEMO_PULSE_VOLUME="${MAKE_NTU_UACDEMO_PULSE_VOLUME:-70%}"
 export DEFAULT_VOLUME_GAIN="$TTS_VOLUME_GAIN"
@@ -97,6 +95,8 @@ cmd=(
   --post-music-standby-cooldown 0.8
   --music-debug
   --weather-default-location Taipei
+  --startup-weather-text "$STARTUP_WEATHER_TEXT"
+  --startup-weather-current-text "$STARTUP_WEATHER_CURRENT_TEXT"
   --weather-timeout 6
   --weather-api-timeout 4.5
   --weather-debug

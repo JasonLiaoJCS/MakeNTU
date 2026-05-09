@@ -3523,14 +3523,13 @@ def send_startup_dashboard_updates(
     send_health_uart_update(args, robot, camera_manager, reason="startup dashboard health")
 
 
-def send_startup_weather_update(args: argparse.Namespace, robot: RobotUartController) -> dict[str, Any] | None:
-    if getattr(args, "no_weather", False) or getattr(args, "no_startup_weather", False):
-        print("Startup weather UART update skipped.")
-        return None
-    if getattr(args, "no_uart", False):
-        return None
-
-    text = str(getattr(args, "startup_weather_text", "") or "今天天氣如何").strip()
+def _send_startup_weather_text(
+    args: argparse.Namespace,
+    robot: RobotUartController,
+    *,
+    text: str,
+    label: str,
+) -> dict[str, Any] | None:
     response: dict[str, Any] = {"transcript": text}
     route = detect_weather_route(response, args)
     if not route.get("should_call"):
@@ -3538,17 +3537,33 @@ def send_startup_weather_update(args: argparse.Namespace, robot: RobotUartContro
         route["intent"] = True
         route["action"] = "weather"
         route["location"] = route.get("location") or getattr(args, "weather_default_location", DEFAULT_WEATHER_LOCATION)
-        route["reason"] = "startup_weather"
+        route["reason"] = f"startup_weather_{label}"
 
-    result = execute_weather_route(route, args, response, phase="startup")
+    result = execute_weather_route(route, args, response, phase=f"startup_{label}")
     if not result:
-        print("Startup weather UART update skipped: no weather result.")
+        print(f"Startup weather {label} UART update skipped: no weather result.")
         return None
-    payload = send_weather_uart_update(args, robot, result, reason="startup weather update")
+    payload = send_weather_uart_update(args, robot, result, reason=f"startup weather {label} update")
     if not payload:
-        print("Startup weather UART update skipped: weather result did not contain compact numeric data.")
+        print(f"Startup weather {label} UART update skipped: weather result did not contain compact numeric data.")
         return result
     return result
+
+
+def send_startup_weather_update(args: argparse.Namespace, robot: RobotUartController) -> dict[str, Any] | None:
+    if getattr(args, "no_weather", False) or getattr(args, "no_startup_weather", False):
+        print("Startup weather UART update skipped.")
+        return None
+    if getattr(args, "no_uart", False):
+        return None
+
+    daily_text = str(getattr(args, "startup_weather_text", "") or "今天天氣如何").strip()
+    current_text = str(getattr(args, "startup_weather_current_text", "") or "現在天氣如何").strip()
+    daily_result = _send_startup_weather_text(args, robot, text=daily_text, label="daily")
+    current_result = _send_startup_weather_text(args, robot, text=current_text, label="current")
+    if daily_result is None and current_result is None:
+        return None
+    return {"daily": daily_result, "current": current_result}
 
 
 @dataclass
@@ -7793,6 +7808,8 @@ def run_self_test() -> int:
         raise AssertionError("Weather raw dry-run failed")
     if not robot.send_uart_raw_line("Weather daily,23,29,40,61,254", reason="self-test"):
         raise AssertionError("Weather+local-temperature raw dry-run failed")
+    if not robot.send_uart_raw_line("Weather current,27,27,0,2", reason="self-test"):
+        raise AssertionError("Weather current raw dry-run failed")
     if not robot.send_uart_raw_line("Todo 3,1", reason="self-test"):
         raise AssertionError("Todo raw dry-run failed")
     if not robot.send_uart_raw_line("TodoItem 1,42,open,Write%20report", reason="self-test"):
@@ -8147,6 +8164,20 @@ def run_self_test() -> int:
     )
     if weather_payload != "daily,22,29,41,61":
         raise AssertionError(f"weather UART payload formatting failed: {weather_payload}")
+    current_weather_payload = format_weather_uart_payload(
+        {
+            "ok": True,
+            "handled": True,
+            "weather": {
+                "kind": "current",
+                "temperature_c": 20.1,
+                "precipitation_probability": 0,
+                "weather_code": 3,
+            },
+        }
+    )
+    if current_weather_payload != "current,20,20,0,3":
+        raise AssertionError(f"weather current UART payload formatting failed: {current_weather_payload}")
     weather_payload_with_local = format_weather_uart_payload(
         {
             "ok": True,
@@ -9293,7 +9324,11 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     if args.no_weather:
         weather_desc = "disabled"
     else:
-        startup_weather = "off" if args.no_startup_weather or args.no_uart else f"on:{args.startup_weather_text}"
+        startup_weather = (
+            "off"
+            if args.no_startup_weather or args.no_uart
+            else f"daily:{args.startup_weather_text}; current:{args.startup_weather_current_text}"
+        )
         weather_desc = (
             f"{args.weather_url}, default_location={args.weather_default_location}, "
             f"source=Open-Meteo, startup_uart={startup_weather}"
@@ -9930,11 +9965,16 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     weather_group.add_argument("--fan-control-command", default=os.getenv("FAN_CONTROL_COMMAND", ""), help="Optional hardware command template for fan control. Placeholders: {power}, {state}, {speed}, {percent}, {device_id}.")
     weather_group.add_argument("--fan-command-timeout", type=float, default=_env_float("FAN_COMMAND_TIMEOUT", 2.0))
     weather_group.add_argument("--no-startup-time", action="store_true", help="Do not send Time UART once at bridge startup.")
-    weather_group.add_argument("--no-startup-weather", action="store_true", help="Do not fetch weather and send Weather UART once at bridge startup.")
+    weather_group.add_argument("--no-startup-weather", action="store_true", help="Do not fetch and send startup Weather daily/current UART payloads.")
     weather_group.add_argument(
         "--startup-weather-text",
         default=os.getenv("STARTUP_WEATHER_TEXT", "今天天氣如何"),
-        help="Text routed through the existing weather tool at startup before sending Normal.",
+        help="Whole-day weather text routed through the existing weather tool at startup before sending Normal.",
+    )
+    weather_group.add_argument(
+        "--startup-weather-current-text",
+        default=os.getenv("STARTUP_WEATHER_CURRENT_TEXT", "現在天氣如何"),
+        help="Current-weather text routed through the existing weather tool at startup before sending Normal.",
     )
     weather_group.add_argument(
         "--esp32-temperature-mode",

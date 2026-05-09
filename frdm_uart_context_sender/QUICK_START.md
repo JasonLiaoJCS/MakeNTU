@@ -47,7 +47,7 @@ FRDM baudrate     : 115200, CRLF
 Local tool server : http://127.0.0.1:8788
 Dashboard server  : http://jetson-ip:8789/dashboard
 Weather source    : Open-Meteo, default location=Taipei
-Startup weather   : enabled, sends Weather UART once before Normal
+Startup weather   : enabled, sends Weather daily + Weather current before Normal
 Local temperature : optional ESP32-S3 + DS18B20 on ESP32 GPIO4, POSTs to Jetson Terminal 3
 ```
 
@@ -96,17 +96,17 @@ head_motion=pose-driven cute motion, large yaw/pitch targets with longer holds
 現場音量安全檔位：
 
 ```text
-目前建議值     : DEFAULT_VOLUME_GAIN=2.4, --tts-volume-gain 2.4
-旁邊的人會嚇到 : 降到 2.0，並把 --beep-volume 降到 0.25
-現場太吵聽不清 : 先升到 3.0，不要直接跳 8.0
+目前建議值     : DEFAULT_VOLUME_GAIN=4.8, --tts-volume-gain 4.8
+旁邊的人會嚇到 : 降到 3.6，並把 --beep-volume 降到 0.25
+現場太吵聽不清 : 先升到 6.0，不要直接跳 8.0
 USB sink 建議   : PulseAudio UACDemo 約 70%，ALSA PCM 70%
 ```
 
-這裡的 `2.4` 是固定絕對增益，不是每次啟動再乘一次。它是前一版 `1.6` 的 `1.5x`，用來補回現場聽起來偏小的 TTS 音量。
+這裡的 `4.8` 是固定絕對增益，不是每次啟動再乘一次。它是前一版 `2.4` 的 `2x`，用來補回現場聽起來依然偏小的 TTS 音量。
 
 新開 Terminal 會透過 `~/.bashrc` 自動呼叫 `frdm_uart_context_sender/set_uacdemo_volume.sh --wait 1`，把 UACDemo 的 PulseAudio 與 ALSA PCM 音量拉回絕對 `70%`。開機/登入時也有已啟用 linger 的 `makentu-uacdemo-volume.service` 和 `~/.config/autostart/makentu-uacdemo-volume.desktop` 會等待 USB speaker 出現後套用同一份絕對音量。臨時要改可以在開 Terminal 前設定 `MAKE_NTU_UACDEMO_PCM_VOLUME` / `MAKE_NTU_UACDEMO_PULSE_VOLUME`，例如 `MAKE_NTU_UACDEMO_PCM_VOLUME=60% MAKE_NTU_UACDEMO_PULSE_VOLUME=60% bash`。
 
-新開 Terminal 也會把 demo 裝置和音量環境變數固定成 auto/keyword/absolute：`AUDIO_DEVICE=auto:UACDemo`、`MIC_DEVICE_KEYWORD=UACDemo`、`SPEAKER_DEVICE_KEYWORD=UACDemo`、`WAKE_CAMERA_ID=auto`、`FOCUS_CAMERA_ID=auto`、`FOCUS_UART_PORT=auto`、`TTS_VOLUME_GAIN=2.4`、`DEFAULT_VOLUME_GAIN=2.4`。如果真的要手動覆蓋，用 `MAKE_NTU_AUDIO_DEVICE` / `MAKE_NTU_WAKE_CAMERA_ID` / `MAKE_NTU_FOCUS_UART_PORT` / `MAKE_NTU_TTS_VOLUME_GAIN` 這類 `MAKE_NTU_*` 變數。
+新開 Terminal 也會把 demo 裝置和音量環境變數固定成 auto/keyword/absolute：`AUDIO_DEVICE=auto:UACDemo`、`MIC_DEVICE_KEYWORD=UACDemo`、`SPEAKER_DEVICE_KEYWORD=UACDemo`、`WAKE_CAMERA_ID=auto`、`FOCUS_CAMERA_ID=auto`、`FOCUS_UART_PORT=auto`、`TTS_VOLUME_GAIN=4.8`、`DEFAULT_VOLUME_GAIN=4.8`。如果真的要手動覆蓋，用 `MAKE_NTU_AUDIO_DEVICE` / `MAKE_NTU_WAKE_CAMERA_ID` / `MAKE_NTU_FOCUS_UART_PORT` / `MAKE_NTU_TTS_VOLUME_GAIN` 這類 `MAKE_NTU_*` 變數。
 
 正式 demo 最省事的做法是先跑自動偵測，再用包好的啟動腳本：
 
@@ -150,7 +150,7 @@ Jetson Terminal 5   -> dashboard server 若前端/API 有改，重啟它
 FRDM UART 狀態機速查：
 
 ```text
-bridge startup        -> wait 2s -> Weather <payload>[,local_temp_x10] -> Normal 0 0
+bridge startup        -> wait 2s -> Time <payload> -> Weather daily <payload> -> Weather current <payload> -> Normal 0 0
 Hey Jarvis detected   -> Thinking 0 0
 AI/TTS starts         -> Speaking <0..5>
 TTS speaking          -> MotorYawPitch <yaw> <pitch>
@@ -201,13 +201,15 @@ emotion_robot_controller/frdm_firmware/patches/speaking_gui_emotion_fix.c
 Startup Weather UART：
 
 ```text
-Jetson startup weather lookup -> Weather daily,23,29,40,61
-Jetson + ESP32 local temp     -> Weather daily,23,29,40,61,254
+Jetson startup weather lookup -> Weather daily,19,23,76,53
+Jetson startup current lookup -> Weather current,20,20,0,3
+Jetson + ESP32 local temp     -> Weather daily,19,23,76,53,254
+Jetson + ESP32 local temp     -> Weather current,20,20,0,3,254
 
 格式：Weather kind,low_or_temp,high_or_temp,rain_percent,open_meteo_weather_code[,local_temp_c_x10]
-daily   例：Weather daily,23,29,40,61
-local   例：Weather daily,23,29,40,61,254  # 254 = 25.4 C
-current 例：Weather current,27,27,0,2
+current 例：Weather current,20,20,0,3
+daily   例：Weather daily,19,23,76,53
+local   例：Weather current,20,20,0,3,254  # 254 = 25.4 C
 ```
 
 Jetson 會用既有 `/weather` 工具查 Open-Meteo，並在 Terminal 3 有收到 ESP32/DS18B20 溫度時把它加成第 6 欄。FRDM 只負責解析這行 UART 並把資料顯示在 Sleep 畫面。FRDM 端參考 patch，並把 `WeatherGui` parser 擴充成可接受 5 欄或 6 欄：
@@ -357,11 +359,11 @@ TTS `.env` 必須是：
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=2.4
+DEFAULT_VOLUME_GAIN=4.8
 ENABLE_STREAM_PLAYBACK=true
 ```
 
-`2.4` 是目前現場固定音量。若仍偏大，降到 `2.0`；若太小，再試 `3.0`。不要直接跳回 `8.0`。
+`4.8` 是目前現場固定音量。若仍偏大，降到 `3.6`；若太小，再試 `6.0`。不要直接跳回 `8.0`。
 
 ### 0.5 Terminal 4: Jetson Local Tool Server
 
@@ -610,7 +612,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --beep-keyword UACDemo \
   --beep-player auto \
   --noisy-room \
-  --tts-volume-gain 2.4 \
+  --tts-volume-gain 4.8 \
   --beep-volume 0.35 \
   --uart-port auto \
   --uart-baudrate 115200 \
@@ -707,7 +709,7 @@ Head motor motion: enabled=True
 
 如果想要更激進低延遲，可以額外加 `--ultra-response`；如果講話中間常停頓被太早切句，改用比較保守的 `--turbo-response`。`fast_reply / num_predict` 需要 Windows Terminal 1 也使用最新版 `desktop_fast_chat_server.py` 並重啟；如果 Windows 還是舊 server，只會套用 Jetson 端的錄音/TTS/camera 加速。
 
-現場吵雜版已加 `--noisy-room`：speech/silence gate 會比安靜室內更嚴格。正式腳本另外固定 `--beep-volume 0.35`，避免提示音太刺耳。TTS 回覆使用固定 `--tts-volume-gain 2.4`；若仍偏大降到 `2.0`，仍太小再回到 `3.0`。只想先測 beep 音量可跑：
+現場吵雜版已加 `--noisy-room`：speech/silence gate 會比安靜室內更嚴格。正式腳本另外固定 `--beep-volume 0.35`，避免提示音太刺耳。TTS 回覆使用固定 `--tts-volume-gain 4.8`；若仍偏大降到 `3.6`，仍太小再回到 `6.0`。只想先測 beep 音量可跑：
 
 ```bash
 python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --noisy-room --beep-volume 0.35 --test-beep
@@ -780,9 +782,10 @@ Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
 Weather local temperature: push receiver http://0.0.0.0:8790/temperature
 Head motor motion: enabled=True, smooth_step=120deg, step_delay=0.55s, speaking_step_delay=0.72s, speaking_smooth_step=120deg, reset_repeats=1, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
-Boot screen settle: waiting 2s, then sending Normal.
+Boot screen settle: waiting 2s, then sending startup dashboard data and Normal.
 ESP32 temperature receiver: http://0.0.0.0:8790/temperature
-Weather UART sent: Weather daily,23,29,40,61,254 (local=25.4 C)  # 如果 ESP32 已先送溫度
+Weather UART sent: Weather daily,19,23,76,53,254 (local=25.4 C)    # 如果 ESP32 已先送溫度
+Weather UART sent: Weather current,20,20,0,3,254 (local=25.4 C)   # startup 也會送 current
 FRDM UART TX: Normal 0 0
 Listening for wake word 'hey_jarvis'
 ```
@@ -1114,7 +1117,7 @@ TTS `.env` 必須用可重插的設定：
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=2.4
+DEFAULT_VOLUME_GAIN=4.8
 ENABLE_STREAM_PLAYBACK=true
 ```
 
@@ -1198,7 +1201,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --beep-keyword UACDemo \
   --beep-player auto \
   --noisy-room \
-  --tts-volume-gain 2.4 \
+  --tts-volume-gain 4.8 \
   --beep-volume 0.35 \
   --uart-port auto \
   --uart-baudrate 115200 \
@@ -1309,6 +1312,7 @@ ESP32 每幾秒 POST 一次：
 
 ```text
 Weather daily,23,29,40,61,254
+Weather current,20,20,0,3,254
 ```
 
 其中第 6 欄 `254` 是 `25.4 C`。如果 ESP32 還沒送或資料超過 `--esp32-temperature-max-age-sec`，就退回舊的 5 欄格式。
@@ -1612,7 +1616,8 @@ Hey Jarvis，weather in Tokyo tomorrow.
 ```text
 Weather routing: intent=True location=...
 Weather tool: ok=True handled=True source=open-meteo
-Weather UART sent: Weather daily,23,29,40,61,254 (local=25.4 C)  # 有 ESP32 溫度時
+Weather UART sent: Weather current,20,20,0,3,254 (local=25.4 C)  # 問現在/所在地天氣，有 ESP32 溫度時
+Weather UART sent: Weather daily,23,29,40,61,254 (local=25.4 C)   # 問明天/今天整日預報，有 ESP32 溫度時
 Reply: <城市><時間>大約 ... °C，... 降雨機率 ...
 AI control: emotion=curious, head_motion=curious_peek
 FRDM UART TX: Speaking 5
@@ -2071,7 +2076,8 @@ curl -X POST http://127.0.0.1:8790/temperature \
 再問一次天氣或重啟 Terminal 3，應看到：
 
 ```text
-Weather UART sent: Weather daily,23,29,40,61,254 (local=25.4 C)
+Weather UART sent: Weather daily,19,23,76,53,254 (local=25.4 C)
+Weather UART sent: Weather current,20,20,0,3,254 (local=25.4 C)
 ```
 
 如果 Jetson 本機可 POST，但 ESP32 不行，檢查 ESP32 程式裡的目標 IP 必須是 Jetson 的 LAN IP，不是 `127.0.0.1`。用 `hostname -I` 看 Jetson IP。ESP32 和 Jetson 也要在同一個 WiFi/LAN，且網路不能隔離 client-to-client traffic。
@@ -2090,7 +2096,7 @@ cat /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=2.4
+DEFAULT_VOLUME_GAIN=4.8
 ```
 
 改 `.env` 或 USB recovery 後重開 TTS server。
@@ -2100,17 +2106,17 @@ DEFAULT_VOLUME_GAIN=2.4
 如果不是完全沒聲音，而是現場聽起來超小聲，Terminal 3 的 Wake Bridge 用：
 
 ```bash
---tts-volume-gain 2.4
+--tts-volume-gain 4.8
 ```
 
-這個增益只放大 Piper raw playback，不會改系統音量；改完要重啟 Terminal 3，且 TTS server 也要是新版。如果會嚇到旁邊的人，把 Terminal 3 改成 `--tts-volume-gain 2.0`，並加 `--beep-volume 0.25 --beep-duration-ms 160`。
+這個增益只放大 Piper raw playback，不會改系統音量；改完要重啟 Terminal 3，且 TTS server 也要是新版。如果會嚇到旁邊的人，把 Terminal 3 改成 `--tts-volume-gain 3.6`，並加 `--beep-volume 0.25 --beep-duration-ms 160`。
 
 直接測新版 TTS server 是否吃到增益：
 
 ```bash
 curl -X POST http://127.0.0.1:8777/speak_async \
   -H "Content-Type: application/json" \
-  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":2.4}'
+  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":4.8}'
 ```
 
 如果回 `422`，代表 Terminal 2 還是舊 TTS server，重啟 Terminal 2。
