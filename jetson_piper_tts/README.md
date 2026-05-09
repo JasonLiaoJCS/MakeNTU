@@ -340,7 +340,8 @@ MODEL_DIR=./models
 PIPER_MODEL=./models/zh_CN-chaowen-medium.onnx
 PIPER_CONFIG=./models/zh_CN-chaowen-medium.onnx.json
 
-AUDIO_DEVICE=default
+AUDIO_DEVICE=auto:UACDemo
+DEFAULT_VOLUME_GAIN=2.4
 APLAY_BIN=aplay
 
 EXTRA_PYTHONPATH=
@@ -368,9 +369,10 @@ LOG_LEVEL=INFO
 
 常改項目：
 
-- `AUDIO_DEVICE=default`：使用 ALSA default。
-- `AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0`：每次播放前從 `aplay -L` 重新找 UACDemo USB speaker，最適合 demo 反覆重插 USB。
-- `AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0`：用 USB 喇叭的穩定 ALSA 卡名，比 `plughw:1,0` 不容易因為重新插拔而失效。
+- `AUDIO_DEVICE=auto:UACDemo`：每次播放前自動找 UACDemo USB speaker，最適合 demo 反覆重插 USB。
+- `AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0`：固定用目前這張 USB 喇叭；比 `plughw:1,0` 穩，但 USB 名稱變了就要改。
+- `AUDIO_DEVICE=default`：使用 ALSA default，只有 Jetson 預設音源已經正確時才建議。
+- `DEFAULT_VOLUME_GAIN=2.4`：目前 demo 固定音量，是前一版 `1.6` 的 `1.5x`；太大可降 `2.0`，太小再試 `3.0`。
 - `DEFAULT_LENGTH_SCALE=0.85`：語速更快。
 - `DEFAULT_LENGTH_SCALE=1.0`：語速較自然。
 - `MAX_TEXT_CHARS=600`：單次最多處理 600 字。
@@ -463,7 +465,7 @@ curl http://127.0.0.1:8777/queue | python -m json.tool
 ```bash
 curl -X POST http://127.0.0.1:8777/speak_async \
   -H "Content-Type: application/json" \
-  -d '{"text":"你好，我是桌面助手。","interrupt":true,"volume_gain":2.25}'
+  -d '{"text":"你好，我是桌面助手。","interrupt":true,"volume_gain":2.4}'
 ```
 
 常用 body：
@@ -474,7 +476,7 @@ curl -X POST http://127.0.0.1:8777/speak_async \
   "interrupt": true,
   "voice": "zh_CN-chaowen-medium",
   "length_scale": 0.9,
-  "volume_gain": 2.25,
+  "volume_gain": 2.4,
   "stream": true
 }
 ```
@@ -485,7 +487,7 @@ curl -X POST http://127.0.0.1:8777/speak_async \
 - `interrupt`: `true` 會停止目前播放並清空 queue，馬上講新句。
 - `voice`: 可選，指定 voice 名稱。
 - `length_scale`: 可選，越小越快。
-- `volume_gain`: 可選，raw playback 音量增益，建議先試 `2.25`，仍太小再試 `3.0` 或 `4.0`，server 接受範圍是 `0.05` 到 `8.0`。
+- `volume_gain`: 可選，raw playback 絕對音量增益，建議先試 `2.4`；太大降 `2.0`，仍太小再試 `3.0`，server 接受範圍是 `0.05` 到 `8.0`。
 - `stream`: 可選，`true` 走 raw streaming；`false` 走 WAV 檔路徑。
 
 ### POST `/speak`
@@ -524,7 +526,7 @@ cat > /tmp/tts_payload.json <<'JSON'
 {
   "text": "房子大了電話小了 感覺越來越好 飯菜香了穿戴美了 生活越來越好",
   "interrupt": true,
-  "volume_gain": 2.25
+  "volume_gain": 2.4
 }
 JSON
 
@@ -603,7 +605,7 @@ python -m jetson_piper_tts.speak "换一个声音。" --voice zh_CN-xiao_ya-medi
 指定 ALSA device：
 
 ```bash
-python -m jetson_piper_tts.speak "测试 USB 喇叭。" --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
+python -m jetson_piper_tts.speak "测试 USB 喇叭。" --device 'auto:UACDemo' --stream
 ```
 
 ## Python Client
@@ -691,7 +693,7 @@ amixer -c 1 sset Speaker 80% unmute
 指定裝置測：
 
 ```bash
-AUDIO_DEVICE='plughw:CARD=UACDemoV10,DEV=0' ./scripts/test_audio.sh
+AUDIO_DEVICE='auto:UACDemo' ./scripts/test_audio.sh
 ```
 
 ## ALSA Device
@@ -712,7 +714,7 @@ aplay -L
 
 ```bash
 AUDIO_DEVICE=default
-AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+AUDIO_DEVICE=auto:UACDemo
 AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
 AUDIO_DEVICE=plughw:0,0
 AUDIO_DEVICE=hw:0,0
@@ -721,13 +723,13 @@ AUDIO_DEVICE=hw:0,0
 如果 `default` 沒聲音，先試 USB speaker：
 
 ```bash
-python -m jetson_piper_tts.speak "测试声音。" --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
+python -m jetson_piper_tts.speak "测试声音。" --device 'auto:UACDemo' --stream
 ```
 
 可用後寫進 `.env`：
 
 ```bash
-AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+AUDIO_DEVICE=auto:UACDemo
 ```
 
 重啟 server。
@@ -1045,7 +1047,7 @@ python -m jetson_piper_tts.speak "测试声音。"
 如果 USB 喇叭是 `UACDemoV1.0`：
 
 ```bash
-python -m jetson_piper_tts.speak "测试声音。" --device 'plughw:CARD=UACDemoV10,DEV=0' --stream
+python -m jetson_piper_tts.speak "测试声音。" --device 'auto:UACDemo' --stream
 ```
 
 ### `aplay: device busy`

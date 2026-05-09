@@ -7,13 +7,35 @@ VENV_DIR="$ROOT_DIR/emotion_robot_controller/.venv"
 SERVER_URL="${SERVER_URL:-http://100.108.141.26:8766/voice-chat}"
 FOCUS_SERVER_URL="${FOCUS_SERVER_URL:-http://100.108.141.26:8766/focus-check}"
 DEVICE_READY_TIMEOUT="${DEVICE_READY_TIMEOUT:-30}"
-TTS_VOLUME_GAIN="${TTS_VOLUME_GAIN:-2.25}"
+if [ -n "${MAKE_NTU_TTS_VOLUME_GAIN:-}" ]; then
+  TTS_VOLUME_GAIN="$MAKE_NTU_TTS_VOLUME_GAIN"
+else
+  TTS_VOLUME_GAIN="${TTS_VOLUME_GAIN:-2.4}"
+fi
 MUSIC_MPV_AUDIO_DEVICE="${MUSIC_MPV_AUDIO_DEVICE:-auto}"
-MUSIC_MPV_VOLUME="${MUSIC_MPV_VOLUME:-100}"
+MUSIC_MPV_VOLUME="${MUSIC_MPV_VOLUME:-70}"
 MUSIC_MPV_READY_TIMEOUT="${MUSIC_MPV_READY_TIMEOUT:-1.5}"
+BEEP_VOLUME="${BEEP_VOLUME:-0.35}"
+export UACDEMO_PCM_VOLUME="${MAKE_NTU_UACDEMO_PCM_VOLUME:-70%}"
+export UACDEMO_PULSE_VOLUME="${MAKE_NTU_UACDEMO_PULSE_VOLUME:-70%}"
+export DEFAULT_VOLUME_GAIN="$TTS_VOLUME_GAIN"
+export AUDIO_DEVICE="${MAKE_NTU_AUDIO_DEVICE:-auto:UACDemo}"
+export MIC_DEVICE_KEYWORD="${MAKE_NTU_MIC_DEVICE_KEYWORD:-UACDemo}"
+export SPEAKER_DEVICE_KEYWORD="${MAKE_NTU_SPEAKER_DEVICE_KEYWORD:-UACDemo}"
+export WAKE_CAMERA_ID="${MAKE_NTU_WAKE_CAMERA_ID:-auto}"
+export FOCUS_CAMERA_ID="${MAKE_NTU_FOCUS_CAMERA_ID:-auto}"
+export FOCUS_UART_PORT="${MAKE_NTU_FOCUS_UART_PORT:-auto}"
 
 cd "$ROOT_DIR"
 source "$VENV_DIR/bin/activate"
+
+if [ -r "$ROOT_DIR/frdm_uart_context_sender/auto_demo_devices.sh" ]; then
+  bash "$ROOT_DIR/frdm_uart_context_sender/auto_demo_devices.sh" || true
+elif [ -r "$ROOT_DIR/frdm_uart_context_sender/set_uacdemo_volume.sh" ]; then
+  bash "$ROOT_DIR/frdm_uart_context_sender/set_uacdemo_volume.sh" >/dev/null 2>&1 || true
+elif command -v amixer >/dev/null 2>&1; then
+  amixer -c UACDemoV10 sset PCM "$UACDEMO_PCM_VOLUME" unmute >/dev/null 2>&1 || true
+fi
 
 cmd=(
   python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py
@@ -23,6 +45,7 @@ cmd=(
   --beep-player auto
   --noisy-room
   --tts-volume-gain "$TTS_VOLUME_GAIN"
+  --beep-volume "$BEEP_VOLUME"
   --uart-port auto
   --uart-baudrate 115200
   --frdm-uart-tx-timeout 0.45
@@ -61,6 +84,7 @@ cmd=(
   --focus-alert-cooldown-sec 90
   --fan-device-id desk_fan
   --fan-speed-max 3
+  --fan-duplicate-suppress-sec 2.0
   --todo-list-path "$ROOT_DIR/frdm_uart_context_sender/logs/todo_list.json"
   --focus-notify-mode discord
   --music-backend mpv

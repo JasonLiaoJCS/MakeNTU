@@ -67,7 +67,7 @@ speech_start_margin=750
 speech_start_ratio=1.45
 silence_margin=900
 silence_noise_ratio=1.30
-recording_beep=1500Hz, 220ms, volume=0.70
+recording_beep=1500Hz, 220ms, volume=0.35
 max_speech_seconds=5
 max_recording_seconds=7
 audio_read_timeout=0.75
@@ -96,11 +96,27 @@ head_motion=pose-driven cute motion, large yaw/pitch targets with longer holds
 現場音量安全檔位：
 
 ```text
-目前建議值     : DEFAULT_VOLUME_GAIN=2.25, --tts-volume-gain 2.25
-旁邊的人會嚇到 : 降到 2.0，並把 --beep-volume 降到 0.35
+目前建議值     : DEFAULT_VOLUME_GAIN=2.4, --tts-volume-gain 2.4
+旁邊的人會嚇到 : 降到 2.0，並把 --beep-volume 降到 0.25
 現場太吵聽不清 : 先升到 3.0，不要直接跳 8.0
-USB sink 建議   : PulseAudio UACDemo 約 80%，ALSA PCM 100%
+USB sink 建議   : PulseAudio UACDemo 約 70%，ALSA PCM 70%
 ```
+
+這裡的 `2.4` 是固定絕對增益，不是每次啟動再乘一次。它是前一版 `1.6` 的 `1.5x`，用來補回現場聽起來偏小的 TTS 音量。
+
+新開 Terminal 會透過 `~/.bashrc` 自動呼叫 `frdm_uart_context_sender/set_uacdemo_volume.sh --wait 1`，把 UACDemo 的 PulseAudio 與 ALSA PCM 音量拉回絕對 `70%`。開機/登入時也有已啟用 linger 的 `makentu-uacdemo-volume.service` 和 `~/.config/autostart/makentu-uacdemo-volume.desktop` 會等待 USB speaker 出現後套用同一份絕對音量。臨時要改可以在開 Terminal 前設定 `MAKE_NTU_UACDEMO_PCM_VOLUME` / `MAKE_NTU_UACDEMO_PULSE_VOLUME`，例如 `MAKE_NTU_UACDEMO_PCM_VOLUME=60% MAKE_NTU_UACDEMO_PULSE_VOLUME=60% bash`。
+
+新開 Terminal 也會把 demo 裝置和音量環境變數固定成 auto/keyword/absolute：`AUDIO_DEVICE=auto:UACDemo`、`MIC_DEVICE_KEYWORD=UACDemo`、`SPEAKER_DEVICE_KEYWORD=UACDemo`、`WAKE_CAMERA_ID=auto`、`FOCUS_CAMERA_ID=auto`、`FOCUS_UART_PORT=auto`、`TTS_VOLUME_GAIN=2.4`、`DEFAULT_VOLUME_GAIN=2.4`。如果真的要手動覆蓋，用 `MAKE_NTU_AUDIO_DEVICE` / `MAKE_NTU_WAKE_CAMERA_ID` / `MAKE_NTU_FOCUS_UART_PORT` / `MAKE_NTU_TTS_VOLUME_GAIN` 這類 `MAKE_NTU_*` 變數。
+
+正式 demo 最省事的做法是先跑自動偵測，再用包好的啟動腳本：
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+bash frdm_uart_context_sender/auto_demo_devices.sh
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+`auto_demo_devices.sh` 會等 UACDemo 揚聲器、UACDemo 麥克風、FRDM UART、相機重新枚舉完成，並順手套用 UACDemo 70% 音量。`run_wake_bridge_full_demo.sh` 也會在每次啟動前再跑一次偵測，所以 USB 重插後通常只要重開 Terminal 3。
 
 音量相關修改後：
 
@@ -340,12 +356,12 @@ python -m jetson_piper_tts.server \
 TTS `.env` 必須是：
 
 ```text
-AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
-DEFAULT_VOLUME_GAIN=2.25
+AUDIO_DEVICE=auto:UACDemo
+DEFAULT_VOLUME_GAIN=2.4
 ENABLE_STREAM_PLAYBACK=true
 ```
 
-`2.25` 是目前把 4.5 削弱一半後的安全測試音量。若仍偏大，降到 `2.0`；若太小，再試 `3.0`。不要直接跳回 `8.0`。
+`2.4` 是目前現場固定音量。若仍偏大，降到 `2.0`；若太小，再試 `3.0`。不要直接跳回 `8.0`。
 
 ### 0.5 Terminal 4: Jetson Local Tool Server
 
@@ -368,7 +384,7 @@ python3 music_web_player.py \
   --port 8788 \
   --backend mpv \
   --mpv-audio-device auto \
-  --mpv-volume 100 \
+  --mpv-volume 70 \
   --mpv-ready-timeout 1.5 \
   --weather-default-location Taipei \
   --weather-timeout 4.5
@@ -594,7 +610,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --beep-keyword UACDemo \
   --beep-player auto \
   --noisy-room \
-  --tts-volume-gain 2.25 \
+  --tts-volume-gain 2.4 \
+  --beep-volume 0.35 \
   --uart-port auto \
   --uart-baudrate 115200 \
   --frdm-uart-tx-timeout 0.45 \
@@ -633,12 +650,13 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-alert-cooldown-sec 90 \
   --fan-device-id desk_fan \
   --fan-speed-max 3 \
+  --fan-duplicate-suppress-sec 2.0 \
   --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
   --focus-notify-mode discord \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
   --music-mpv-audio-device auto \
-  --music-mpv-volume 100 \
+  --music-mpv-volume 70 \
   --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
   --music-wake-pause-timeout 0.25 \
@@ -689,10 +707,10 @@ Head motor motion: enabled=True
 
 如果想要更激進低延遲，可以額外加 `--ultra-response`；如果講話中間常停頓被太早切句，改用比較保守的 `--turbo-response`。`fast_reply / num_predict` 需要 Windows Terminal 1 也使用最新版 `desktop_fast_chat_server.py` 並重啟；如果 Windows 還是舊 server，只會套用 Jetson 端的錄音/TTS/camera 加速。
 
-現場吵雜版已加 `--noisy-room`：beep 會比較大聲、更長，speech/silence gate 也會比安靜室內更嚴格。TTS 回覆太小聲時用 `--tts-volume-gain 2.25`；若仍偏大降到 `2.0`，仍太小再回到 `3.0`。只想先測 beep 音量可跑：
+現場吵雜版已加 `--noisy-room`：speech/silence gate 會比安靜室內更嚴格。正式腳本另外固定 `--beep-volume 0.35`，避免提示音太刺耳。TTS 回覆使用固定 `--tts-volume-gain 2.4`；若仍偏大降到 `2.0`，仍太小再回到 `3.0`。只想先測 beep 音量可跑：
 
 ```bash
-python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --noisy-room --test-beep
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --noisy-room --beep-volume 0.35 --test-beep
 ```
 
 如果現場背景音量平均約 `10000`、你講話約 `19000`，`--noisy-room` 會自動抓大約：
@@ -732,7 +750,7 @@ EVT,Fan,1,3      # 也支援 EVT 前綴
 FanSpeed 2       # 只改風速；大於 0 會視為開
 ```
 
-Wake Bridge 會把它轉成 `desk_fan` dashboard 狀態，預設 POST 到 `http://127.0.0.1:8789/api/devices/desk_fan/set`。若要真的控制 Jetson GPIO/PWM/relay，另外加 `--fan-control-command "/path/to/fan_control.sh {power} {speed} {percent}"`；環境變數也會帶 `FAN_POWER`、`FAN_SPEED`、`FAN_PERCENT`、`FAN_STATE`。Focus 子程序的 UART 也改走 parent UART proxy，所以不會和主程式搶 `/dev/ttyACM0`。
+Wake Bridge 會把它轉成 `desk_fan` dashboard 狀態，預設 POST 到 `http://127.0.0.1:8789/api/devices/desk_fan/set`。相同狀態會用 `--fan-duplicate-suppress-sec 2.0` 去重，避免 FRDM slider 持續回報 `Fanspeed 100` 時洗 terminal 和 dashboard。若要真的控制 Jetson GPIO/PWM/relay，另外加 `--fan-control-command "/path/to/fan_control.sh {power} {speed} {percent}"`；環境變數也會帶 `FAN_POWER`、`FAN_SPEED`、`FAN_PERCENT`、`FAN_STATE`。Focus 子程序的 UART 也改走 parent UART proxy，所以不會和主程式搶 `/dev/ttyACM0`。
 
 如果 FRDM CDC 一時卡住，正式指令現在會用 `--frdm-uart-tx-timeout 0.45` 快速失敗，不會再每個 `Thinking/Speaking/MotorYawPitch` 卡約 2 秒；連續失敗 2 次後會暫停 TX 4 秒但保持 RX 監聽，所以觸控事件恢復後仍能進來。看到 `FRDM UART bus temporarily bypassing TX` 時，先檢查 FRDM firmware 是否正在讀 UART、MCU-LINK USB-C 是否穩定，必要時重插 FRDM 或加 `--no-frdm-uart-bus` 暫時退回舊 per-command TX。
 
@@ -926,6 +944,14 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --list-uarts
 ./frdm_uart_context_sender/recover_demo_usb.sh
 ```
 
+如果啟動時 30 秒內都沒有 `/dev/serial/by-id/*`、`/dev/ttyACM*`、`/dev/ttyUSB*`，Wake Bridge 會先進入 FRDM UART auto-recovery：語音/相機/TTS 仍可跑，UART bus 會在背景安靜等待 FRDM debug USB。插回 FRDM 後會看到 `FRDM UART bus opened ...`，之後新的畫面/馬達/dashboard 指令會自動恢復送 UART，不需要重啟 Terminal 3。只有明確加 `--no-uart` 時，這一輪才會完全不送 FRDM UART。
+
+如果現場 demo 一定要 FRDM，有缺 UART 就不要繼續啟動，指令尾端加：
+
+```text
+--require-uart
+```
+
 ### 0.9 一輪互動正常 log
 
 ```text
@@ -1087,8 +1113,8 @@ python -m jetson_piper_tts.server \
 TTS `.env` 必須用可重插的設定：
 
 ```text
-AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
-DEFAULT_VOLUME_GAIN=2.25
+AUDIO_DEVICE=auto:UACDemo
+DEFAULT_VOLUME_GAIN=2.4
 ENABLE_STREAM_PLAYBACK=true
 ```
 
@@ -1108,7 +1134,7 @@ python3 music_web_player.py \
   --port 8788 \
   --backend mpv \
   --mpv-audio-device auto \
-  --mpv-volume 100 \
+  --mpv-volume 70 \
   --mpv-ready-timeout 1.5 \
   --weather-default-location Taipei \
   --weather-timeout 4.5
@@ -1172,6 +1198,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --beep-keyword UACDemo \
   --beep-player auto \
   --noisy-room \
+  --tts-volume-gain 2.4 \
+  --beep-volume 0.35 \
   --uart-port auto \
   --uart-baudrate 115200 \
   --frdm-uart-tx-timeout 0.45 \
@@ -1210,12 +1238,13 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-alert-cooldown-sec 90 \
   --fan-device-id desk_fan \
   --fan-speed-max 3 \
+  --fan-duplicate-suppress-sec 2.0 \
   --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
   --focus-notify-mode discord \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
   --music-mpv-audio-device auto \
-  --music-mpv-volume 100 \
+  --music-mpv-volume 70 \
   --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
   --music-wake-pause-timeout 0.25 \
@@ -1659,7 +1688,7 @@ audio.device           : plughw:CARD=UACDemo...
 ```text
 mic       : --mic-keyword UACDemo
 beep      : --beep-keyword UACDemo
-TTS audio : AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+TTS audio : AUDIO_DEVICE=auto:UACDemo
 camera    : --camera-id auto
 FRDM      : --uart-port auto
 ```
@@ -2060,8 +2089,8 @@ cat /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env
 確認：
 
 ```text
-AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
-DEFAULT_VOLUME_GAIN=2.25
+AUDIO_DEVICE=auto:UACDemo
+DEFAULT_VOLUME_GAIN=2.4
 ```
 
 改 `.env` 或 USB recovery 後重開 TTS server。
@@ -2071,17 +2100,17 @@ DEFAULT_VOLUME_GAIN=2.25
 如果不是完全沒聲音，而是現場聽起來超小聲，Terminal 3 的 Wake Bridge 用：
 
 ```bash
---tts-volume-gain 2.25
+--tts-volume-gain 2.4
 ```
 
-這個增益只放大 Piper raw playback，不會改系統音量；改完要重啟 Terminal 3，且 TTS server 也要是新版。如果會嚇到旁邊的人，把 Terminal 3 改成 `--tts-volume-gain 4.0`，並加 `--beep-volume 0.45 --beep-duration-ms 160`。
+這個增益只放大 Piper raw playback，不會改系統音量；改完要重啟 Terminal 3，且 TTS server 也要是新版。如果會嚇到旁邊的人，把 Terminal 3 改成 `--tts-volume-gain 2.0`，並加 `--beep-volume 0.25 --beep-duration-ms 160`。
 
 直接測新版 TTS server 是否吃到增益：
 
 ```bash
 curl -X POST http://127.0.0.1:8777/speak_async \
   -H "Content-Type: application/json" \
-  -d '{"text":"音量測試，現在應該比較大聲。","interrupt":true,"volume_gain":2.25}'
+  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":2.4}'
 ```
 
 如果回 `422`，代表 Terminal 2 還是舊 TTS server，重啟 Terminal 2。

@@ -131,6 +131,8 @@ DEVICE_OWNER_ALLOW_PATTERNS = (
     "pipewire",
     "wireplumber",
 )
+UART_DEVICE_GLOB_PATTERNS = ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*")
+UART_DEVICE_DESCRIPTION = "FRDM UART (/dev/serial/by-id/*, /dev/ttyACM*, /dev/ttyUSB*)"
 DEMO_PREFLIGHT_SKIP_ARGS = (
     "--self-test",
     "--device-preflight-only",
@@ -1294,6 +1296,24 @@ def wait_for_path_candidates(description: str, glob_pattern: str, *, timeout_sec
         time.sleep(0.5)
 
 
+def wait_for_uart_candidates(*, timeout_sec: float) -> list[str]:
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    last_report_at = 0.0
+    patterns = ", ".join(UART_DEVICE_GLOB_PATTERNS)
+    while True:
+        matches = [str(path) for path in discover_demo_uart_paths()]
+        if matches:
+            print(f"Device ready: FRDM UART nodes: {', '.join(matches)}")
+            return matches
+        now = time.monotonic()
+        if now >= deadline:
+            return []
+        if now - last_report_at >= 2.0:
+            print(f"Device preflight: waiting for FRDM UART nodes ({patterns})...")
+            last_report_at = now
+        time.sleep(0.5)
+
+
 def output_device_info(device_index: int | None) -> dict[str, Any] | None:
     if device_index is None:
         return None
@@ -1304,6 +1324,10 @@ def output_device_info(device_index: int | None) -> dict[str, Any] | None:
     except Exception:
         return None
     return info if isinstance(info, dict) else None
+
+
+def beep_player_requires_sounddevice_output(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "beep_player", "auto") or "auto").strip().lower() == "sounddevice"
 
 
 def list_sounddevice_inputs() -> None:
@@ -1506,15 +1530,60 @@ def uacdemo_audio_device_paths() -> list[Path]:
     return paths
 
 
+def uart_hardware_enabled(args: argparse.Namespace) -> bool:
+    return not bool(getattr(args, "no_uart", False)) and not bool(getattr(args, "uart_dry_run", False))
+
+
+def auto_uart_requested(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "uart_port", "auto") or "auto").strip().lower() == "auto"
+
+
+def discover_demo_uart_paths() -> list[Path]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+
+    for port in bridge.discover_uart_ports():
+        device = str(port.get("device", "") or "")
+        if not device.startswith("/dev/"):
+            continue
+        path = Path(device)
+        if not path.exists():
+            continue
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            resolved = device
+        if resolved in seen:
+            continue
+        paths.append(path)
+        seen.add(resolved)
+
+    for pattern in UART_DEVICE_GLOB_PATTERNS:
+        for device in sorted(glob.glob(pattern)):
+            path = Path(device)
+            if not path.exists():
+                continue
+            try:
+                resolved = str(path.resolve())
+            except OSError:
+                resolved = device
+            if resolved in seen:
+                continue
+            paths.append(path)
+            seen.add(resolved)
+
+    return sorted(paths, key=lambda path: str(path))
+
+
 def demo_device_paths(args: argparse.Namespace) -> list[Path]:
     paths: list[Path] = []
     if not getattr(args, "no_camera", False) and not getattr(args, "no_vision", False):
         paths.extend(Path(path) for path in glob.glob("/dev/video*"))
-    if str(getattr(args, "uart_port", "auto")).lower() == "auto":
-        paths.extend(Path(path) for path in glob.glob("/dev/ttyACM*"))
+    if uart_hardware_enabled(args) and auto_uart_requested(args):
+        paths.extend(discover_demo_uart_paths())
     else:
         uart_path = Path(str(args.uart_port))
-        if str(uart_path).startswith("/dev/"):
+        if uart_hardware_enabled(args) and str(uart_path).startswith("/dev/"):
             paths.append(uart_path)
     paths.extend(uacdemo_audio_device_paths())
     existing: list[Path] = []
@@ -1540,8 +1609,12 @@ def missing_demo_devices(args: argparse.Namespace) -> list[str]:
         missing.append("UACDemo audio")
     if not getattr(args, "no_camera", False) and not getattr(args, "no_vision", False) and not glob.glob("/dev/video*"):
         missing.append("camera /dev/video*")
-    if str(getattr(args, "uart_port", "auto")).lower() == "auto" and not glob.glob("/dev/ttyACM*"):
-        missing.append("FRDM /dev/ttyACM*")
+    if (
+        uart_hardware_enabled(args)
+        and auto_uart_requested(args)
+        and not discover_demo_uart_paths()
+    ):
+        missing.append(UART_DEVICE_DESCRIPTION)
     return missing
 
 
@@ -1640,17 +1713,30 @@ def kill_stale_demo_processes(args: argparse.Namespace) -> None:
     terminate_pids(pid_reasons, dry_run=args.device_preflight_dry_run, grace_sec=args.device_preflight_grace)
 
 
-def wait_for_demo_devices_ready(args: argparse.Namespace) -> None:
+def wait_for_demo_devices_ready(args: argparse.Namespace) -> bool:
     if getattr(args, "device_preflight_dry_run", False):
-        return
+        return True
     timeout_sec = float(getattr(args, "device_ready_timeout", 12.0) or 0.0)
     if timeout_sec <= 0:
-        return
+        return True
 
     if not getattr(args, "no_camera", False) and not getattr(args, "no_vision", False):
         wait_for_path_candidates("camera nodes", "/dev/video*", timeout_sec=timeout_sec)
-    if str(getattr(args, "uart_port", "auto")).lower() == "auto":
-        wait_for_path_candidates("FRDM UART nodes", "/dev/ttyACM*", timeout_sec=timeout_sec)
+    if uart_hardware_enabled(args) and auto_uart_requested(args):
+        uart_matches = wait_for_uart_candidates(timeout_sec=timeout_sec)
+        setattr(args, "_frdm_uart_available_after_preflight", bool(uart_matches))
+        if not uart_matches:
+            message = (
+                f"FRDM UART did not appear after {timeout_sec:g}s. "
+                "Plug/replug the FRDM debug USB cable and run "
+                "`python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --list-uarts`."
+            )
+            if getattr(args, "require_uart", False):
+                print(f"ERROR: {message}")
+                return False
+            print(f"WARNING: {message}")
+            print("WARNING: FRDM UART will stay in auto-recovery mode; plug it in and this run will resume UART without restart.")
+            setattr(args, "_frdm_uart_startup_missing", True)
 
     manual_input = bool(getattr(args, "_manual_input_device", getattr(args, "device", None) is not None))
     if not manual_input:
@@ -1662,19 +1748,32 @@ def wait_for_demo_devices_ready(args: argparse.Namespace) -> None:
         )
 
     manual_beep = bool(getattr(args, "_manual_beep_device", getattr(args, "beep_device", None) is not None))
-    if not getattr(args, "no_beep", False) and not manual_beep:
+    beep_keyword = str(getattr(args, "beep_keyword", "") or "")
+    if not getattr(args, "no_beep", False) and not manual_beep and beep_player_requires_sounddevice_output(args):
         wait_for_sounddevice_keyword(
-            str(getattr(args, "beep_keyword", "") or ""),
+            beep_keyword,
             output=True,
             timeout_sec=timeout_sec,
             label="output",
         )
+    elif (
+        not getattr(args, "no_beep", False)
+        and not manual_beep
+        and beep_keyword.strip()
+        and getattr(args, "device_preflight_verbose", False)
+    ):
+        beep_player = str(getattr(args, "beep_player", "auto") or "auto").strip().lower()
+        print(
+            "Device preflight: skipping sounddevice output keyword wait "
+            f"for beep player {beep_player!r}."
+        )
+    return True
 
 
-def device_preflight(args: argparse.Namespace) -> None:
+def device_preflight(args: argparse.Namespace) -> bool:
     if getattr(args, "no_device_preflight", False):
         print("Device preflight skipped by --no-device-preflight.")
-        return
+        return True
     print("Device preflight: releasing stale demo device owners.")
     kill_stale_demo_processes(args)
     reset_usb_host_if_missing(args)
@@ -1691,7 +1790,7 @@ def device_preflight(args: argparse.Namespace) -> None:
     if not owners and not getattr(args, "device_preflight_dry_run", False):
         print("Device preflight: target devices look free.")
     time.sleep(max(0.0, float(getattr(args, "device_preflight_settle", 0.8))))
-    wait_for_demo_devices_ready(args)
+    return wait_for_demo_devices_ready(args)
 
 
 def clamp_int(value: Any, low: int, high: int, default: int = 0) -> int:
@@ -3157,6 +3256,8 @@ def send_weather_uart_update(
     *,
     reason: str,
 ) -> str | None:
+    if getattr(args, "no_uart", False):
+        return None
     reading = attach_local_temperature_to_weather_result(args, weather_result)
     payload = format_weather_uart_payload(weather_result)
     if not payload:
@@ -3185,6 +3286,8 @@ def format_time_uart_payload(current: datetime | None = None) -> str:
 def send_startup_time_update(args: argparse.Namespace, robot: RobotUartController) -> str | None:
     if getattr(args, "no_startup_time", False):
         print("Startup time UART update skipped.")
+        return None
+    if getattr(args, "no_uart", False):
         return None
 
     payload = format_time_uart_payload()
@@ -3249,7 +3352,7 @@ def send_todo_uart_update(
     reason: str,
     include_items: bool = True,
 ) -> str | None:
-    if getattr(args, "no_dashboard_uart", False):
+    if getattr(args, "no_dashboard_uart", False) or getattr(args, "no_uart", False):
         return None
     payload = format_todo_uart_payload(todo_manager)
     ok = robot.send_uart_raw_line(f"Todo {payload}", reason=reason, read_ms=80)
@@ -3313,7 +3416,7 @@ def send_music_uart_update(
     *,
     reason: str,
 ) -> str | None:
-    if getattr(args, "no_dashboard_uart", False):
+    if getattr(args, "no_dashboard_uart", False) or getattr(args, "no_uart", False):
         return None
     payload = format_music_uart_payload(data, args)
     ok = robot.send_uart_raw_line(f"Music {payload}", reason=reason, read_ms=80)
@@ -3348,7 +3451,7 @@ def send_focus_uart_update(
     streak: int = 0,
     reason: str,
 ) -> str | None:
-    if getattr(args, "no_dashboard_uart", False):
+    if getattr(args, "no_dashboard_uart", False) or getattr(args, "no_uart", False):
         return None
     payload = format_focus_uart_payload(state, remaining_min, streak)
     ok = robot.send_uart_raw_line(f"Focus {payload}", reason=reason, read_ms=80)
@@ -3391,7 +3494,7 @@ def send_health_uart_update(
     *,
     reason: str,
 ) -> str | None:
-    if getattr(args, "no_dashboard_uart", False):
+    if getattr(args, "no_dashboard_uart", False) or getattr(args, "no_uart", False):
         return None
     payload = format_health_uart_payload(args, camera_manager)
     ok = robot.send_uart_raw_line(f"Health {payload}", reason=reason, read_ms=80)
@@ -3412,6 +3515,8 @@ def send_startup_dashboard_updates(
     if getattr(args, "no_dashboard_uart", False):
         print("Dashboard UART updates skipped.")
         return
+    if getattr(args, "no_uart", False):
+        return
     send_todo_uart_update(args, robot, todo_manager, reason="startup dashboard todo")
     send_music_uart_update(args, robot, get_music_health(args), reason="startup dashboard music")
     send_focus_uart_update(args, robot, state="idle", remaining_min=0, streak=0, reason="startup dashboard focus")
@@ -3421,6 +3526,8 @@ def send_startup_dashboard_updates(
 def send_startup_weather_update(args: argparse.Namespace, robot: RobotUartController) -> dict[str, Any] | None:
     if getattr(args, "no_weather", False) or getattr(args, "no_startup_weather", False):
         print("Startup weather UART update skipped.")
+        return None
+    if getattr(args, "no_uart", False):
         return None
 
     text = str(getattr(args, "startup_weather_text", "") or "今天天氣如何").strip()
@@ -3517,6 +3624,9 @@ class FrdmUartBus:
         self._disabled_until = 0.0
         self._disable_notice_last = 0.0
         self._last_error = ""
+        self._connected = False
+        self._waiting_notice_last = 0.0
+        self._waiting_notice_detail = ""
 
     def is_enabled(self) -> bool:
         if getattr(self.args, "no_frdm_uart_bus", False):
@@ -3527,7 +3637,12 @@ class FrdmUartBus:
 
     def start(self) -> bool:
         if not self.is_enabled():
-            print("FRDM UART event bus: disabled; using legacy per-command UART writes.")
+            if getattr(self.args, "no_uart", False):
+                print("FRDM UART event bus: disabled because live UART is off.")
+            elif getattr(self.args, "uart_dry_run", False):
+                print("FRDM UART event bus: disabled in UART dry-run mode.")
+            else:
+                print("FRDM UART event bus: disabled; using legacy per-command UART writes.")
             return False
         if self.thread is not None and self.thread.is_alive():
             return True
@@ -3563,6 +3678,14 @@ class FrdmUartBus:
     def _disabled_remaining(self) -> float:
         with self._health_lock:
             return max(0.0, self._disabled_until - time.monotonic())
+
+    def is_connected(self) -> bool:
+        with self._health_lock:
+            return self._connected
+
+    def _set_connected(self, connected: bool) -> None:
+        with self._health_lock:
+            self._connected = bool(connected)
 
     def _note_tx_success(self) -> None:
         with self._health_lock:
@@ -3600,6 +3723,25 @@ class FrdmUartBus:
             if getattr(self.args, "uart_debug", False):
                 print(f"FRDM UART bus cancelled TX during {reason}: {request.wire}")
 
+    def _waiting_detail(self) -> str:
+        requested = str(getattr(self.args, "uart_port", "auto") or "auto").strip()
+        if auto_uart_requested(self.args):
+            if discover_demo_uart_paths() or self.is_connected():
+                return ""
+            return f"no visible {UART_DEVICE_DESCRIPTION}"
+        if requested.startswith("/dev/") and not Path(requested).exists() and not self.is_connected():
+            return f"{requested} is not present"
+        return ""
+
+    def _notice_waiting_for_device(self, detail: str) -> None:
+        now = time.monotonic()
+        detail = str(detail or "UART device unavailable").strip()
+        if detail == self._waiting_notice_detail and now - self._waiting_notice_last < 15.0:
+            return
+        self._waiting_notice_detail = detail
+        self._waiting_notice_last = now
+        print(f"FRDM UART bus waiting for device: {detail}. TX is paused until it appears.")
+
     def send_line(
         self,
         wire: str,
@@ -3611,6 +3753,10 @@ class FrdmUartBus:
         if not self.is_enabled():
             return False, []
         if self.stop_event.is_set():
+            return False, []
+        waiting_detail = self._waiting_detail()
+        if waiting_detail:
+            self._notice_waiting_for_device(waiting_detail)
             return False, []
         disabled_remaining = self._disabled_remaining()
         if disabled_remaining > 0.0:
@@ -3629,6 +3775,9 @@ class FrdmUartBus:
         wait_timeout = timeout_sec
         if wait_timeout is None:
             wait_timeout = self._configured_tx_timeout(request.read_ms)
+        if not self.is_connected() and not self._waiting_detail():
+            reconnect_sec = max(0.1, min(5.0, float(getattr(self.args, "frdm_uart_reconnect_sec", 1.0) or 1.0)))
+            wait_timeout = max(wait_timeout, reconnect_sec + self._configured_tx_timeout(request.read_ms))
         if not request.done.wait(max(0.1, wait_timeout)):
             request.cancelled = True
             request.finish(False)
@@ -3637,10 +3786,12 @@ class FrdmUartBus:
             return False, list(request.rx_lines)
         return request.ok, list(request.rx_lines)
 
-    def _resolve_port(self) -> str:
+    def _resolve_port(self) -> str | None:
         requested = str(getattr(self.args, "uart_port", "auto") or "auto")
         if self._cached_port and Path(self._cached_port).exists():
             return self._cached_port
+        if auto_uart_requested(self.args) and not discover_demo_uart_paths():
+            return None
         self._cached_port = bridge.resolve_uart_port(requested)
         return self._cached_port
 
@@ -3676,6 +3827,11 @@ class FrdmUartBus:
             try:
                 if ser is None:
                     port = self._resolve_port()
+                    if not port:
+                        self._set_connected(False)
+                        self._notice_waiting_for_device(f"no visible {UART_DEVICE_DESCRIPTION}")
+                        self.stop_event.wait(reconnect_sec)
+                        continue
                     ser = serial.Serial(
                         port=port,
                         baudrate=getattr(self.args, "uart_baudrate", 115200),
@@ -3693,7 +3849,11 @@ class FrdmUartBus:
                         pass
                     if port != self._last_open_log:
                         print(f"FRDM UART bus opened {port}.")
+                        if getattr(self.args, "_frdm_uart_startup_missing", False):
+                            print("FRDM UART auto-recovery: device is back; future UART commands will be sent.")
                         self._last_open_log = port
+                    self._set_connected(True)
+                    setattr(self.args, "_frdm_uart_startup_missing", False)
 
                 try:
                     current_request = self.tx_queue.get(timeout=0.02)
@@ -3729,6 +3889,7 @@ class FrdmUartBus:
                     except Exception:
                         pass
                     ser = None
+                self._set_connected(False)
                 self._cached_port = ""
                 if current_request is not None and not current_request.done.is_set():
                     current_request.finish(False)
@@ -3748,6 +3909,7 @@ class FrdmUartBus:
                 ser.close()
             except Exception:
                 pass
+        self._set_connected(False)
 
     def _dispatch_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -3823,6 +3985,8 @@ class RobotUartController:
     def head_motor_enabled(self) -> bool:
         if getattr(self.args, "uart_dry_run", False):
             return True
+        if getattr(self.args, "no_uart", False):
+            return False
         if getattr(self.args, "disable_head_motor", False):
             return False
         return bool(getattr(self.args, "enable_head_motor", False))
@@ -3830,9 +3994,14 @@ class RobotUartController:
     def head_motor_disabled_reason(self) -> str:
         if self.head_motor_enabled():
             return ""
+        if getattr(self.args, "no_uart", False):
+            return "live UART is disabled"
         if getattr(self.args, "disable_head_motor", False):
             return "--disable-head-motor is set"
         return "--enable-head-motor not set"
+
+    def live_uart_enabled(self) -> bool:
+        return not bool(getattr(self.args, "no_uart", False))
 
     def current_screen_state(self) -> str:
         return self._screen_state
@@ -3997,7 +4166,7 @@ class RobotUartController:
                 invalid_count += 1
                 continue
             name, safe_v1, safe_v2 = validated
-            if name in MOTOR_COMMANDS and not self.head_motor_enabled():
+            if name in MOTOR_COMMANDS and not getattr(self.args, "no_uart", False) and not self.head_motor_enabled():
                 skipped_disabled_motor_count += 1
                 wire = format_uart_wire_command(name, safe_v1, safe_v2)
                 print(f"FRDM UART motor skipped ({self.head_motor_disabled_reason()}): {wire}")
@@ -4012,9 +4181,7 @@ class RobotUartController:
         if not valid_steps:
             return invalid_count == 0 and skipped_lockout_motor_count == 0
         if getattr(self.args, "no_uart", False):
-            for _name, _v1, _v2, wire in valid_steps:
-                print(f"FRDM UART skipped (--no-uart): {wire}")
-            return True
+            return False
 
         read_ms, read_window_sec, configured_timeout, per_read_timeout = self._uart_read_config(read_ms)
 
@@ -4131,8 +4298,7 @@ class RobotUartController:
             print(f"WARNING: refusing overlong UART raw line ({len(wire.encode('utf-8'))} bytes): {wire!r}.")
             return False
         if getattr(self.args, "no_uart", False):
-            print(f"FRDM UART skipped (--no-uart): {wire}")
-            return True
+            return False
 
         read_ms, read_window_sec, configured_timeout, per_read_timeout = self._uart_read_config(read_ms)
         bus = self._active_uart_bus()
@@ -4189,7 +4355,8 @@ class RobotUartController:
 
     def reset_head_position(self, *, reason: str = "head_motion reset") -> bool:
         if not self.head_motor_enabled():
-            print(f"head motion reset skipped ({self.head_motor_disabled_reason()}): {reason}")
+            if not getattr(self.args, "no_uart", False):
+                print(f"head motion reset skipped ({self.head_motor_disabled_reason()}): {reason}")
             return True
         if self.head_is_centered():
             print(f"head motion reset skipped: already centered ({reason})")
@@ -4218,6 +4385,8 @@ class RobotUartController:
             print(f"WARNING: refusing non-screen state {state!r}.")
             return False
         command = validated[0]
+        if getattr(self.args, "no_uart", False):
+            return False
         if (
             not force
             and command == self._screen_state
@@ -4242,6 +4411,8 @@ class RobotUartController:
         if normalized in {"normal", "sleep"}:
             self.set_persistent_state(normalized)
         ok = self.set_screen_state(command, reason=reason or f"screen mode {normalized}")
+        if getattr(self.args, "no_uart", False):
+            return False
         if ok:
             print(f"UART {command} sent ({reason or 'screen mode ' + normalized}).")
         else:
@@ -4257,6 +4428,8 @@ class RobotUartController:
     def restore_persistent_screen_state(self) -> bool:
         command = "Sleep" if self.persistent_state == "sleep" else "Normal"
         ok = self.send_uart_command(command, 0, 0, reason=f"restore persistent state {self.persistent_state}", read_ms=100)
+        if getattr(self.args, "no_uart", False):
+            return False
         if ok:
             self._note_screen_state(command)
             print(f"UART {command} sent (restore persistent_state={self.persistent_state}).")
@@ -4264,10 +4437,10 @@ class RobotUartController:
             print(f"WARNING: UART {command} not sent; FRDM UART is unavailable.")
         return ok
 
-    def send_emotion_screen(self, emotion: str) -> str:
+    def send_emotion_screen(self, emotion: str) -> bool:
         return self.send_speaking_and_emotion(emotion)
 
-    def send_speaking_and_emotion(self, emotion: str) -> str:
+    def send_speaking_and_emotion(self, emotion: str) -> bool:
         """Switch to Speaking and pass the FRDM 0..5 speaking emotion code."""
         normalized = normalize_emotion_name(emotion, default="neutral")
         code = speaking_code_for_emotion(normalized)
@@ -4278,17 +4451,20 @@ class RobotUartController:
             reason=f"speaking emotion {normalized} code {code}",
             read_ms=80,
         )
+        if getattr(self.args, "no_uart", False):
+            return False
         if ok:
             self._note_screen_state("Speaking")
             print(f"UART Speaking sent with emotion={normalized}, code={code}.")
         else:
             print(f"WARNING: UART Speaking {code} not sent; FRDM UART is unavailable.")
-        return "Speaking"
+        return ok
 
     def run_head_motion(self, head_motion: str) -> bool:
         motion = head_motion if head_motion in HEAD_MOTION_SEQUENCES else "none"
         if not self.head_motor_enabled():
-            print(f"head motion skipped ({self.head_motor_disabled_reason()}): {motion}")
+            if not getattr(self.args, "no_uart", False):
+                print(f"head motion skipped ({self.head_motor_disabled_reason()}): {motion}")
             return True
         keyframes = list(HEAD_MOTION_SEQUENCES.get(motion, HEAD_MOTION_SEQUENCES["none"]))
         sequence = smooth_motor_sequence(keyframes, self.motor_smooth_step_deg())
@@ -4385,7 +4561,8 @@ class RobotUartController:
             print("speaking head motion skipped: none")
             return None, None
         if not self.head_motor_enabled():
-            print(f"speaking head motion skipped ({self.head_motor_disabled_reason()}): {motion}")
+            if not getattr(self.args, "no_uart", False):
+                print(f"speaking head motion skipped ({self.head_motor_disabled_reason()}): {motion}")
             return None, None
         stop_event = threading.Event()
         thread = threading.Thread(
@@ -5439,6 +5616,7 @@ class FrdmFanControlManager:
         self.args = args
         self.last_event_key = ""
         self.last_event_at = 0.0
+        self.suppressed_duplicate_count = 0
 
     def is_enabled(self) -> bool:
         return not bool(getattr(self.args, "no_frdm_fan_events", False))
@@ -5471,14 +5649,18 @@ class FrdmFanControlManager:
             return False
         key = f"{event['state']}:{event['speed']}:{event['percent']}"
         now = time.monotonic()
-        if key == self.last_event_key and now - self.last_event_at < 0.15:
+        duplicate_suppress_sec = max(0.0, float(getattr(self.args, "fan_duplicate_suppress_sec", 2.0) or 0.0))
+        if key == self.last_event_key and now - self.last_event_at < duplicate_suppress_sec:
+            self.suppressed_duplicate_count += 1
             return True
+        suppressed = self.suppressed_duplicate_count
+        self.suppressed_duplicate_count = 0
         self.last_event_key = key
         self.last_event_at = now
-        print(
-            "FRDM fan event: "
-            f"state={event['state']} speed={event['speed']} percent={event['percent']} raw={event['raw']!r}"
-        )
+        detail = f"state={event['state']} speed={event['speed']} percent={event['percent']} raw={event['raw']!r}"
+        if suppressed:
+            detail += f" suppressed_duplicates={suppressed}"
+        print(f"FRDM fan event: {detail}")
         dashboard_ok = self._sync_dashboard(event)
         command_ok = self._run_control_command(event)
         if not dashboard_ok and not command_ok and not str(getattr(self.args, "fan_control_command", "") or "").strip():
@@ -7191,13 +7373,15 @@ def build_wake_hook(
             and (pause_result.get("paused") or pause_result.get("stopped"))
         ):
             send_music_uart_update(args, robot, pause_result, reason="wake paused music dashboard")
-            timing.mark("music pause dashboard sent")
+            if not getattr(args, "no_uart", False):
+                timing.mark("music pause dashboard sent")
 
-        if robot.set_screen_state("Thinking"):
-            print("UART Thinking sent.")
-        else:
-            print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
-        timing.mark("UART Thinking sent")
+        if not getattr(args, "no_uart", False):
+            if robot.set_screen_state("Thinking"):
+                print("UART Thinking sent.")
+            else:
+                print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
+            timing.mark("UART Thinking sent")
 
         return {
             "image_future": None,
@@ -7249,13 +7433,14 @@ def build_conversation_turn_context(
         play_recording_cue(args, label="Follow-up recording")
         timing.mark("follow-up beep done")
 
-    if robot.is_screen_state_recent("Thinking", within_sec=8.0):
-        print(f"UART Thinking skipped; already active {robot.screen_state_age():.2f}s ago for this conversation follow-up.")
-    elif robot.set_screen_state("Thinking", reason="conversation follow-up listening"):
-        print("UART Thinking sent.")
-    else:
-        print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
-    timing.mark("UART Thinking sent")
+    if not getattr(args, "no_uart", False):
+        if robot.is_screen_state_recent("Thinking", within_sec=8.0):
+            print(f"UART Thinking skipped; already active {robot.screen_state_age():.2f}s ago for this conversation follow-up.")
+        elif robot.set_screen_state("Thinking", reason="conversation follow-up listening"):
+            print("UART Thinking sent.")
+        else:
+            print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
+        timing.mark("UART Thinking sent")
 
     return {
         "image_future": None,
@@ -7417,9 +7602,9 @@ class SpeakingPlaybackCue:
         if self.started:
             return
         self.started = True
-        self.robot.send_speaking_and_emotion(self.emotion)
+        sent = self.robot.send_speaking_and_emotion(self.emotion)
         self.head_thread, self.head_stop = self.robot.start_speaking_head_motion(self.head_motion)
-        if self.timing is not None:
+        if self.timing is not None and sent:
             self.timing.mark(self.timing_label)
 
     def stop(self) -> None:
@@ -7579,6 +7764,7 @@ def run_self_test() -> int:
         no_frdm_fan_events=False,
         no_fan_dashboard_sync=True,
         fan_speed_max=3,
+        fan_duplicate_suppress_sec=2.0,
         fan_control_command="",
         motor_step_delay=0.02,
         motor_smooth_step_deg=MOTOR_SMOOTH_STEP_DEG,
@@ -8139,45 +8325,41 @@ def set_post_reply_screen(
     persistent_state = str(control.get("persistent_state", "unchanged") or "unchanged").strip().lower()
     music_action = str(music_action or "").strip().lower()
 
+    def mark_uart(label: str) -> None:
+        if timing is not None and not getattr(args, "no_uart", False):
+            timing.mark(label)
+
     if music_action in {"play", "resume"}:
         robot.set_screen_mode("music", reason=f"{reason}; music {music_action}")
-        if timing is not None:
-            timing.mark("UART Music sent")
+        mark_uart("UART Music sent")
         return
     if music_action in {"pause", "stop"}:
         robot.set_screen_mode("normal", reason=f"{reason}; music {music_action}")
-        if timing is not None:
-            timing.mark("UART Normal sent after music stop/pause")
+        mark_uart("UART Normal sent after music stop/pause")
         return
     if focus_stopped:
         robot.set_screen_mode("normal", reason=f"{reason}; focus stopped")
-        if timing is not None:
-            timing.mark("UART Normal sent after focus stop")
+        mark_uart("UART Normal sent after focus stop")
         return
     if focus_running:
         robot.set_screen_mode("focus", reason=f"{reason}; focus running")
-        if timing is not None:
-            timing.mark("UART Focus sent")
+        mark_uart("UART Focus sent")
         return
     if screen_mode in {"normal", "sleep", "music", "focus"}:
         robot.set_screen_mode(screen_mode, reason=f"{reason}; control screen_mode")
-        if timing is not None:
-            timing.mark(f"UART {SCREEN_MODE_TO_COMMAND.get(screen_mode, screen_mode)} sent")
+        mark_uart(f"UART {SCREEN_MODE_TO_COMMAND.get(screen_mode, screen_mode)} sent")
         return
     if persistent_state in {"normal", "sleep"}:
         robot.set_screen_mode(persistent_state, reason=f"{reason}; persistent_state")
-        if timing is not None:
-            timing.mark(f"UART {SCREEN_MODE_TO_COMMAND.get(persistent_state, persistent_state)} sent")
+        mark_uart(f"UART {SCREEN_MODE_TO_COMMAND.get(persistent_state, persistent_state)} sent")
         return
     if getattr(args, "conversation_mode", False):
         robot.set_screen_mode("thinking", reason=f"{reason}; waiting for follow-up")
-        if timing is not None:
-            timing.mark("UART Thinking sent for follow-up")
+        mark_uart("UART Thinking sent for follow-up")
         return
 
     robot.restore_persistent_screen_state()
-    if timing is not None:
-        timing.mark("UART persistent screen state sent")
+    mark_uart("UART persistent screen state sent")
 
 
 def emotion_summary_from_control(control: dict[str, str]) -> dict[str, Any]:
@@ -8421,8 +8603,8 @@ def handle_wake_chat_response(
     if weather_result is not None and timing is not None:
         timing.mark("weather tool handled" if weather_result.get("ok") else "weather tool failed")
     if weather_result is not None and weather_result.get("ok") and weather_result.get("handled", weather_result.get("ok")):
-        send_weather_uart_update(args, robot, weather_result, reason="weather query update")
-        if timing is not None:
+        weather_payload = send_weather_uart_update(args, robot, weather_result, reason="weather query update")
+        if weather_payload and timing is not None:
             timing.mark("Weather UART sent")
 
     control = normalize_control(response)
@@ -8500,11 +8682,12 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
     timing = TimingLogger()
     try:
         print(f"POST text to {text_url}")
-        if robot.set_screen_state("Thinking"):
-            print("UART Thinking sent.")
-        else:
-            print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
-        timing.mark("UART Thinking sent")
+        if not getattr(args, "no_uart", False):
+            if robot.set_screen_state("Thinking"):
+                print("UART Thinking sent.")
+            else:
+                print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
+            timing.mark("UART Thinking sent")
         try:
             response = voice_chat.post_json(text_url, {"text": args.text}, timeout_sec=args.timeout)
         except Exception as exc:
@@ -8528,7 +8711,8 @@ def run_head_motion_test(args: argparse.Namespace) -> int:
     if not getattr(args, "uart_dry_run", False) and head_motor_requested:
         if not getattr(args, "no_uart", False):
             args.require_uart = True
-        device_preflight(args)
+        if not device_preflight(args):
+            return 1
 
     robot = RobotUartController(args)
     requested_speaking_motion = str(getattr(args, "test_speaking_head_motion", "") or "").strip()
@@ -8869,7 +9053,8 @@ def send_and_handle_audio_turn(
 
 
 def run_wake_voice_loop(args: argparse.Namespace) -> int:
-    device_preflight(args)
+    if not device_preflight(args):
+        return 1
     lock = InstanceLock(args.instance_lock, enabled=not args.no_instance_lock)
     if not lock.acquire():
         return 1
@@ -8993,11 +9178,16 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     print("AI path: Jetson wake/record locally -> Windows desktop local /voice-chat -> local ASR/Ollama.")
     print("No Gemini/OpenAI cloud API is used by this bridge.")
     print(f"Server URL: {args.server_url}")
-    print(
-        f"FRDM UART: {args.uart_port} @ {args.uart_baudrate}, "
-        f"line_ending={args.uart_line_ending}, "
-        f"bus_tx_timeout={getattr(args, 'frdm_uart_tx_timeout', 0.45):g}s"
-    )
+    if getattr(args, "no_uart", False):
+        print("FRDM UART: disabled for this run.")
+    else:
+        print(
+            f"FRDM UART: {args.uart_port} @ {args.uart_baudrate}, "
+            f"line_ending={args.uart_line_ending}, "
+            f"bus_tx_timeout={getattr(args, 'frdm_uart_tx_timeout', 0.45):g}s"
+        )
+        if getattr(args, "_frdm_uart_startup_missing", False):
+            print("FRDM UART: waiting in auto-recovery mode; commands will resume after the device appears.")
     print(f"Input sample rate: {input_sample_rate} Hz; upload WAV sample rate: {voice_chat.SAMPLE_RATE} Hz")
     print(f"Wake word: {'disabled' if args.no_wake_word else args.wake_word}")
     print(
@@ -9067,8 +9257,9 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     print(f"To-do list: {todo_desc}")
     uart_event_desc = "on" if frdm_uart_events_active(args) else "off"
     todo_event_desc = "off" if args.no_frdm_todo_events or args.no_dashboard_uart or not frdm_uart_events_active(args) else "on"
+    dashboard_uart_desc = "disabled" if args.no_dashboard_uart or args.no_uart else "enabled"
     print(
-        f"Dashboard UART data sync: {'disabled' if args.no_dashboard_uart else 'enabled'}, "
+        f"Dashboard UART data sync: {dashboard_uart_desc}, "
         f"todo_item_limit={args.dashboard_todo_item_limit}, "
         f"uart_event_bus={uart_event_desc}, "
         f"frdm_todo_events={todo_event_desc}"
@@ -9097,12 +9288,12 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             f"post_music_cooldown={args.post_music_standby_cooldown:g}s"
         )
     print(f"Music tool: {music_desc}")
-    startup_time = "off" if args.no_startup_time else "on"
+    startup_time = "off" if args.no_startup_time or args.no_uart else "on"
     print(f"Startup time UART: {startup_time}")
     if args.no_weather:
         weather_desc = "disabled"
     else:
-        startup_weather = "off" if args.no_startup_weather else f"on:{args.startup_weather_text}"
+        startup_weather = "off" if args.no_startup_weather or args.no_uart else f"on:{args.startup_weather_text}"
         weather_desc = (
             f"{args.weather_url}, default_location={args.weather_default_location}, "
             f"source=Open-Meteo, startup_uart={startup_weather}"
@@ -9149,7 +9340,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         f"mic={'fixed index ' + str(args.device) if args._manual_input_device else 'keyword ' + repr(args.mic_keyword)}; "
         f"beep={'disabled' if args.no_beep else ('fixed index ' + str(args.beep_device) if args._manual_beep_device else 'keyword ' + repr(args.beep_keyword))}; "
         f"camera={'disabled' if args.no_camera or args.no_vision else str(args.camera_id)}; "
-        f"FRDM UART={args.uart_port}"
+        f"FRDM UART={'disabled' if args.no_uart else args.uart_port}"
     )
     boot_delay = max(0.0, float(getattr(args, "boot_normal_delay", 2.0) or 0.0))
     if boot_delay > 0:
@@ -9732,6 +9923,7 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     weather_group.add_argument("--no-frdm-fan-events", action="store_true", help="Do not listen for FRDM fan UI events.")
     weather_group.add_argument("--fan-device-id", default=os.getenv("FAN_DEVICE_ID", "desk_fan"), help="Dashboard device id controlled by FRDM fan events.")
     weather_group.add_argument("--fan-speed-max", type=int, default=_env_int("FAN_SPEED_MAX", 3), help="Maximum FRDM fan speed level. Levels are mapped to 0..100 percent for dashboard state.")
+    weather_group.add_argument("--fan-duplicate-suppress-sec", type=float, default=_env_float("FAN_DUPLICATE_SUPPRESS_SEC", 2.0), help="Ignore repeated identical FRDM fan events for this many seconds to avoid slider log/dashboard spam.")
     weather_group.add_argument("--fan-dashboard-url", default=DEFAULT_FAN_DASHBOARD_URL, help="Dashboard set-device URL template. Use {device_id} for the URL-escaped device id.")
     weather_group.add_argument("--no-fan-dashboard-sync", action="store_true", help="Do not POST FRDM fan events to the Jetson dashboard API.")
     weather_group.add_argument("--fan-dashboard-timeout", type=float, default=_env_float("FAN_DASHBOARD_TIMEOUT", 1.5))
@@ -10109,6 +10301,9 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
     if int(getattr(args, "fan_speed_max", 0) or 0) <= 0:
         print("ERROR: --fan-speed-max must be > 0.")
         return False
+    if float(getattr(args, "fan_duplicate_suppress_sec", 0.0) or 0.0) < 0.0:
+        print("ERROR: --fan-duplicate-suppress-sec must be >= 0.")
+        return False
     if float(getattr(args, "fan_dashboard_timeout", 0.0) or 0.0) <= 0.0:
         print("ERROR: --fan-dashboard-timeout must be > 0.")
         return False
@@ -10193,8 +10388,7 @@ def main() -> int:
     if args.test_head_motion or args.test_head_emotion or args.test_speaking_head_motion:
         return run_head_motion_test(args)
     if args.device_preflight_only:
-        device_preflight(args)
-        return 0
+        return 0 if device_preflight(args) else 1
     if args.check_server:
         return bridge.run_check_server(args)
     if args.text:

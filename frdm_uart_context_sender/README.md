@@ -30,8 +30,10 @@ audio_read_timeout    : 0.75
 camera                : auto, 320x240, JPEG quality 70, memory-only
 image_capture         : after end-of-speech beep, before upload
 uart                  : auto, 115200, CRLF
-tts                   : local Piper /speak_async, AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
-tts volume            : --tts-volume-gain 2.25, server accepts volume_gain 0.05..8.0
+tts                   : local Piper /speak_async, AUDIO_DEVICE=auto:UACDemo
+tts volume            : --tts-volume-gain 2.4, server accepts volume_gain 0.05..8.0
+beep volume           : --beep-volume 0.35
+USB output volume     : PulseAudio UACDemo ~70%, ALSA PCM 70%
 music/weather         : local tool server on 127.0.0.1:8788, mpv + Open-Meteo
 local temperature     : optional ESP32-S3 + DS18B20 over LAN, merged into Weather UART as a 6th field
 to-do list            : local JSON voice tool, frdm_uart_context_sender/logs/todo_list.json
@@ -44,12 +46,15 @@ Do not pin numeric USB indexes. After a USB replug, `--device 25`, `--beep-devic
 Conservative on-site volume settings:
 
 ```text
-TTS .env default      : DEFAULT_VOLUME_GAIN=2.25
-Wake Bridge default   : --tts-volume-gain 2.25
-PulseAudio USB sink   : about 80%
-Too loud              : try 2.0 and --beep-volume 0.35
+TTS .env default      : DEFAULT_VOLUME_GAIN=2.4
+Wake Bridge default   : --tts-volume-gain 2.4
+PulseAudio USB sink   : about 70%
+ALSA USB PCM          : 70%
+Too loud              : try 2.0 and --beep-volume 0.25
 Too quiet             : try 3.0 before going higher
 ```
+
+Volume is reset to absolute values in three places: `~/.config/systemd/user/makentu-uacdemo-volume.service` at boot/login with user linger enabled, `~/.config/autostart/makentu-uacdemo-volume.desktop` after the desktop session starts, and `~/.bashrc` whenever a new terminal opens. `set_uacdemo_volume.sh` rejects relative values such as `+5%`, so repeated boots or terminals do not drift louder or quieter.
 
 When code changes, restart the matching terminal:
 
@@ -252,6 +257,9 @@ Demo Checklist
 
 ```text
 wake_voice_chat_frdm_bridge.py   # official Hey Jarvis hands-free demo
+run_wake_bridge_full_demo.sh      # recommended Terminal 3 launcher with auto device detection
+auto_demo_devices.sh              # waits for UACDemo speaker/mic, FRDM UART, and camera
+set_uacdemo_volume.sh             # normalizes UACDemo PulseAudio/ALSA volume
 focus_work_mode.py               # focus work mode subprocess, started/stopped by the Wake Bridge
 voice_chat_frdm_uart_bridge.py   # manual Enter-to-record version
 frdm_uart_context_sender.py      # standalone FRDM UART command sender
@@ -270,7 +278,21 @@ The Windows desktop runs the bundle copy, so server changes must be synced with 
 
 ## Standard Startup
 
-The full copy-paste Terminal 1/2/4/3 flow is in [QUICK_START.md](QUICK_START.md). Do not hand-type the last few parameters; the common mistake is accidentally typing `--uart-debug\terval 0.75`. The correct tail is:
+The full copy-paste Terminal 1/2/4/3 flow is in [QUICK_START.md](QUICK_START.md). The recommended Terminal 3 path is:
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+bash frdm_uart_context_sender/auto_demo_devices.sh
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+`run_wake_bridge_full_demo.sh` exports the auto/keyword device settings, normalizes UACDemo volume, then launches the bridge. Override only when needed:
+
+```bash
+TTS_VOLUME_GAIN=1.2 BEEP_VOLUME=0.25 MUSIC_MPV_VOLUME=60 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+Do not hand-type the last few parameters in manual mode; the common mistake is accidentally typing `--uart-debug\terval 0.75`. The correct tail is:
 
 ```bash
   --tts-poll-interval 0.75 \
@@ -288,8 +310,10 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
   --beep-keyword UACDemo \
+  --beep-player auto \
   --noisy-room \
-  --tts-volume-gain 2.25 \
+  --tts-volume-gain 2.4 \
+  --beep-volume 0.35 \
   --uart-port auto \
   --uart-baudrate 115200 \
   --enable-head-motor \
@@ -319,14 +343,17 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-interval-sec 60 \
   --focus-duration-min 0 \
   --focus-log-root /tmp/focus_voice_test \
-  --focus-alert-threshold 2 \
+  --focus-alert-threshold 1 \
   --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
   --focus-notify-mode discord \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
+  --music-mpv-audio-device auto \
+  --music-mpv-volume 70 \
+  --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
-  --music-wake-pause-timeout 0.6 \
-  --music-wake-beep-settle 0.18 \
+  --music-wake-pause-timeout 0.25 \
+  --music-wake-beep-settle 0.05 \
   --post-music-standby-cooldown 0.8 \
   --music-debug \
   --weather-default-location Taipei \
@@ -354,12 +381,12 @@ This full mode enables wake word, conversation mode, speech-end image capture, F
 
 For one-shot Q&A, remove `--conversation-mode`, `--turn-listen-timeout`, `--session-idle-timeout`, and `--max-session-turns`. For lower latency, add `--ultra-response`; if speech is cut too early, use the more conservative `--turbo-response`.
 
-Keep `--noisy-room` for loud demo spaces. It raises speech/silence gates and makes the cue beep louder and longer. If TTS is too loud, try `--tts-volume-gain 2.0`; if it is still too quiet, try `3.0`.
+Keep `--noisy-room` for loud demo spaces. It raises speech/silence gates; the live demo launcher also passes `--beep-volume 0.35` so the cue beep stays controlled. TTS uses a fixed absolute `--tts-volume-gain 2.4`, which is `1.5x` over the previous `1.6`. If TTS is too loud, try `2.0`; if it is still too quiet, try `3.0`.
 
 Beep-only test:
 
 ```bash
-python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --noisy-room --test-beep
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --noisy-room --beep-volume 0.35 --test-beep
 ```
 
 For a room with background volume around `10000` and speech around `19000`, `--noisy-room` should put thresholds near:
@@ -384,7 +411,7 @@ Use:
 ```text
 mic       : --mic-keyword UACDemo
 beep      : --beep-keyword UACDemo
-TTS audio : AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+TTS audio : AUDIO_DEVICE=auto:UACDemo
 camera    : --camera-id auto
 FRDM      : --uart-port auto
 music     : --music-backend mpv
@@ -400,6 +427,7 @@ stop stale arecord / aplay / mpv / ffplay / paplay
 if UACDemo/camera/FRDM disappeared, reset Jetson USB host
 scan /dev/video*, UACDemo /dev/snd/pcm*, /dev/ttyACM*
 stop same-user processes that still own those device nodes
+skip sounddevice output wait unless --beep-player sounddevice is explicitly used
 keep jetson_piper_tts.server alive
 keep pulseaudio / pipewire / wireplumber by default
 ```
@@ -1475,12 +1503,12 @@ Timeout and polling options:
 TTS `.env` recommendation:
 
 ```text
-AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
-DEFAULT_VOLUME_GAIN=2.25
+AUDIO_DEVICE=auto:UACDemo
+DEFAULT_VOLUME_GAIN=2.4
 ENABLE_STREAM_PLAYBACK=true
 ```
 
-After USB recovery or speaker replug, restart the TTS server.
+After USB recovery, speaker replug, or `.env` changes, restart the TTS server. `auto:UACDemo` resolves the current UACDemo ALSA card name at playback time, so it survives card-number changes better than `plughw:1,0`. The gain value is absolute, not multiplied on each start.
 
 ## USB Replug Auto Discovery
 
@@ -1497,6 +1525,7 @@ Correct startup log:
 
 ```text
 USB auto-discovery: mic=keyword 'UACDemo'; beep=keyword 'UACDemo'; camera=auto; FRDM UART=auto
+TTS audio: AUDIO_DEVICE=auto:UACDemo
 ```
 
 If the USB controller drops and `lsusb` cannot see UACDemo/camera/FRDM:
@@ -1561,7 +1590,7 @@ TTS volume API smoke test:
 ```bash
 curl -X POST http://127.0.0.1:8777/speak_async \
   -H "Content-Type: application/json" \
-  -d '{"text":"音量測試，現在應該比較大聲。","interrupt":true,"volume_gain":2.25}'
+  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":2.4}'
 ```
 
 Focus work mode self-test:
@@ -1690,10 +1719,10 @@ debug_version is not 13
 -> Re-sync the Windows bundle, stop the old server, and restart.
 
 TTS ready but no sound
--> Check /health. Confirm AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0 and audio.device is UACDemo. Restart TTS.
+-> Check /health. Confirm configured_device is auto:UACDemo and audio.device resolved to UACDemo. Restart TTS.
 
 TTS is audible but too quiet
--> Add --tts-volume-gain 2.25 to Terminal 3 and restart Wake Bridge.
+-> Use --tts-volume-gain 2.4 first. If still too quiet, try 3.0 and restart Wake Bridge.
 -> If /speak_async with volume_gain returns 422, Terminal 2 is still the old TTS server; restart it.
 
 Music starts when the user is complaining about audio volume

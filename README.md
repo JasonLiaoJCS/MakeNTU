@@ -23,7 +23,7 @@ FRDM state machine    : Normal / Thinking / Speaking / Music / Focus / Sleep
 FRDM startup data     : Time + Weather UART payloads before Normal
 FRDM dashboard data   : Todo / Music / Focus / Health UART payloads for swipe pages
 Head motor            : MotorPitch 65..90..115, MotorYaw 0..90..180
-TTS                   : Jetson Piper /speak_async, UACDemo audio
+TTS                   : Jetson Piper /speak_async, AUDIO_DEVICE=auto:UACDemo
 Music tool            : Jetson local /music, mpv + yt-dlp
 Weather tool          : Jetson local /weather, Open-Meteo
 Smart home dashboard  : Jetson local /dashboard + REST API on port 8789
@@ -39,6 +39,7 @@ Do not pin numeric USB indexes. For the live demo, use keyword/auto discovery:
 ```text
 mic       : --mic-keyword UACDemo
 beep      : --beep-keyword UACDemo
+TTS audio : AUDIO_DEVICE=auto:UACDemo
 camera    : --camera-id auto
 FRDM UART : --uart-port auto
 ```
@@ -119,8 +120,8 @@ python -m jetson_piper_tts.server \
 Recommended `.env`:
 
 ```text
-AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
-DEFAULT_VOLUME_GAIN=2.25
+AUDIO_DEVICE=auto:UACDemo
+DEFAULT_VOLUME_GAIN=2.4
 ENABLE_STREAM_PLAYBACK=true
 ```
 
@@ -137,6 +138,8 @@ python3 music_web_player.py \
   --host 127.0.0.1 \
   --port 8788 \
   --backend mpv \
+  --mpv-audio-device auto \
+  --mpv-volume 70 \
   --weather-default-location Taipei
 ```
 
@@ -259,12 +262,24 @@ Jetson:
 cd /home/asrlab-yian/MakeNTU
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
 
+bash frdm_uart_context_sender/auto_demo_devices.sh
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+Manual equivalent, if you need to tune one parameter live:
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+
 python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --server-url http://100.108.141.26:8766/voice-chat \
   --mic-keyword UACDemo \
   --beep-keyword UACDemo \
+  --beep-player auto \
   --noisy-room \
-  --tts-volume-gain 2.25 \
+  --tts-volume-gain 2.4 \
+  --beep-volume 0.35 \
   --uart-port auto \
   --uart-baudrate 115200 \
   --enable-head-motor \
@@ -294,13 +309,16 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-interval-sec 60 \
   --focus-duration-min 0 \
   --focus-log-root /tmp/focus_voice_test \
-  --focus-alert-threshold 2 \
+  --focus-alert-threshold 1 \
   --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
   --focus-notify-mode discord \
   --music-backend mpv \
+  --music-mpv-audio-device auto \
+  --music-mpv-volume 70 \
+  --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
-  --music-wake-pause-timeout 0.6 \
-  --music-wake-beep-settle 0.18 \
+  --music-wake-pause-timeout 0.25 \
+  --music-wake-beep-settle 0.05 \
   --post-music-standby-cooldown 0.8 \
   --music-debug \
   --weather-default-location Taipei \
