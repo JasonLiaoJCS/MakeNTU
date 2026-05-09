@@ -324,10 +324,10 @@ bash frdm_uart_context_sender/auto_demo_devices.sh
 `run_wake_bridge_full_demo.sh` exports the auto/keyword device settings, normalizes UACDemo volume, then launches the bridge. Override only when needed:
 
 ```bash
-MAKE_NTU_TTS_VOLUME_GAIN=3.6 BEEP_VOLUME=0.25 MUSIC_MPV_VOLUME=125 MUSIC_MPV_VOLUME_MAX=200 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+MAKE_NTU_TTS_VOLUME_GAIN=3.6 BEEP_VOLUME=0.25 MUSIC_MPV_VOLUME=220 MUSIC_MPV_VOLUME_MAX=300 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
 ```
 
-`MUSIC_MPV_VOLUME` controls only mpv music playback. The default launcher now uses `125` so music is louder without changing Piper TTS speech volume.
+`MUSIC_MPV_VOLUME` controls only mpv music playback. The default launcher now uses `220` with `MUSIC_MPV_VOLUME_MAX=300`, so music is much louder without changing Piper TTS speech volume.
 
 For the ESP32-S3 BLE board, prefer pinning the MAC discovered by scan-only:
 
@@ -393,13 +393,23 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-duration-min 0 \
   --focus-log-root /tmp/focus_voice_test \
   --focus-alert-threshold 1 \
+  --fan-device-id desk_fan \
+  --fan-speed-max 100 \
+  --esp32-ble \
+  --esp32-ble-adapter hci0 \
+  --esp32-ble-scan-duplicates \
+  --esp32-ble-min-fan-pwm 96 \
+  --esp32-ble-command-queue-max 64 \
+  --esp32-dashboard-host 127.0.0.1 \
+  --esp32-dashboard-port 8791 \
+  --fan-duplicate-suppress-sec 2.0 \
   --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
   --focus-notify-mode discord \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
   --music-mpv-audio-device auto \
-  --music-mpv-volume 125 \
-  --music-mpv-volume-max 200 \
+  --music-mpv-volume 220 \
+  --music-mpv-volume-max 300 \
   --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
   --music-wake-pause-timeout 0.25 \
@@ -599,8 +609,8 @@ python3 music_web_player.py \
   --port 8788 \
   --backend mpv \
   --mpv-audio-device auto \
-  --mpv-volume 125 \
-  --mpv-volume-max 200 \
+  --mpv-volume 220 \
+  --mpv-volume-max 300 \
   --mpv-ready-timeout 1.5 \
   --weather-default-location Taipei
 ```
@@ -610,8 +620,8 @@ Important options:
 ```text
 --music-backend mpv              # real playback; auto also prefers mpv
 --music-mpv-audio-device auto    # prefer the UACDemo USB speaker for mpv
---music-mpv-volume 125           # mpv music volume only; does not change Piper TTS
---music-mpv-volume-max 200       # mpv --volume-max ceiling, needed for values above 100
+--music-mpv-volume 220           # mpv music volume only; does not change Piper TTS
+--music-mpv-volume-max 300       # mpv --volume-max ceiling, needed for values above 100
 --music-timeout 5                # play/change request timeout
 --music-wake-pause-timeout 0.6   # short timeout for immediate pause on wake
 --music-debug                    # print Music routing / Music tool logs
@@ -627,7 +637,7 @@ Music volume is separate from Piper TTS volume:
 ```text
 Piper TTS speech volume -> Terminal 3 --tts-volume-gain / Jetson TTS DEFAULT_VOLUME_GAIN
 mpv music volume        -> Terminal 4 --mpv-volume, or Terminal 3 --music-mpv-volume when autostarting
-launcher override       -> MUSIC_MPV_VOLUME=95 MUSIC_MPV_VOLUME_MAX=200 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+launcher override       -> MUSIC_MPV_VOLUME=180 MUSIC_MPV_VOLUME_MAX=300 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
 ```
 
 If the music itself is quiet but TTS is fine, adjust `MUSIC_MPV_VOLUME` / `--music-mpv-volume`, not `--tts-volume-gain`. Values above 100 require `MUSIC_MPV_VOLUME_MAX` / `--music-mpv-volume-max`; otherwise mpv may clamp the request.
@@ -856,15 +866,42 @@ Wake Bridge integration:
 ```bash
 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
 ESP32_BLE_ADAPTER=hci0 \
+ESP32_BLE_COMMAND_QUEUE_MAX=64 \
 FAN_MIN_PWM=96 \
 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
 ```
+
+BLE is intentionally isolated from the rest of the Wake Bridge. The reconnect loop runs in its own background thread named `esp32s3-ble-reconnect-loop`; scan/connect retries must not block wake-word recording, TTS, music, weather, FRDM UART, to-do, focus mode, or the dashboard. If `bleak` or the helper module is missing, the bridge prints a warning and starts in degraded mode instead of exiting.
+
+Runtime behavior:
+
+```text
+BLE connected                  -> fan/LED commands write immediately, TEMP notify feeds Weather + TempRoom
+BLE disconnected               -> reconnect loop keeps scanning/connecting in the background
+voice/dashboard/FRDM command   -> command is queued while disconnected, then sent after reconnect
+command queue full             -> oldest pending BLE command is dropped; other bridge features continue
+bleak/helper unavailable       -> ESP32 BLE is disabled for this run; Wake/TTS/music/weather/FRDM continue
+```
+
+The disconnected command queue is bounded by `--esp32-ble-command-queue-max` / `ESP32_BLE_COMMAND_QUEUE_MAX`, default `64`.
 
 When `--esp32-ble` is enabled, Wake Bridge also exposes a local Dashboard control API:
 
 ```text
 GET  http://127.0.0.1:8791/api/esp32/status
 POST http://127.0.0.1:8791/api/esp32/control
+```
+
+Useful status fields:
+
+```text
+requested          : --esp32-ble was requested
+enabled            : BLE runtime is usable; false if helper/bleak is unavailable
+running            : reconnect worker thread is alive
+connected          : currently connected to ESP32-S3
+queued_pending     : BLE commands waiting for reconnect
+dropped_pending    : old queued BLE commands dropped because the queue hit its limit
+unavailable_reason : why BLE is disabled in degraded mode
 ```
 
 The Smart Home Dashboard uses this path for the Live tab appliance controls:
@@ -931,7 +968,7 @@ systemctl --user start makentu-wake-bridge.service
 journalctl --user -u makentu-wake-bridge.service -f
 ```
 
-The service loads `~/.config/makentu/wake-bridge.env`, enables user linger, and restarts the full Wake Bridge if the process exits. The BLE controller inside the bridge also reconnects after ESP32/BlueZ disconnects, so normal short BLE drops do not require manual restart. Edit the env file when the ESP32 MAC, Tailscale URL, or `FAN_MIN_PWM` changes:
+The service loads `~/.config/makentu/wake-bridge.env`, enables user linger, and restarts the full Wake Bridge if the process exits. BLE reconnect is inside a separate worker thread, so normal short ESP32/BlueZ drops do not require a manual restart and do not pause the main voice loop. Edit the env file when the ESP32 MAC, Tailscale URL, queue limit, or `FAN_MIN_PWM` changes:
 
 ```bash
 nano ~/.config/makentu/wake-bridge.env
@@ -940,6 +977,8 @@ systemctl --user restart makentu-wake-bridge.service
 
 When voice fan/LED control is requested while BLE is disconnected, the Jetson reply explicitly says the ESP32-S3 Bluetooth link is not connected and that it is reconnecting. The command is queued, then sent automatically after the BLE bridge reconnects. If BLE is connected and the latest ESP32 status is already `FAN:OFF`, asking to turn the fan off gets a spoken already-off reply and skips the redundant `FAN_OFF` write.
 
+Fan intent parsing is deliberately narrower than generic audio volume parsing. Phrases like `音樂太小聲，幫我調大音量` are treated as audio/music volume complaints, not fan speed commands. Fan speed changes require fan context such as `風扇`, `風量`, `風速`, or hot/cold wording.
+
 Voice appliance control is handled before the general AI route, like a local tool:
 
 ```text
@@ -947,6 +986,7 @@ voice "關風扇" with BLE connected        -> send FAN_OFF, speak confirmation,
 voice "關風扇" and ESP32 already FAN:OFF -> no duplicate BLE write, speak already-off reply
 voice "全部關掉" / ALL_OFF               -> send ALL_OFF, speak confirmation, head_motion=none
 voice command while BLE disconnected     -> queue command, speak reconnecting/queued explanation
+voice "音樂太小聲，調大音量"             -> not BLE; handled as audio/music volume context
 after local ESP32 control in conversation mode -> FRDM Normal 0 0, wake-only standby
 ```
 
@@ -2073,12 +2113,13 @@ TTS is audible but too quiet
 
 Music is audible but too quiet
 -> This is mpv volume, not Piper TTS. Check curl http://127.0.0.1:8788/health.
--> Expected defaults are mpv_volume=125, mpv_volume_max=200, mpv_volume_clamped=false.
--> Raise only music with MUSIC_MPV_VOLUME=150 MUSIC_MPV_VOLUME_MAX=220 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh.
+-> Expected defaults are mpv_volume=220, mpv_volume_max=300, mpv_volume_clamped=false.
+-> Raise only music with MUSIC_MPV_VOLUME=260 MUSIC_MPV_VOLUME_MAX=350 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh.
 -> If mpv_actual_volume is missing while music should be playing, mpv is not active or IPC is not ready.
 
 Music starts when the user is complaining about audio volume
 -> Restart Terminal 4 and Terminal 3. Latest routing treats phrases about no sound / low sound / volume as audio complaints, not song requests.
+-> ESP32 BLE should also ignore "音樂太小聲 / 調大音量" unless the phrase contains fan context such as 風扇, 風量, 風速, 好熱, or 好冷.
 
 Music stop / fan off succeeds but there is no spoken reply, or the head moves silently
 -> Restart Terminal 3 so the local-control confirmation path is active.
@@ -2094,6 +2135,13 @@ FRDM room temperature does not update
 -> If Weather local temperature works but TempRoom does not, check --no-temp-room-uart and --temp-room-uart-interval-sec.
 -> If Terminal 3 prints "WARNING: refusing unknown UART raw line 'TempRoom ...'", an old bridge is running; restart Terminal 3.
 -> If Terminal 3 sends TempRoom but FRDM shows nothing, add a FRDM parser for single-argument "TempRoom <Celsius*10>".
+
+ESP32 BLE is disconnected but wake/TTS/music should keep working
+-> This is expected. BLE reconnect runs in the esp32s3-ble-reconnect-loop worker and must not block the main Wake Bridge.
+-> Check curl http://127.0.0.1:8791/api/esp32/status. running=true, connected=false means the background reconnect loop is alive.
+-> queued_pending shows fan/LED commands waiting for reconnect; dropped_pending increments if the queue exceeded --esp32-ble-command-queue-max.
+-> If enabled=false with unavailable_reason, install/fix bleak or the helper module. Other features continue in degraded mode.
+-> To intentionally run without ESP32 BLE, start with ESP32_BLE=0.
 
 Emotion face is wrong
 -> Check Windows debug control.emotion and Terminal 3 FRDM UART TX: Speaking N.

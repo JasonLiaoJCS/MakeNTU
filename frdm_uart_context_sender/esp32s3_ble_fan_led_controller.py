@@ -280,9 +280,18 @@ def voice_text_to_ble_commands(text: str, status: Esp32Status | None, *, speed_s
     )
     hot_words = ("hot", "too warm", "好熱", "好热", "太熱", "太热", "很熱", "很热", "悶", "闷")
     cold_words = ("cold", "too cold", "好冷", "太冷", "很冷", "涼", "凉")
+    fan_speed_context_words = ("風量", "风量", "風速", "风速", "wind", "airflow")
+    audio_volume_context_words = (
+        "音量", "聲音", "声音", "喇叭", "speaker", "volume",
+        "music", "音樂", "音乐", "歌曲", "播歌", "tts",
+    )
 
     def has_any(words: Iterable[str]) -> bool:
         return any(word in lowered or word in compact or word in raw for word in words)
+
+    fan_context = is_fan or has_any(hot_words + cold_words + fan_speed_context_words)
+    if has_any(audio_volume_context_words) and not is_led and not fan_context:
+        return None
 
     if "all off" in lowered or "全部關" in raw or "全部关" in raw:
         return ["ALL_OFF"]
@@ -298,7 +307,7 @@ def voice_text_to_ble_commands(text: str, status: Esp32Status | None, *, speed_s
             commands.append("LED_TOGGLE")
 
     current_speed = int(status.speed) if status and status.speed is not None else 0
-    if is_fan or has_any(faster_words + slower_words + hot_words + cold_words):
+    if fan_context:
         floor = min_nonzero_pwm()
         if has_any(off_words):
             commands.append("FAN_OFF")
@@ -1079,6 +1088,8 @@ def run_self_test() -> None:
     expected_off_faster = ["FAN_ON", f"FAN_SPEED:{apply_min_nonzero_pwm(32)}"]
     if off_faster != expected_off_faster:
         raise AssertionError(f"fan faster from off failed: expected {expected_off_faster}, got {off_faster}")
+    if resolve_input_to_ble_commands("音樂太小聲，幫我調大音量", off_status) is not None:
+        raise AssertionError("audio volume request must not be interpreted as an ESP32 fan command")
     parsed = parse_status("TEMP:27.31,FAN:ON,SPEED:180,LED:ON")
     if parsed.temp_c != 27.31 or parsed.fan != "ON" or parsed.speed != 180 or parsed.led != "ON":
         raise AssertionError(f"status parse failed: {parsed}")

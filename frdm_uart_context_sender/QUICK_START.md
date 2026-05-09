@@ -135,7 +135,7 @@ bash frdm_uart_context_sender/auto_demo_devices.sh
 ```text
 Windows Terminal 1  -> 必須重啟，讓 emotion alias / local fallback 生效
 Jetson Terminal 2   -> 必須重啟，讓 TTS volume_gain API 生效
-Jetson Terminal 3   -> 必須重啟，讓 Speaking 0-5、音樂誤判保護、tts-volume-gain 生效
+Jetson Terminal 3   -> 必須重啟，讓 Speaking 0-5、音樂誤判保護、BLE reconnect 隔離、tts-volume-gain 生效
 Jetson Terminal 4   -> music/weather tool 若已正常可不用重啟；若點歌誤判仍怪，重啟它
 Jetson Terminal 5   -> dashboard server 若前端/API 有改，重啟它
 ```
@@ -410,8 +410,8 @@ python3 music_web_player.py \
   --port 8788 \
   --backend mpv \
   --mpv-audio-device auto \
-  --mpv-volume 125 \
-  --mpv-volume-max 200 \
+  --mpv-volume 220 \
+  --mpv-volume-max 300 \
   --mpv-ready-timeout 1.5 \
   --weather-default-location Taipei \
   --weather-timeout 4.5
@@ -419,7 +419,7 @@ python3 music_web_player.py \
 
 `mpv` 會真的播放第一個搜尋結果，並支援 pause/resume 保留播放位置；`browser` 只開搜尋頁，不保證播放，也不能可靠暫停/繼續。
 `--mpv-audio-device auto` 會優先找 `UACDemo` USB 音效輸出，避免 mpv 播了但聲音跑到 Jetson 預設音源。
-`--mpv-volume 125` 只調整音樂本身，不會影響 Piper TTS；`--mpv-volume-max 200` 讓 mpv 接受大於 100 的音量設定，避免你把音樂調高卻被 mpv 內部上限截掉。
+`--mpv-volume 220` 只調整音樂本身，不會影響 Piper TTS；`--mpv-volume-max 300` 讓 mpv 接受大於 100 的音量設定，避免你把音樂調高卻被 mpv 內部上限截掉。
 天氣走 Open-Meteo，不需要 API key。`--weather-default-location Taipei` 是「所在地、這裡、附近、here」的預設位置；如果 demo 場地在新竹，可改成 `Hsinchu`。`--weather-timeout 4.5` 會讓外部 Open-Meteo 查詢在合理時間內回覆，並搭配本機 cache 避免 dashboard/status 被天氣查詢卡住。
 
 ESP32-S3 + DS18B20 本地溫度不在 Terminal 4。現在主線是 Terminal 3 透過 BLE 訂閱 ESP32-S3 狀態 notify；同一塊 ESP32 也控制風扇和 MAX7219 LED。舊版 WiFi push 溫度仍保留給只做溫度板的情境：ESP32 和 Jetson 在同一個 LAN，ESP32 定期 POST 到 Jetson：
@@ -447,12 +447,12 @@ curl http://127.0.0.1:8788/health
 backend=mpv        -> 正式播放模式
 active=true        -> 目前有 mpv process
 paused=true        -> 音樂暫停中，可以 resume
-requested_mpv_volume=125 -> 啟動時要求的音樂音量
-requested_mpv_volume_max=200 -> 啟動時要求的 mpv 上限
-mpv_volume=125     -> 程式設定的音樂音量
-mpv_volume_max=200 -> mpv --volume-max ceiling
-mpv_actual_volume=125 -> mpv IPC 回報的實際音量，播放中才會有
-mpv_effective_volume=125 -> 播放中用實際音量，閒置時用設定音量
+requested_mpv_volume=220 -> 啟動時要求的音樂音量
+requested_mpv_volume_max=300 -> 啟動時要求的 mpv 上限
+mpv_volume=220     -> 程式設定的音樂音量
+mpv_volume_max=300 -> mpv --volume-max ceiling
+mpv_actual_volume=220 -> mpv IPC 回報的實際音量，播放中才會有
+mpv_effective_volume=220 -> 播放中用實際音量，閒置時用設定音量
 mpv_volume_clamped=false -> true 代表要求值被上限截斷
 last_query=...     -> 上一次點的歌
 title=...          -> mpv 從 YouTube/yt-dlp 取得的實際 media title
@@ -653,6 +653,8 @@ ESP32_BLE_ADAPTER=hci0 \
 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
 ```
 
+BLE 現在是可降級功能，不應該影響其他功能。Terminal 3 會把 BLE scan/connect/reconnect 放在背景 worker `esp32s3-ble-reconnect-loop`；ESP32 沒連上時，Hey Jarvis、TTS、音樂、天氣、FRDM UART、to-do、focus 和 dashboard 仍要繼續跑。只有風扇/LED/DS18B20 溫度相關功能會暫時降級。
+
 如果你要 Jetson 開機就自動啟動 Wake Bridge 並自動連 ESP32 BLE，安裝 user systemd service：
 
 ```bash
@@ -665,16 +667,16 @@ systemctl --user start makentu-wake-bridge.service
 journalctl --user -u makentu-wake-bridge.service -f
 ```
 
-之後重開機也會自動啟動。BLE 中途斷線時，程式會持續重新 scan/connect；如果整個 bridge 程式掛掉，systemd 會用 `Restart=always` 拉起來。要改 MAC、Tailscale IP 或風扇最低 PWM，編輯：
+之後重開機也會自動啟動。BLE 中途斷線時，背景 worker 會持續重新 scan/connect；如果整個 bridge 程式掛掉，systemd 會用 `Restart=always` 拉起來。要改 MAC、Tailscale IP、BLE queue 上限或風扇最低 PWM，編輯：
 
 ```bash
 nano ~/.config/makentu/wake-bridge.env
 systemctl --user restart makentu-wake-bridge.service
 ```
 
-如果 BLE 斷線時你說「開風扇 / 關風扇 / 調高風扇」，Jetson 會直接語音提醒「目前沒有連上 ESP32-S3 藍芽、正在重新連線」，並把這次指令先排進佇列；ESP32-S3 重新連上後會自動送出。如果 BLE 連線中且最新 ESP32 狀態已經是 `FAN:OFF`，你又說「關風扇」，Jetson 會直接說電風扇明明已經是關的，不會再重複送 `FAN_OFF`。
+如果 BLE 斷線時你說「開風扇 / 關風扇 / 調高風扇」，Jetson 會直接語音提醒「目前沒有連上 ESP32-S3 藍芽、正在重新連線」，並把這次指令先排進佇列；ESP32-S3 重新連上後會自動送出。佇列上限是 `ESP32_BLE_COMMAND_QUEUE_MAX` / `--esp32-ble-command-queue-max`，預設 `64`，滿了會丟掉最舊的 BLE 指令，不會讓主程式卡住。如果 BLE 連線中且最新 ESP32 狀態已經是 `FAN:OFF`，你又說「關風扇」，Jetson 會直接說電風扇明明已經是關的，不會再重複送 `FAN_OFF`。
 
-語音控制 ESP32 是本地控制，不會先丟給一般 AI route。`關風扇 / 全部關掉 / 關 LED` 會先送 BLE 指令，再用 Piper 說一小句確認，最後送 `Normal 0 0` 並退出 conversation follow-up。這些確認句強制 `head_motion=none`；Terminal 3 看到 `speaking head motion skipped: none` 是正確的，代表有講話但不轉頭，避免「沒聲音或已關閉後馬達還在動」。
+語音控制 ESP32 是本地控制，不會先丟給一般 AI route。`關風扇 / 全部關掉 / 關 LED` 會先送 BLE 指令，再用 Piper 說一小句確認，最後送 `Normal 0 0` 並退出 conversation follow-up。這些確認句強制 `head_motion=none`；Terminal 3 看到 `speaking head motion skipped: none` 是正確的，代表有講話但不轉頭，避免「沒聲音或已關閉後馬達還在動」。音量抱怨不會被當成風扇控制：`音樂太小聲，幫我調大音量` 不會走 BLE；只有包含 `風扇 / 風量 / 風速 / 好熱 / 好冷` 這類語境時才會調風扇。
 
 需要調風扇最低起轉 duty 時：
 
@@ -753,6 +755,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --esp32-ble-adapter hci0 \
   --esp32-ble-scan-duplicates \
   --esp32-ble-min-fan-pwm 96 \
+  --esp32-ble-command-queue-max 64 \
   --esp32-dashboard-host 127.0.0.1 \
   --esp32-dashboard-port 8791 \
   --fan-duplicate-suppress-sec 2.0 \
@@ -762,8 +765,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
   --music-mpv-audio-device auto \
-  --music-mpv-volume 125 \
-  --music-mpv-volume-max 200 \
+  --music-mpv-volume 220 \
+  --music-mpv-volume-max 300 \
   --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
   --music-wake-pause-timeout 0.25 \
@@ -849,7 +852,7 @@ speech end/silence <= 13000
 
 每次準備收音前都會先 beep；程式判定你講完時會再 beep 一聲，並在那一刻抓照片，跟該輪語音一起送到 Windows server。beep 預設用 `--beep-player auto`，會優先走 `paplay` / PulseAudio 的 UACDemo sink，不再用 `sounddevice` 直接開 ALSA output，避免 PortAudio 在音樂播放/暫停交界時 assertion abort。播音樂後下一次 `Hey Jarvis` 會先快速 pause 音樂、短暫等 0.05 秒，再播開始收音 beep；為了讓嗶聲快，wake 當下不再先送 `Music paused` dashboard UART。音樂被 pause 後會重設錄音 gate，避免剛剛音樂音量把 speech/silence 門檻墊太高，導致後續回應變慢。說 `byebye / 掰掰 / 拜拜 / 再見` 後會送 `Normal 0 0`；說「去睡覺吧 / 休息一下」會送 `Sleep 0 0`。兩者都會回到只聽喚醒詞的 standby；這之後你講一般話不會送 ASR/Ollama，下一次必須重新說 `Hey Jarvis`。
 
-音樂控制也會自動結束 conversation mode：播音樂或繼續播放後會送 `Music 0 0` 並回到 wake-only standby；暫停或停止會先處理 mpv，再用 Piper 說一小句確認，最後送 `Normal 0 0` 並回到 wake-only standby。這些本地控制確認不會啟動頭部馬達，避免沒有實際說話時馬達還在動。所以下次要暫停、停止或換歌，都必須先說 `Hey Jarvis`。音樂 mpv 預設音量已調成 `125`，不影響 Piper TTS 的說話音量；覺得太大或太小就用 `MUSIC_MPV_VOLUME=95 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh` 覆蓋。
+音樂控制也會自動結束 conversation mode：播音樂或繼續播放後會送 `Music 0 0` 並回到 wake-only standby；暫停或停止會先處理 mpv，再用 Piper 說一小句確認，最後送 `Normal 0 0` 並回到 wake-only standby。這些本地控制確認不會啟動頭部馬達，避免沒有實際說話時馬達還在動。所以下次要暫停、停止或換歌，都必須先說 `Hey Jarvis`。音樂 mpv 預設音量已調成 `220`、上限 `300`，不影響 Piper TTS 的說話音量；覺得太大就用 `MUSIC_MPV_VOLUME=180 MUSIC_MPV_VOLUME_MAX=300 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh` 降低，仍太小聲就用 `MUSIC_MPV_VOLUME=260 MUSIC_MPV_VOLUME_MAX=350` 提高。
 
 音樂控制的預期 log：
 
@@ -1000,7 +1003,27 @@ FAN_MIN_PWM=120 \
 ```bash
 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
 ESP32_BLE_ADAPTER=hci0 \
+ESP32_BLE_COMMAND_QUEUE_MAX=64 \
 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+BLE 斷線不再算 Wake Bridge 致命錯誤。Terminal 3 會用背景 worker `esp32s3-ble-reconnect-loop` 自己重連；沒連上時只有風扇、LED、ESP32 溫度、TempRoom 會暫時沒有新資料，Hey Jarvis、TTS、音樂、天氣、FRDM UART、to-do、focus 都要繼續正常。BLE 指令離線時會先排隊，預設最多保留 `64` 筆；滿了丟最舊的，避免長時間斷線把主程式拖垮。
+
+檢查 BLE worker 狀態：
+
+```bash
+curl http://127.0.0.1:8791/api/esp32/status
+```
+
+重要欄位：
+
+```text
+requested=true       -> 這次啟動有要求 ESP32 BLE
+enabled=true         -> bleak/helper 可用；如果 false，看 unavailable_reason
+running=true         -> 背景 reconnect worker 還活著
+connected=false      -> ESP32 目前沒連上，但其他功能可繼續
+queued_pending=0     -> 離線等待送出的 BLE 指令數
+dropped_pending=0    -> queue 滿時被丟掉的舊 BLE 指令數
 ```
 
 可以講的語音：
@@ -1013,6 +1036,15 @@ Hey Jarvis，風扇轉慢一點
 Hey Jarvis，LED on
 Hey Jarvis，LED off
 ```
+
+不會被 BLE 攔截的音量句：
+
+```text
+Hey Jarvis，音樂太小聲，幫我調大音量
+Hey Jarvis，聲音太小
+```
+
+這類句子會留給音樂/TTS/一般對話處理；要控制風扇請明確說 `風扇`、`風量`、`風速` 或 `好熱 / 好冷`。
 
 ESP32 溫度 notify 也會變成 local temperature，天氣 UART 有新鮮溫度時會補第 6 欄，例如 `254 = 25.4 C`。同一個溫度還會每 10 秒送 `TempRoom 254` 給 FRDM，讓室內溫度畫面可以持續更新；頻率用 `TEMP_ROOM_UART_INTERVAL_SEC` 或 `--temp-room-uart-interval-sec` 調整。溫度高於 `--esp32-ble-passive-threshold` 預設 25 度時，Wake Bridge 會被動提醒是否要開風扇；使用者可以再用語音或 FRDM 觸控開啟。
 
@@ -1065,6 +1097,23 @@ Weather UART sent: Weather current,20,20,0,3,254 (local=25.4 C)   # startup 也�
 TempRoom UART sent: TempRoom 254 (25.4 C, age=0.5s)               # 之後每 10 秒一次
 FRDM UART TX: Normal 0 0
 Listening for wake word 'hey_jarvis'
+```
+
+如果 ESP32 當下沒開或 BlueZ 還在重連，Terminal 3 也可以算啟動成功，只是 BLE 相關功能暫時降級。可接受的 log 範例：
+
+```text
+ESP32-S3 BLE fan/LED/temp: enabled, name=ESP32S3_FAN_LED_TEMP, address=..., voice_control=True, frdm_relay=True, min_pwm=96, passive_reminder=True (>25 C)
+BLE: scanning for ...
+WARNING: BLE connection failed: ...
+BLE: reconnecting in 3s...
+Listening for wake word 'hey_jarvis'
+```
+
+如果看到 degraded mode，代表 BLE runtime 不可用，但主流程仍會跑：
+
+```text
+WARNING: --esp32-ble requested but BLE will run in degraded mode (...). Wake, TTS, music, weather, and FRDM UART will continue.
+ESP32-S3 BLE fan/LED/temp: requested but degraded, reason=...
 ```
 
 目前馬達 UART 是絕對角度，不是相對位移：
@@ -1414,8 +1463,8 @@ python3 music_web_player.py \
   --port 8788 \
   --backend mpv \
   --mpv-audio-device auto \
-  --mpv-volume 125 \
-  --mpv-volume-max 200 \
+  --mpv-volume 220 \
+  --mpv-volume-max 300 \
   --mpv-ready-timeout 1.5 \
   --weather-default-location Taipei \
   --weather-timeout 4.5
@@ -1434,7 +1483,7 @@ export MUSIC_MPV_YTDL_COOKIES="$HOME/.config/makentu/youtube_cookies.txt"
 只想改所在地，例如 demo 在新竹：
 
 ```bash
-python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 125 --mpv-volume-max 200 --mpv-ready-timeout 1.5 --weather-default-location Hsinchu
+python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 220 --mpv-volume-max 300 --mpv-ready-timeout 1.5 --weather-default-location Hsinchu
 ```
 
 ### 1.7 Terminal 5: Smart Home Dashboard Optional
@@ -1523,6 +1572,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --esp32-ble-adapter hci0 \
   --esp32-ble-scan-duplicates \
   --esp32-ble-min-fan-pwm 96 \
+  --esp32-ble-command-queue-max 64 \
   --esp32-dashboard-host 127.0.0.1 \
   --esp32-dashboard-port 8791 \
   --fan-duplicate-suppress-sec 2.0 \
@@ -1532,8 +1582,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
   --music-mpv-audio-device auto \
-  --music-mpv-volume 125 \
-  --music-mpv-volume-max 200 \
+  --music-mpv-volume 220 \
+  --music-mpv-volume-max 300 \
   --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
   --music-wake-pause-timeout 0.25 \
@@ -2364,7 +2414,7 @@ pkill -f 'music_web_player.py'
 
 cd /home/asrlab-yian/MakeNTU/music_web_player
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 125 --mpv-volume-max 200 --mpv-ready-timeout 1.5 --weather-default-location Taipei --weather-timeout 4.5
+python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 220 --mpv-volume-max 300 --mpv-ready-timeout 1.5 --weather-default-location Taipei --weather-timeout 4.5
 ```
 
 手動測：
@@ -2469,6 +2519,45 @@ Weather UART sent: Weather current,20,20,0,3,254 (local=25.4 C)
 如果 Jetson 本機可 POST，但 ESP32 不行，檢查 ESP32 程式裡的目標 IP 必須是 Jetson 的 LAN IP，不是 `127.0.0.1`。用 `hostname -I` 看 Jetson IP。ESP32 和 Jetson 也要在同一個 WiFi/LAN，且網路不能隔離 client-to-client traffic。
 
 如果 FRDM 收到 `Weather ... ,254` 但畫面沒有本地溫度，代表 FRDM firmware 還只 parse 5 欄；要把 `WeatherGui` / `ParseWeatherPayload` 改成 5 欄和 6 欄都接受，並把第 6 欄 `local_temp_c_x10` 顯示成 `25.4 C`。
+
+### BLE 沒連上但其他功能要繼續
+
+新版預期是 BLE 連不上也不會拖住整個 demo。Terminal 3 可以一邊印 BLE reconnect，一邊繼續聽 Hey Jarvis：
+
+```text
+BLE: scanning for ...
+WARNING: BLE connection failed: ...
+BLE: reconnecting in 3s...
+Listening for wake word 'hey_jarvis'
+```
+
+先看 dashboard API 狀態：
+
+```bash
+curl http://127.0.0.1:8791/api/esp32/status
+```
+
+判斷方式：
+
+```text
+running=true, connected=false  -> 正常降級，背景 reconnect loop 還活著
+queued_pending>0               -> 有風扇/LED 指令等 BLE 重連後送出
+dropped_pending>0              -> BLE 斷太久，queue 滿了，舊 BLE 指令被丟掉
+enabled=false                  -> bleak/helper 不可用，看 unavailable_reason
+```
+
+如果 `enabled=false`，先修 Python BLE 環境；但 Wake/TTS/music/weather/FRDM UART 可以先照跑。臨時完全不接 ESP32 時，用：
+
+```bash
+ESP32_BLE=0 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+如果 `running=false` 但你確定有啟用 `--esp32-ble`，通常是 Terminal 3 還是舊 process 或啟動參數沒帶到；停乾淨再重開：
+
+```bash
+pkill -f wake_voice_chat_frdm_bridge.py
+ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A ESP32_BLE_ADAPTER=hci0 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
 
 ### ESP32 BLE 掃得到手機但 Jetson 掃不到
 
@@ -2617,8 +2706,8 @@ curl http://127.0.0.1:8788/health
 正常預設要看到：
 
 ```text
-mpv_volume=125
-mpv_volume_max=200
+mpv_volume=220
+mpv_volume_max=300
 mpv_volume_clamped=false
 ```
 
@@ -2628,7 +2717,7 @@ mpv_volume_clamped=false
 pkill -f 'music_web_player.py'
 cd /home/asrlab-yian/MakeNTU/music_web_player
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 125 --mpv-volume-max 200 --mpv-ready-timeout 1.5 --weather-default-location Taipei --weather-timeout 4.5
+python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 220 --mpv-volume-max 300 --mpv-ready-timeout 1.5 --weather-default-location Taipei --weather-timeout 4.5
 ```
 
 如果是讓 Terminal 3 自動啟動 Music Player，就重開 Terminal 3 並帶環境變數。
@@ -2636,10 +2725,12 @@ python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv 
 只想把音樂再調大，不要動 TTS：
 
 ```bash
-MUSIC_MPV_VOLUME=150 MUSIC_MPV_VOLUME_MAX=220 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+MUSIC_MPV_VOLUME=260 MUSIC_MPV_VOLUME_MAX=350 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
 ```
 
 如果 `mpv_volume_clamped=true`，代表要求值超過 `mpv_volume_max`；一起提高 `MUSIC_MPV_VOLUME_MAX`。如果 `mpv_actual_volume` 沒出現但你以為正在播歌，代表 mpv process 沒 active 或 IPC 還沒 ready，先檢查 Terminal 4 log。
+
+如果你說「音樂太小聲，幫我調大音量」時 Terminal 3 跑去印 `ESP32-S3 BLE control:`，代表還在跑舊版 Wake Bridge。新版 BLE 只會攔截有風扇語境的句子，例如 `風扇調大`、`風量調高`、`好熱幫我開風扇`；單純音量句不會進 BLE。
 
 ### 停止音樂或關風扇那輪沒聲音 / 馬達亂動
 
@@ -2795,7 +2886,7 @@ Jetson：
 [ ] ESP32-S3 已燒完整 `esp32s3_ble_fan_led_temp.ino`
 [ ] BLE scan-only 看得到 service UUID `12345678-1234-1234-1234-1234567890ab`
 [ ] Standalone BLE CLI 測過 `TEMP?`、`LED_ON/OFF`、`FAN_SPEED:255`、`FAN_OFF`
-[ ] Terminal 3 用 `ESP32_BLE_ADDRESS=<MAC>` 啟動，看到 `BLE: connected`
+[ ] Terminal 3 用 `ESP32_BLE_ADDRESS=<MAC>` 啟動；若沒連上，`/api/esp32/status` 至少要看到 `running=true`
 [ ] Terminal 3 每 10 秒看到 `TempRoom UART sent: TempRoom ...`
 [ ] FRDM 已解析 `TempRoom <攝氏x10>` 並顯示室內溫度
 [ ] FRDM `FanSpeed 16` 會送至少 `FAN_SPEED:96`，必要時調 `FAN_MIN_PWM=120`

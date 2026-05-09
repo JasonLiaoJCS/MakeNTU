@@ -2717,8 +2717,8 @@ def maybe_autostart_music_tool(args: argparse.Namespace, *, tool_url: str | None
     if backend == "mpv":
         command.extend(["--mpv-audio-device", str(getattr(args, "music_mpv_audio_device", "auto") or "auto")])
         command.extend(["--mpv-audio-keyword", str(getattr(args, "music_mpv_audio_keyword", "UACDemo") or "UACDemo")])
-        command.extend(["--mpv-volume", str(getattr(args, "music_mpv_volume", 125))])
-        command.extend(["--mpv-volume-max", str(getattr(args, "music_mpv_volume_max", 200))])
+        command.extend(["--mpv-volume", str(getattr(args, "music_mpv_volume", 220))])
+        command.extend(["--mpv-volume-max", str(getattr(args, "music_mpv_volume_max", 300))])
         command.extend(["--mpv-ready-timeout", str(getattr(args, "music_mpv_ready_timeout", 1.5))])
         cookies_path = str(getattr(args, "music_mpv_ytdl_cookies", "") or "").strip()
         if cookies_path:
@@ -3342,7 +3342,9 @@ def get_local_temperature_reading(args: argparse.Namespace) -> dict[str, Any] | 
     if getattr(args, "no_weather_local_temperature", False):
         return None
     mode = str(getattr(args, "esp32_temperature_mode", "disabled") or "disabled").strip().lower()
-    ble_temperature_enabled = bool(getattr(args, "esp32_ble", False))
+    ble_temperature_enabled = bool(getattr(args, "esp32_ble", False)) and not bool(
+        getattr(args, "_esp32_ble_runtime_unavailable", False)
+    )
     if mode not in {"push", "pull", "both"} and not ble_temperature_enabled:
         return None
     max_age_sec = max(0.0, float(getattr(args, "esp32_temperature_max_age_sec", 120.0) or 120.0))
@@ -3404,9 +3406,17 @@ class Esp32BleBridgeManager:
         self._pending_commands: list[str] = []
         self._latest_status: Any | None = None
         self._started = False
+        self._last_reconnect_notice_at = 0.0
+        self._unavailable_notice_printed = False
+        self._dropped_pending_commands = 0
 
     def is_enabled(self) -> bool:
-        return bool(getattr(self.args, "esp32_ble", False))
+        return bool(getattr(self.args, "esp32_ble", False)) and not bool(
+            getattr(self.args, "_esp32_ble_runtime_unavailable", False)
+        )
+
+    def unavailable_reason(self) -> str:
+        return str(getattr(self.args, "_esp32_ble_runtime_unavailable_reason", "") or "").strip()
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -3423,8 +3433,19 @@ class Esp32BleBridgeManager:
         with self._lock:
             return self._latest_status
 
+    def queue_stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "queued_pending": len(self._pending_commands),
+                "dropped_pending": self._dropped_pending_commands,
+            }
+
     def start(self) -> bool:
         if not self.is_enabled():
+            reason = self.unavailable_reason()
+            if bool(getattr(self.args, "esp32_ble", False)) and reason and not self._unavailable_notice_printed:
+                self._unavailable_notice_printed = True
+                print(f"WARNING: ESP32 BLE reconnect loop not started ({reason}); other bridge features continue.")
             return False
         if esp32_ble is None:
             print(f"WARNING: ESP32 BLE disabled because helper import failed: {ESP32_BLE_IMPORT_ERROR}")
@@ -3433,7 +3454,7 @@ class Esp32BleBridgeManager:
             return True
         if self._thread is not None:
             self._thread = None
-        self._thread = threading.Thread(target=self._run, name="esp32s3-ble-bridge", daemon=True)
+        self._thread = threading.Thread(target=self._run_reconnect_loop, name="esp32s3-ble-reconnect-loop", daemon=True)
         self._thread.start()
         self._started = True
         return True
@@ -3442,7 +3463,9 @@ class Esp32BleBridgeManager:
         if not self.is_enabled():
             return False
         started = self.start()
-        if started and not self.is_connected():
+        now = time.monotonic()
+        if started and not self.is_connected() and now - self._last_reconnect_notice_at >= 10.0:
+            self._last_reconnect_notice_at = now
             print("ESP32 BLE is not connected; reconnect loop is active.")
         return started
 
@@ -3502,7 +3525,18 @@ class Esp32BleBridgeManager:
             voice_speed_step=max(1, int(getattr(self.args, "esp32_ble_voice_speed_step", 32) or 32)),
         )
 
-    def _run(self) -> None:
+    def _pending_command_limit(self) -> int:
+        return max(1, int(getattr(self.args, "esp32_ble_command_queue_max", 64) or 64))
+
+    def _queue_pending_locked(self, command: str) -> bool:
+        limit = self._pending_command_limit()
+        if len(self._pending_commands) >= limit:
+            self._pending_commands.pop(0)
+            self._dropped_pending_commands += 1
+        self._pending_commands.append(command)
+        return True
+
+    def _run_reconnect_loop(self) -> None:
         if esp32_ble is None:
             return
         manager = self
@@ -3560,11 +3594,21 @@ class Esp32BleBridgeManager:
             controller = self._controller
             if loop is None or controller is None:
                 if self._started:
-                    self._pending_commands.append(command)
-                    return True
+                    return self._queue_pending_locked(command)
                 return False
         try:
-            asyncio.run_coroutine_threadsafe(controller.command_queue.put(command), loop)
+            async def put_bounded() -> None:
+                limit = self._pending_command_limit()
+                try:
+                    while controller.command_queue.qsize() >= limit:
+                        controller.command_queue.get_nowait()
+                        with self._lock:
+                            self._dropped_pending_commands += 1
+                except asyncio.QueueEmpty:
+                    pass
+                await controller.command_queue.put(command)
+
+            asyncio.run_coroutine_threadsafe(put_bounded(), loop)
             if source:
                 print(f"ESP32 BLE queued ({source}): {command}")
             return True
@@ -3646,14 +3690,25 @@ def esp32_status_payload(manager: Esp32BleBridgeManager | None) -> dict[str, Any
     if manager is None:
         return {"ok": False, "enabled": False, "running": False, "connected": False, "error": "esp32 manager unavailable"}
     status = manager.latest_status()
+    queue_stats = manager.queue_stats()
     payload: dict[str, Any] = {
         "ok": manager.is_enabled(),
+        "requested": bool(getattr(manager.args, "esp32_ble", False)),
         "enabled": manager.is_enabled(),
+        "unavailable_reason": manager.unavailable_reason(),
         "running": manager.is_running(),
         "connected": manager.is_connected(),
+        **queue_stats,
         "updated_at": "",
         "raw": "",
     }
+    if not manager.is_enabled():
+        payload["ok"] = False
+        if payload["requested"] and payload["unavailable_reason"]:
+            payload["error"] = "ESP32 BLE unavailable; reconnect loop disabled"
+        else:
+            payload["error"] = "ESP32 BLE disabled"
+        return payload
     if status is None:
         payload["ok"] = False
         payload["error"] = "no ESP32 status yet"
@@ -8648,6 +8703,8 @@ def run_self_test() -> int:
     multi_ble = esp32_ble.voice_text_to_ble_commands("幫我開燈以及開風扇", None)
     if multi_ble != ["LED_ON", "FAN_ON", f"FAN_SPEED:{esp32_ble.apply_min_nonzero_pwm(180)}"]:
         raise AssertionError(f"ESP32 BLE multi-command parsing failed: {multi_ble}")
+    if esp32_ble.voice_text_to_ble_commands("音樂太小聲，幫我調大音量", None) is not None:
+        raise AssertionError("ESP32 BLE should not intercept audio volume requests")
     off_ble_status = esp32_ble.Esp32Status(
         raw="TEMP:24.00,FAN:OFF,SPEED:0,LED:OFF",
         temp_c=24.0,
@@ -10254,6 +10311,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         )
         if (
             bool(getattr(args, "esp32_ble", False))
+            and not bool(getattr(args, "_esp32_ble_runtime_unavailable", False))
             and temperature_receiver is None
             and (not getattr(args, "no_weather_local_temperature", False) or temp_room_uart_enabled)
         ):
@@ -10328,7 +10386,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     esp32_ble_manager.start()
     temp_room_publisher = FrdmRoomTemperaturePublisher(args, robot, temperature_receiver)
     temp_room_publisher.start()
-    if not getattr(args, "no_esp32_dashboard_control", False) and esp32_ble_manager.is_enabled():
+    if not getattr(args, "no_esp32_dashboard_control", False) and bool(getattr(args, "esp32_ble", False)):
         esp32_dashboard_server = Esp32DashboardControlServer(args, esp32_ble_manager)
         esp32_dashboard_server.start()
     todo_event_listener = FrdmTodoEventListener(args, robot, todo_manager)
@@ -10465,7 +10523,13 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         f"dashboard_sync={not args.no_fan_dashboard_sync}, command={'set' if args.fan_control_command else 'not set'}"
     )
     print(f"FRDM fan touch events: {fan_desc}")
-    if getattr(args, "esp32_ble", False):
+    if getattr(args, "esp32_ble", False) and bool(getattr(args, "_esp32_ble_runtime_unavailable", False)):
+        esp32_ble_desc = (
+            "requested but degraded, "
+            f"reason={getattr(args, '_esp32_ble_runtime_unavailable_reason', 'unavailable')}; "
+            "reconnect loop disabled so other features keep running"
+        )
+    elif getattr(args, "esp32_ble", False):
         esp32_ble_desc = (
             f"enabled, name={args.esp32_ble_name}, "
             f"address={args.esp32_ble_address or 'scan-by-name'}, "
@@ -10517,7 +10581,11 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     print(f"Weather tool: {weather_desc}")
     if args.no_weather_local_temperature:
         local_temp_desc = "disabled"
-    elif getattr(args, "esp32_ble", False) and args.esp32_temperature_mode == "disabled":
+    elif (
+        getattr(args, "esp32_ble", False)
+        and not bool(getattr(args, "_esp32_ble_runtime_unavailable", False))
+        and args.esp32_temperature_mode == "disabled"
+    ):
         local_temp_desc = "BLE notify from ESP32-S3 status characteristic"
     elif args.esp32_temperature_mode == "disabled":
         local_temp_desc = "disabled"
@@ -11068,8 +11136,8 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     music_group.add_argument("--music-mpv-audio-keyword", default=os.getenv("MUSIC_MPV_AUDIO_KEYWORD", os.getenv("MPV_AUDIO_DEVICE_KEYWORD", "UACDemo")), help="Keyword for auto mpv audio device discovery.")
     music_group.add_argument("--music-mpv-ytdl-cookies", default=os.getenv("MUSIC_MPV_YTDL_COOKIES", os.getenv("MPV_YTDL_COOKIES", os.getenv("YTDLP_COOKIES", ""))), help="Optional cookies.txt passed to auto-started mpv/yt-dlp for logged-in YouTube playback.")
     music_group.add_argument("--music-mpv-ytdl-cookies-from-browser", default=os.getenv("MUSIC_MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("YTDLP_COOKIES_FROM_BROWSER", ""))), help="Optional yt-dlp browser cookie source for auto-started mpv, e.g. firefox or chrome:Profile 1.")
-    music_group.add_argument("--music-mpv-volume", type=int, default=_env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 125)), help="mpv music volume passed to auto-started sidecar.")
-    music_group.add_argument("--music-mpv-volume-max", type=int, default=_env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 200)), help="mpv --volume-max ceiling passed to auto-started sidecar.")
+    music_group.add_argument("--music-mpv-volume", type=int, default=_env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 220)), help="mpv music volume passed to auto-started sidecar.")
+    music_group.add_argument("--music-mpv-volume-max", type=int, default=_env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 300)), help="mpv --volume-max ceiling passed to auto-started sidecar.")
     music_group.add_argument("--music-mpv-ready-timeout", type=float, default=_env_float("MUSIC_MPV_READY_TIMEOUT", _env_float("MPV_READY_TIMEOUT", 1.5)), help="Seconds the music sidecar waits for mpv playback status.")
     music_group.add_argument(
         "--music-wake-pause-timeout",
@@ -11202,6 +11270,7 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     esp32_ble_group.add_argument("--esp32-ble-scan-timeout", type=float, default=_env_float("ESP32_BLE_SCAN_TIMEOUT", 8.0))
     esp32_ble_group.add_argument("--esp32-ble-connect-timeout", type=float, default=_env_float("ESP32_BLE_CONNECT_TIMEOUT", 12.0))
     esp32_ble_group.add_argument("--esp32-ble-reconnect-sec", type=float, default=_env_float("ESP32_BLE_RECONNECT_SEC", 3.0))
+    esp32_ble_group.add_argument("--esp32-ble-command-queue-max", type=int, default=_env_int("ESP32_BLE_COMMAND_QUEUE_MAX", 64), help="Maximum ESP32 BLE commands to keep queued while disconnected.")
     esp32_ble_group.add_argument("--esp32-ble-write-with-response", action="store_true", help="Force BLE writes to use write-with-response.")
     esp32_ble_group.add_argument(
         "--esp32-ble-write-response-auto",
@@ -11567,7 +11636,7 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
     if int(getattr(args, "music_mpv_volume", 100) or 0) < 0:
         print("ERROR: --music-mpv-volume must be >= 0.")
         return False
-    if int(getattr(args, "music_mpv_volume_max", 200) or 0) < 100:
+    if int(getattr(args, "music_mpv_volume_max", 300) or 0) < 100:
         print("ERROR: --music-mpv-volume-max must be >= 100.")
         return False
     if float(getattr(args, "music_mpv_ready_timeout", 0.0) or 0.0) < 0.0:
@@ -11631,15 +11700,25 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
     if float(getattr(args, "fan_command_timeout", 0.0) or 0.0) <= 0.0:
         print("ERROR: --fan-command-timeout must be > 0.")
         return False
-    if bool(getattr(args, "esp32_ble", False)) and esp32_ble is None:
-        print(f"ERROR: --esp32-ble requested but ESP32 BLE helper could not be imported: {ESP32_BLE_IMPORT_ERROR}")
-        return False
     if bool(getattr(args, "esp32_ble", False)):
-        try:
-            __import__("bleak")
-        except Exception as exc:
-            print(f"ERROR: --esp32-ble requires bleak. Install it with: python3 -m pip install bleak ({exc})")
-            return False
+        ble_unavailable_reason = ""
+        if esp32_ble is None:
+            ble_unavailable_reason = f"helper import failed: {ESP32_BLE_IMPORT_ERROR}"
+        else:
+            try:
+                __import__("bleak")
+            except Exception as exc:
+                ble_unavailable_reason = f"bleak is unavailable: {exc}"
+        if ble_unavailable_reason:
+            setattr(args, "_esp32_ble_runtime_unavailable", True)
+            setattr(args, "_esp32_ble_runtime_unavailable_reason", ble_unavailable_reason)
+            print(
+                "WARNING: --esp32-ble requested but BLE will run in degraded mode "
+                f"({ble_unavailable_reason}). Wake, TTS, music, weather, and FRDM UART will continue."
+            )
+        else:
+            setattr(args, "_esp32_ble_runtime_unavailable", False)
+            setattr(args, "_esp32_ble_runtime_unavailable_reason", "")
         if float(getattr(args, "esp32_ble_scan_timeout", 0.0) or 0.0) <= 0.0:
             print("ERROR: --esp32-ble-scan-timeout must be > 0.")
             return False
@@ -11648,6 +11727,9 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
             return False
         if float(getattr(args, "esp32_ble_reconnect_sec", 0.0) or 0.0) <= 0.0:
             print("ERROR: --esp32-ble-reconnect-sec must be > 0.")
+            return False
+        if int(getattr(args, "esp32_ble_command_queue_max", 0) or 0) <= 0:
+            print("ERROR: --esp32-ble-command-queue-max must be > 0.")
             return False
         if not 0 <= int(getattr(args, "esp32_ble_min_fan_pwm", 0) or 0) <= 255:
             print("ERROR: --esp32-ble-min-fan-pwm must be 0..255.")

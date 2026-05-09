@@ -78,8 +78,8 @@ DEFAULT_MPV_AUDIO_DEVICE = os.getenv("MPV_AUDIO_DEVICE", "auto")
 DEFAULT_MPV_AUDIO_DEVICE_KEYWORD = os.getenv("MPV_AUDIO_DEVICE_KEYWORD", "UACDemo")
 DEFAULT_MPV_YTDL_COOKIES = os.getenv("MPV_YTDL_COOKIES", os.getenv("YTDLP_COOKIES", ""))
 DEFAULT_MPV_YTDL_COOKIES_FROM_BROWSER = os.getenv("MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("YTDLP_COOKIES_FROM_BROWSER", ""))
-DEFAULT_MPV_VOLUME = _env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 125))
-DEFAULT_MPV_VOLUME_MAX = _env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 200))
+DEFAULT_MPV_VOLUME = _env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 220))
+DEFAULT_MPV_VOLUME_MAX = _env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 300))
 DEFAULT_MPV_READY_TIMEOUT_SEC = _env_float("MPV_READY_TIMEOUT_SEC", _env_float("MPV_READY_TIMEOUT", 1.5))
 
 WAKE_WORD_PATTERNS = (
@@ -1650,7 +1650,7 @@ def run_self_test() -> int:
     result = handle_text(player, "幫我放稻香", dry_run=True)
     if not result.get("ok") or result.get("query") != "稻香":
         raise AssertionError(f"dry-run play failed: {result}")
-    if player.mpv_volume != 125 or player.mpv_volume_max != 200:
+    if player.mpv_volume != 220 or player.mpv_volume_max != 300:
         raise AssertionError(f"default mpv volume changed unexpectedly: {player.mpv_volume}/{player.mpv_volume_max}")
     loud_player = MusicPlayer(backend="mpv", dry_run=True, mpv_audio_device="default", mpv_volume=250, mpv_volume_max=200)
     loud_status = loud_player.status()
