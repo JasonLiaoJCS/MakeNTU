@@ -1185,8 +1185,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 ```text
 Motor settings: pitch=65..90..115 (down..center..up), yaw=0..90..180 (right..center..left), smooth_step=120deg
 Testing head motion: nod
-head motion keyframes: MotorYawPitch:yaw=72,pitch=100 -> MotorYawPitch:yaw=108,pitch=65 -> MotorYawPitch:yaw=72,pitch=108 -> MotorYawPitch:yaw=90,pitch=90
-head motion expanded: MotorYawPitch:yaw=72,pitch=100 -> MotorYawPitch:yaw=108,pitch=65 -> MotorYawPitch:yaw=72,pitch=108 -> MotorYawPitch:yaw=90,pitch=90
+head motion keyframes: MotorYawPitch:yaw=72,pitch=100 -> MotorYawPitch:yaw=108,pitch=65 -> MotorYawPitch:yaw=90,pitch=102 -> MotorYawPitch:yaw=72,pitch=108 -> MotorYawPitch:yaw=90,pitch=80 -> MotorYawPitch:yaw=90,pitch=90
+head motion expanded: MotorYawPitch:yaw=72,pitch=100 -> MotorYawPitch:yaw=108,pitch=65 -> MotorYawPitch:yaw=90,pitch=102 -> MotorYawPitch:yaw=72,pitch=108 -> MotorYawPitch:yaw=90,pitch=80 -> MotorYawPitch:yaw=90,pitch=90
 head motion reset skipped: already centered
 FRDM UART dry-run TX: MotorYawPitch 72 100
 FRDM UART dry-run TX: MotorYawPitch 108 65
@@ -1207,15 +1207,15 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
 情緒 fallback 對應表：
 
 ```text
-neutral   -> Speaking 0 -> none
-concerned -> Speaking 1 -> concerned_tilt  # 右下 -> 左下 -> 右下小回收
+neutral   -> Speaking 0 -> gentle_nod      # 小幅右上 -> 左下 -> 中上 -> 右下
+concerned -> Speaking 1 -> concerned_tilt  # 右下 -> 左下 -> 中下 -> 右下 -> 左上
 angry     -> Speaking 2 -> firm_shake      # 右上極限 -> 左上極限 -> 右/左斜切
-sad       -> Speaking 3 -> sad_droop       # 右下 -> 左低頭 -> 右低頭
-happy     -> Speaking 4 -> happy_bounce    # 右上跳 -> 左上跳 -> 右下蓄力 -> 左上
-curious   -> Speaking 5 -> curious_peek    # 右上探看 -> 直接左上探看
-excited   -> Speaking 4 -> excited_bounce  # 大幅右上 -> 大幅左上 -> 斜向回彈
-confused  -> Speaking 5 -> confused_tilt   # 右上疑惑 -> 左下疑惑 -> 右上/左下
-sleepy    -> Speaking 3 -> sleepy_drop     # 右側下垂 -> 左側低頭 -> 右側沉下
+sad       -> Speaking 3 -> sad_droop       # 右下 -> 中間深低頭 -> 左低頭 -> 右低頭
+happy     -> Speaking 4 -> happy_bounce    # 右上跳 -> 中上 -> 左上跳 -> 右下蓄力 -> 左上
+curious   -> Speaking 5 -> curious_peek    # 右上探看 -> 中間注意 -> 左上探看
+excited   -> Speaking 4 -> excited_bounce  # 大幅右上 -> 右小停 -> 大幅左上 -> 左小停 -> 斜向回彈
+confused  -> Speaking 5 -> confused_tilt   # 右上疑惑 -> 左下疑惑 -> 中間注意 -> 右上/左下
+sleepy    -> Speaking 3 -> sleepy_drop     # 右側下垂 -> 中間低頭 -> 左側低頭 -> 右側沉下
 surprised / amazed       -> excited
 anxious / worried / 急   -> concerned
 操你媽 / 生氣 / 不爽     -> concerned

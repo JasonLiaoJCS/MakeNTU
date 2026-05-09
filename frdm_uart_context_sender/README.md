@@ -1322,7 +1322,7 @@ valid JSON                  -> use reply/control
 text around JSON            -> extract the first JSON object
 old server field uart       -> normalize into control
 reply contains JSON/control -> extract natural reply so TTS does not speak control text
-parse failure               -> natural fallback reply + neutral/none/unchanged
+parse failure               -> natural fallback reply + neutral/gentle_nod/unchanged
 ```
 
 `reply` is always for the user. `control` is always internal.
@@ -1426,7 +1426,7 @@ sleepy    -> Speaking 3
 Emotion-to-motion fallback:
 
 ```text
-neutral   -> none
+neutral   -> gentle_nod
 concerned -> concerned_tilt
 angry     -> firm_shake
 sad       -> sad_droop
@@ -1590,6 +1590,8 @@ void MotorControlYaw(char *pValue)
 
 Motion tables are high-level held poses. The current strategy is not dense micro-stepping; it is a small number of clear `MotorYawPitch` targets with longer pauses at expressive poses. This makes the head look like it is intentionally looking, nodding, or reacting instead of constantly vibrating. The bridge still supports interpolation if you lower `--motor-smooth-step-deg`, but the demo default is large pose-to-pose movement. The bridge also safety-checks `MotorYawPitch` ACK lines such as `Motor YawPitch = yaw:120 pitch:90`; if FRDM reports out-of-range values, motor commands are locked out until the bridge restarts.
 
+The latest motion table is slightly more expressive: neutral replies now use a small `gentle_nod`, and emotion motions include extra diagonal keyframes so the robot does not only pitch up/down. Local tool confirmations such as music stop/pause and ESP32 fan/LED commands still force `head_motion=none`, so they speak without moving the head.
+
 Current keyframes:
 
 ```text
@@ -1597,47 +1599,46 @@ none:
   MotorYawPitch 90 90
 
 nod:
-  MotorYawPitch 90 90 -> MotorYawPitch 90 65
-  -> MotorYawPitch 90 108 -> MotorYawPitch 90 90
+  right/up -> left/down -> center/up -> right/up -> center/down -> center
 
 double_nod:
-  center -> strong down -> center -> smaller down -> center
+  right/up -> left/down -> center/up -> right/up -> left/down -> center/up -> center
 
 look_around:
-  center -> right prep -> right limit -> center/up -> left prep -> left limit -> center
+  right prep -> right limit -> right/up settle -> left prep -> left limit -> left/up settle -> center
 
 shake:
-  center -> right limit -> center -> left limit -> center
+  right -> left -> right/down -> left/up -> center
 
 gentle_nod:
-  center -> small down -> center
+  right/up -> left/down -> center/up -> right/down -> center
 
 sleepy_drop:
-  center -> diagonal droop -> held down/right -> center
+  right/drowsy -> center/down -> left/down -> held right/down -> left/drowsy -> center
 
 happy_bounce:
-  center -> strong up -> soft down -> up -> center
+  right/up -> center/up -> left/up -> right/down -> left/up -> center/up -> center
 
 excited_bounce:
-  center -> right/up -> center -> left/up -> up -> center
+  big right/up -> right attentive -> big left/up -> left attentive -> right/down -> left/up -> center/up -> center
 
 curious_peek:
-  center -> right prep -> right/up look -> center/up -> left prep -> left/up look -> center
+  right prep -> right/up look -> right/up settle -> center attentive -> left prep -> left/up look -> left/up settle -> center
 
 concerned_tilt:
-  center -> right/down tilt -> down-center hold -> center
+  right/down -> left/down -> center/down -> right/down -> left attentive -> center
 
 sad_droop:
-  center -> right/down -> deeper down/right hold -> center
+  right/down -> center/deep down -> left/deep down -> right/deep down -> left/down -> center
 
 confused_tilt:
-  center -> right/up tilt -> center -> left/down tilt -> center
+  right/up -> left/down -> center attentive -> right/up -> left/down -> right/down -> center
 
 firm_shake:
-  center -> right/up limit -> center -> left/up limit -> center
+  right/up limit -> left/up limit -> right/center -> left/down -> right/up -> left/center -> center
 ```
 
-Emotion fallback uses the expressive versions by default: `happy_bounce`, `excited_bounce`, `curious_peek`, `concerned_tilt`, `sad_droop`, `confused_tilt`, and `firm_shake`. The older generic motions remain available for explicit commands like "點頭" or "搖頭".
+Emotion fallback uses the expressive versions by default: `gentle_nod`, `happy_bounce`, `excited_bounce`, `curious_peek`, `concerned_tilt`, `sad_droop`, `confused_tilt`, and `firm_shake`. The older generic motions remain available for explicit commands like "點頭" or "搖頭".
 
 In live dialogue, TTS starts a speaking motion loop. While TTS is playing, the loop repeats short motions. When TTS finishes, the stop event centers the head and exits, then the bridge sends the next screen mode.
 
