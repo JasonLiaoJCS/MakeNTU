@@ -32,7 +32,16 @@ python3 smart_home_dashboard/server.py \
 GET /api/status
 ```
 
-回傳 time / devices / sensors / todo / focus today / music / weather / system health。
+回傳 time / devices / sensors / todo / focus today / music / weather / local ESP32 temperature / wake monitor / system health。
+
+Live tab 會用這份資料顯示：
+
+```text
+Local Temperature -> ESP32-S3 BLE notify 或舊版 /temperature push/pull
+LED Light         -> device id living_light
+Fan Speed         -> device id desk_fan
+Wake Monitor      -> frdm_uart_context_sender/logs/wake_status.json
+```
 
 ### AI Trace
 
@@ -121,11 +130,62 @@ POST /api/devices/{device_id}/set
 {"state":"on","value":80}
 ```
 
-目前是 Jetson local device registry，可讓前端 demo 電燈、風扇、冷氣狀態。若啟用 `--frdm-uart-port`，會額外送：
+目前是 Jetson local device registry，可讓前端 demo 電燈、風扇、冷氣狀態。`living_light` 和 `desk_fan` 也會被轉送到 Wake Bridge 的 ESP32-S3 BLE control API：
+
+```text
+http://127.0.0.1:8791/api/esp32/control
+```
+
+因此網站 Live tab 的 LED 開關和風扇拉條會走：
+
+```text
+網站 -> Dashboard :8789 -> Wake Bridge :8791 -> ESP32-S3 BLE -> LED / fan
+```
+
+如果 Wake Bridge 沒開、沒有 `--esp32-ble`、或 BLE 還沒連上，Dashboard 仍會保存本機狀態，但 toast 會顯示 BLE 未送達。
+
+若啟用 `--frdm-uart-port`，會額外送：
 
 ```text
 Device device_id,state,value
 ```
+
+### ESP32-S3 Appliance Status
+
+Dashboard 預設會從 Wake Bridge 讀：
+
+```http
+GET  http://127.0.0.1:8791/api/esp32/status
+POST http://127.0.0.1:8791/api/esp32/control
+```
+
+Wake Bridge 需要用 ESP32 BLE 模式啟動，`run_wake_bridge_full_demo.sh` 已經會帶入主線設定。控制 payload 例：
+
+```json
+{"device_id":"living_light","type":"light","state":"on","value":100}
+```
+
+```json
+{"device_id":"desk_fan","type":"fan","state":"on","value":65}
+```
+
+Wake Bridge 會轉成 BLE command：
+
+```text
+LED_ON / LED_OFF
+FAN_ON + FAN_SPEED:<0..255>
+FAN_OFF
+```
+
+### Wake Monitor
+
+Dashboard 會讀 Wake Bridge 寫出的 live status：
+
+```text
+frdm_uart_context_sender/logs/wake_status.json
+```
+
+內容包含目前是否仍在監聽、volume、recent peak、wake score、wake threshold、noise floor、phase。網站的 System Health 已把原本 `TTS` 指示改成 `Wake Listen`，代表「目前 wake bridge 監聽迴圈是否正常更新」，不是 TTS server 是否活著。
 
 ### Sensors
 
@@ -265,6 +325,7 @@ smart_home_dashboard/data/          # devices/events local state
 smart_home_dashboard/data/sensors.json
 frdm_uart_context_sender/logs/todo_list.json
 frdm_uart_context_sender/logs/ai_trace.jsonl
+frdm_uart_context_sender/logs/wake_status.json
 ```
 
-`todo_list.json` 和 wake bridge/focus mode 共用，所以語音新增待辦、FRDM checkbox、手機網站完成待辦會看到同一份資料。
+`todo_list.json` 和 wake bridge/focus mode 共用，所以語音新增待辦、FRDM checkbox、手機網站完成待辦會看到同一份資料。`wake_status.json` 由 Wake Bridge 每 1 秒左右更新，Dashboard 用它判斷監聽功能是否正常、顯示 volume 和喚醒詞分數。

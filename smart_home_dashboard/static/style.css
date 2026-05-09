@@ -514,6 +514,107 @@ button {
   font-weight: 600;
 }
 
+.appliance-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.appliance-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.appliance-fan-card {
+  display: block;
+}
+
+.appliance-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.appliance-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  display: grid;
+  place-items: center;
+  font-size: 20px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.appliance-icon.temp {
+  background: var(--info-soft);
+  color: var(--info);
+}
+
+.appliance-icon.light {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.appliance-icon.fan {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.appliance-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.appliance-label {
+  font-size: 11px;
+  color: var(--text-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 500;
+}
+
+.appliance-value {
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.1;
+  margin-top: 4px;
+}
+
+.appliance-unit {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-left: 2px;
+  font-weight: 500;
+}
+
+.appliance-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.wake-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.wake-card .stat-value.ok {
+  color: var(--ok);
+}
+
+.wake-card .stat-value.danger {
+  color: var(--danger);
+}
+
 .health-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
@@ -1337,11 +1438,19 @@ button {
     flex-direction: column;
     align-items: flex-start;
   }
+
+  .wake-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (min-width: 640px) {
   .focus-stats {
     grid-template-columns: repeat(4, 1fr);
+  }
+
+  .appliance-grid {
+    grid-template-columns: repeat(3, 1fr);
   }
 
   .health-grid {

@@ -36,7 +36,11 @@ DEFAULT_MUSIC_HEALTH_URL = os.getenv("MUSIC_TOOL_HEALTH_URL", "http://127.0.0.1:
 DEFAULT_TTS_HEALTH_URL = os.getenv("TTS_HEALTH_URL", "http://127.0.0.1:8777/health")
 DEFAULT_AI_HEALTH_URL = os.getenv("AI_SERVER_HEALTH_URL", "http://100.108.141.26:8766/health")
 DEFAULT_AI_DEBUG_LOG = os.getenv("AI_DEBUG_LOG", str(PROJECT_ROOT / "frdm_uart_context_sender" / "logs" / "ai_trace.jsonl"))
+DEFAULT_WAKE_STATUS_PATH = os.getenv("WAKE_STATUS_PATH", str(PROJECT_ROOT / "frdm_uart_context_sender" / "logs" / "wake_status.json"))
 DEFAULT_WEATHER_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "Taipei")
+DEFAULT_LOCAL_TEMPERATURE_URL = os.getenv("LOCAL_TEMPERATURE_URL", "http://127.0.0.1:8790/temperature")
+DEFAULT_ESP32_STATUS_URL = os.getenv("ESP32_STATUS_URL", "http://127.0.0.1:8791/api/esp32/status")
+DEFAULT_ESP32_CONTROL_URL = os.getenv("ESP32_CONTROL_URL", "http://127.0.0.1:8791/api/esp32/control")
 DEFAULT_FRDM_POWER_CYCLE_MODE = os.getenv("DASHBOARD_FRDM_POWER_CYCLE_MODE", "usb-host")
 DEFAULT_FRDM_USB_CONTROLLER = os.getenv("DASHBOARD_FRDM_USB_CONTROLLER", "3610000.usb")
 UART_PREFERRED_KEYWORDS = ("frdm", "mcu", "cmsis", "dap", "nxp", "j-link", "linkserver", "mbed")
@@ -289,7 +293,7 @@ def default_devices() -> dict[str, Any]:
         "devices": [
             {
                 "id": "living_light",
-                "name": "Living Room Light",
+                "name": "LED Light",
                 "type": "light",
                 "room": "living_room",
                 "state": "off",
@@ -328,13 +332,13 @@ def default_sensors() -> dict[str, Any]:
         "sensors": [
             {
                 "id": "home_temperature",
-                "name": "Home Temperature",
+                "name": "Local Temperature",
                 "type": "temperature",
-                "room": "living_room",
+                "room": "desk",
                 "value": None,
                 "unit": "C",
                 "online": False,
-                "source": "frdm",
+                "source": "esp32",
             },
             {
                 "id": "home_humidity",
@@ -674,6 +678,96 @@ def public_music(data: dict[str, Any]) -> dict[str, Any]:
         "active": active,
         "paused": paused,
         "health": data,
+    }
+
+
+def numeric_value(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def pwm_to_percent(value: Any) -> int:
+    pwm = numeric_value(value)
+    if pwm is None:
+        return 0
+    return max(0, min(100, int(round(pwm * 100.0 / 255.0))))
+
+
+def upsert_sensor_view(sensors: dict[str, Any], sensor: dict[str, Any]) -> dict[str, Any]:
+    data = normalize_sensors(sensors)
+    sensor_id = clean_text(sensor.get("id"), 48)
+    replaced = False
+    for index, item in enumerate(data["sensors"]):
+        if isinstance(item, dict) and item.get("id") == sensor_id:
+            data["sensors"][index] = {**item, **sensor}
+            replaced = True
+            break
+    if not replaced:
+        data["sensors"].append(sensor)
+    data["updated_at"] = now_iso()
+    return normalize_sensors(data)
+
+
+def upsert_device_view(devices: dict[str, Any], device: dict[str, Any]) -> dict[str, Any]:
+    data = normalize_devices(devices)
+    device_id = clean_text(device.get("id"), 48)
+    replaced = False
+    for index, item in enumerate(data["devices"]):
+        if isinstance(item, dict) and item.get("id") == device_id:
+            data["devices"][index] = {**item, **device}
+            replaced = True
+            break
+    if not replaced:
+        data["devices"].append(device)
+    data["updated_at"] = now_iso()
+    return normalize_devices(data)
+
+
+def public_local_temperature(data: dict[str, Any]) -> dict[str, Any]:
+    temp = numeric_value(data.get("temperature_c"))
+    if temp is None:
+        temp = numeric_value(data.get("temp_c"))
+    return {
+        "ok": bool(data.get("ok") is True and temp is not None),
+        "temperature_c": temp,
+        "unit": "C",
+        "source": data.get("source") or "esp32",
+        "age_sec": data.get("age_sec"),
+        "updated_at": data.get("updated_at") or data.get("received_at_iso") or now_iso(),
+        "raw": data,
+    }
+
+
+def public_wake_status(path: Path) -> dict[str, Any]:
+    raw = read_json(path, {})
+    if not isinstance(raw, dict) or not raw:
+        return {"ok": False, "listening": False, "error": "wake status unavailable", "path": str(path)}
+    updated_at = parse_iso_datetime(raw.get("updated_at"))
+    age_sec = None
+    if updated_at is not None:
+        age_sec = max(0.0, (now_local() - updated_at).total_seconds())
+    stale = age_sec is None or age_sec > 12.0
+    phase = clean_text(raw.get("phase") or raw.get("state") or "", 48)
+    listening = bool(raw.get("listening", False)) and not stale
+    return {
+        "ok": listening,
+        "listening": listening,
+        "stale": stale,
+        "phase": phase or ("stale" if stale else "unknown"),
+        "volume": raw.get("volume"),
+        "recent_peak": raw.get("recent_peak"),
+        "wake_score": raw.get("wake_score"),
+        "wake_threshold": raw.get("wake_threshold"),
+        "wake_volume_threshold": raw.get("wake_volume_threshold"),
+        "noise_floor": raw.get("noise_floor"),
+        "updated_at": raw.get("updated_at"),
+        "age_sec": age_sec,
+        "path": str(path),
+        "raw": raw,
     }
 
 
@@ -1414,6 +1508,10 @@ class DashboardState:
         self.tts_health_url = args.tts_health_url
         self.ai_health_url = args.ai_health_url
         self.ai_debug_log = args.ai_debug_log
+        self.wake_status_path = Path(args.wake_status_path).expanduser()
+        self.local_temperature_url = args.local_temperature_url
+        self.esp32_status_url = args.esp32_status_url
+        self.esp32_control_url = args.esp32_control_url
         self.camera_id = args.camera_id
         self.camera_width = args.camera_width
         self.camera_height = args.camera_height
@@ -1440,12 +1538,93 @@ class DashboardState:
         if not self.events_path.exists():
             atomic_write_json(self.events_path, {"version": 1, "events": []})
 
+    def sync_esp32_device(self, device: dict[str, Any]) -> dict[str, Any]:
+        if not self.esp32_control_url:
+            return {"ok": False, "skipped": True, "reason": "esp32 control url not configured"}
+        device_type = clean_text(device.get("type"), 40).lower()
+        device_id = clean_text(device.get("id"), 48)
+        if device_type not in {"fan", "light"} and device_id not in {"desk_fan", "living_light"}:
+            return {"ok": False, "skipped": True, "reason": "device is not an ESP32 appliance"}
+        payload = {
+            "device_id": device_id,
+            "type": device_type,
+            "state": clean_text(device.get("state"), 24).lower(),
+            "value": device.get("value"),
+            "source": "dashboard",
+        }
+        return safe_post_json(self.esp32_control_url, payload, timeout_sec=2.5)
+
     def status_payload(self) -> dict[str, Any]:
         todo = read_todo(self.todo_path)
         todo_view = todo_public(todo)
         todo_view["path"] = str(self.todo_path)
         devices = read_devices(self.devices_path)
         sensors = read_sensors(self.sensors_path)
+        local_temperature = public_local_temperature(safe_get_json(self.local_temperature_url, timeout_sec=0.5))
+        esp32_status = safe_get_json(self.esp32_status_url, timeout_sec=0.5) if self.esp32_status_url else {"ok": False}
+        esp32_temperature = numeric_value(esp32_status.get("temperature_c"))
+        if esp32_temperature is None:
+            esp32_temperature = numeric_value(esp32_status.get("temp_c"))
+        if not local_temperature.get("ok") and esp32_status.get("ok") and esp32_temperature is not None:
+            local_temperature = {
+                "ok": True,
+                "temperature_c": esp32_temperature,
+                "unit": "C",
+                "source": "esp32-ble-status",
+                "age_sec": None,
+                "updated_at": esp32_status.get("updated_at") or now_iso(),
+                "raw": esp32_status,
+            }
+        if local_temperature.get("ok"):
+            sensors = upsert_sensor_view(
+                sensors,
+                {
+                    "id": "home_temperature",
+                    "name": "Local Temperature",
+                    "type": "temperature",
+                    "room": "desk",
+                    "value": local_temperature.get("temperature_c"),
+                    "unit": "C",
+                    "online": True,
+                    "source": local_temperature.get("source") or "esp32",
+                    "updated_at": local_temperature.get("updated_at") or now_iso(),
+                },
+            )
+        if esp32_status.get("ok"):
+            fan_state = str(esp32_status.get("fan") or "").strip().lower()
+            fan_percent = pwm_to_percent(esp32_status.get("speed"))
+            if fan_state == "on" and fan_percent <= 0:
+                fan_percent = 1
+            devices = upsert_device_view(
+                devices,
+                {
+                    "id": "desk_fan",
+                    "name": "Desk Fan",
+                    "type": "fan",
+                    "room": "desk",
+                    "state": "on" if fan_state == "on" and fan_percent > 0 else "off",
+                    "value": fan_percent,
+                    "unit": "%",
+                    "online": True,
+                    "updated_at": esp32_status.get("updated_at") or now_iso(),
+                },
+            )
+            led_state = str(esp32_status.get("led") or "").strip().lower()
+            if led_state in {"on", "off"}:
+                devices = upsert_device_view(
+                    devices,
+                    {
+                        "id": "living_light",
+                        "name": "LED Light",
+                        "type": "light",
+                        "room": "desk",
+                        "state": led_state,
+                        "value": 100 if led_state == "on" else 0,
+                        "unit": "%",
+                        "online": True,
+                        "updated_at": esp32_status.get("updated_at") or now_iso(),
+                    },
+                )
         focus = load_focus_summaries(self.focus_roots, range_name="today")
         music_health = safe_get_json(self.music_health_url, timeout_sec=0.8)
         weather_current = safe_post_json(
@@ -1456,9 +1635,11 @@ class DashboardState:
         weather_view = public_weather(weather_current, default_location=self.weather_default_location)
         tts_health = safe_get_json(self.tts_health_url, timeout_sec=0.8)
         ai_health = safe_get_json(self.ai_health_url, timeout_sec=0.9)
+        wake_status = public_wake_status(self.wake_status_path)
         camera_ok = camera_available(self.camera_id)
         ai_ok = bool(ai_health.get("chat_ready") is True or ai_health.get("ok") is True)
         tts_ok = bool(tts_health.get("ready") is True or tts_health.get("ok") is True)
+        wake_ok = bool(wake_status.get("ok"))
         music_ok = bool(music_health.get("ok") is True)
         weather_ok = bool(weather_view.get("ok") is True or music_health.get("weather_available") is True)
         frdm_status = self.frdm.status()
@@ -1482,6 +1663,9 @@ class DashboardState:
             "device_state": devices,
             "sensors": sensors.get("sensors", []),
             "sensor_state": sensors,
+            "local_temperature": local_temperature,
+            "esp32": esp32_status,
+            "wake": wake_status,
             "todo": todo_view,
             "focus": {"today": aggregate_focus(focus), "recent": focus[:8]},
             "music": public_music(music_health),
@@ -1490,13 +1674,14 @@ class DashboardState:
                 "ai": ai_ok,
                 "ai_server": ai_ok,
                 "tts": tts_ok,
+                "wake": wake_ok,
                 "music": music_ok,
                 "weather": weather_ok,
                 "camera": camera_ok,
                 "frdm_panel": frdm_seen,
                 "frdm_uart": frdm_status,
                 "frdm_power": self.frdm_power.status(),
-                "details": {"ai": ai_health, "tts": tts_health, "music": music_health, "weather": weather_current},
+                "details": {"ai": ai_health, "tts": tts_health, "wake": wake_status, "music": music_health, "weather": weather_current},
             },
         }
 
@@ -1649,9 +1834,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             result = set_device(self.state.devices_path, device_id, data)
             if result.get("ok"):
+                esp32_control = self.state.sync_esp32_device(result["device"])
+                result["esp32_control"] = esp32_control
                 sync = self.state.frdm.sync_device(result["device"], reason="dashboard device set")
                 result["frdm_sync"] = sync
-                append_event(self.state.events_path, {"type": "device_set", "device": result.get("device"), "frdm_sync": sync})
+                append_event(
+                    self.state.events_path,
+                    {
+                        "type": "device_set",
+                        "device": result.get("device"),
+                        "frdm_sync": sync,
+                        "esp32_control": esp32_control,
+                    },
+                )
             json_response(self, 200 if result.get("ok") else 404, result)
             return
         if path.startswith("/api/sensors/") and path.endswith("/update"):
@@ -1825,6 +2020,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tts-health-url", default=DEFAULT_TTS_HEALTH_URL)
     parser.add_argument("--ai-health-url", default=DEFAULT_AI_HEALTH_URL)
     parser.add_argument("--ai-debug-log", default=DEFAULT_AI_DEBUG_LOG, help="Optional local fast_chat_debug.jsonl path for AI trace history.")
+    parser.add_argument("--wake-status-path", default=DEFAULT_WAKE_STATUS_PATH)
+    parser.add_argument("--local-temperature-url", default=DEFAULT_LOCAL_TEMPERATURE_URL)
+    parser.add_argument("--esp32-status-url", default=DEFAULT_ESP32_STATUS_URL)
+    parser.add_argument("--esp32-control-url", default=DEFAULT_ESP32_CONTROL_URL)
     parser.add_argument("--camera-id", default=os.getenv("DASHBOARD_CAMERA_ID", "auto"))
     parser.add_argument("--camera-width", type=int, default=int(os.getenv("DASHBOARD_CAMERA_WIDTH", "640")))
     parser.add_argument("--camera-height", type=int, default=int(os.getenv("DASHBOARD_CAMERA_HEIGHT", "360")))

@@ -35,7 +35,8 @@ tts volume            : --tts-volume-gain 4.8, server accepts volume_gain 0.05..
 beep volume           : --beep-volume 0.35
 USB output volume     : PulseAudio UACDemo ~70%, ALSA PCM 70%
 music/weather         : local tool server on 127.0.0.1:8788, mpv + Open-Meteo
-local temperature     : optional ESP32-S3 + DS18B20 over LAN, merged into Weather UART as a 6th field
+ESP32-S3 BLE          : fan + MAX7219 LED + DS18B20 status over BLE, ESP32S3_FAN_LED_TEMP
+local temperature     : preferred from ESP32-S3 BLE notify, legacy HTTP push/pull still supported
 to-do list            : local JSON voice tool, frdm_uart_context_sender/logs/todo_list.json
 focus work mode       : voice-triggered start/stop, periodic /focus-check, JSONL log + Markdown report
 pet idle reflection   : every ~30s ask /text-chat an internal self-question; most checks stay silent, occasional worthy shares use TTS
@@ -71,7 +72,7 @@ Music/weather intent changed                  -> restart Jetson Terminal 4
 Bridge process starts
 -> FRDM startup waits 2 seconds
 -> Jetson sends Time <payload> over UART
--> Jetson calls local /weather for daily and current data, merges latest ESP32 local temperature if available, and sends both Weather payloads over UART
+-> Jetson calls local /weather for daily and current data, merges latest ESP32 BLE/DS18B20 local temperature if available, and sends both Weather payloads over UART
 -> Normal 0 0
 -> while idle, every ~30 seconds Jetson may ask the model an internal pet-reflection question
 -> if the model answers PET_IDLE_SILENCE, nothing is spoken
@@ -99,7 +100,7 @@ Focus work mode is a side mode. When the transcript is a work-mode command, the 
 
 Pet idle reflection is intentionally blocked while focus work mode is running. The bridge may still do silent internal checks during normal standby, but it will not start a spontaneous TTS line during focus mode. Disable this behavior with `--no-pet-idle-reflection` or `PET_IDLE_REFLECTION=0`; tune it with `--pet-idle-interval-sec`, `--pet-idle-share-cooldown-sec`, and `--pet-idle-debug`.
 
-This bridge does not use Gemini, OpenAI, or cloud LLM APIs. ASR and Ollama run locally on the Windows desktop. Wake word, camera, TTS, UART, music/weather routing, ESP32 local-temperature receiving, to-do list, and focus orchestration run locally on the Jetson. Weather uses the local tool server and Open-Meteo; music uses local `mpv`/`yt-dlp`.
+This bridge does not use Gemini, OpenAI, or cloud LLM APIs. ASR and Ollama run locally on the Windows desktop. Wake word, camera, TTS, UART, music/weather routing, ESP32 BLE fan/LED/temp bridging, to-do list, and focus orchestration run locally on the Jetson. Weather uses the local tool server and Open-Meteo; music uses local `mpv`/`yt-dlp`.
 
 ## FRDM State Machine
 
@@ -192,6 +193,35 @@ Weather kind,low_or_temp,high_or_temp,rain_percent,open_meteo_weather_code,local
 
 The optional 6th field is the ESP32/DS18B20 local temperature in Celsius multiplied by 10. For example, `254` means `25.4 C`, and `-42` means `-4.2 C`. The field is omitted when no recent ESP32 temperature is available, so older FRDM firmware that only parses 5 fields can keep running while the temperature path is being tested.
 
+`TempRoom` is the direct periodic room-temperature payload for FRDM widgets. It is sent independently of weather queries whenever a fresh ESP32 BLE temperature notify is available:
+
+```text
+TempRoom 254
+```
+
+Payload format is also Celsius multiplied by 10. The default live bridge sends it every `--temp-room-uart-interval-sec 10` seconds and skips stale readings older than `--temp-room-uart-max-age-sec 30`.
+
+FRDM parser contract:
+
+```text
+wire line      : TempRoom <signed_celsius_x10>
+example        : TempRoom 254
+meaning        : 25.4 C
+valid range    : -550..1250, matching the DS18B20 range -55.0..125.0 C
+frequency      : Wake Bridge throttles to one line every 10 seconds by default
+screen effect  : update the room-temperature widget only; do not switch pages/screens
+```
+
+Recommended FRDM-side state:
+
+```c
+static int g_room_temp_c_x10 = 0;
+static bool g_room_temp_valid = false;
+static uint32_t g_room_temp_updated_ms = 0;
+```
+
+When parsing `TempRoom 254`, store `g_room_temp_c_x10 = 254`, set `g_room_temp_valid = true`, and render `25.4 C`. If no `TempRoom` has arrived yet, show `--.- C` or keep the previous value.
+
 Dashboard data commands update swipe-page widgets and do not switch screens by themselves. `Todo x,y` means `x=open/unfinished count` and `y=done/completed count`.
 
 ```text
@@ -238,6 +268,7 @@ Files
 Standard Startup
 Music Routing And Playback
 Weather Routing
+ESP32-S3 BLE Fan LED Temperature
 To-Do List
 Focus Work Mode
 Windows Server
@@ -262,10 +293,13 @@ run_wake_bridge_full_demo.sh      # recommended Terminal 3 launcher with auto de
 auto_demo_devices.sh              # waits for UACDemo speaker/mic, FRDM UART, and camera
 set_uacdemo_volume.sh             # normalizes UACDemo PulseAudio/ALSA volume
 focus_work_mode.py               # focus work mode subprocess, started/stopped by the Wake Bridge
+esp32s3_ble_fan_led_controller.py # standalone BLE CLI + helper used by Wake Bridge
 voice_chat_frdm_uart_bridge.py   # manual Enter-to-record version
 frdm_uart_context_sender.py      # standalone FRDM UART command sender
 recover_demo_usb.sh              # Jetson USB host controller recovery
 QUICK_START.md                   # on-site operating guide
+examples/esp32s3_ble_fan_led_temp/          # full ESP32-S3 Arduino BLE + fan + LED + temp sketch
+examples/esp32s3_ble_advertise_minimal/     # minimal BLE advertisement/connectivity sketch
 ```
 
 Windows server files:
@@ -290,7 +324,21 @@ bash frdm_uart_context_sender/auto_demo_devices.sh
 `run_wake_bridge_full_demo.sh` exports the auto/keyword device settings, normalizes UACDemo volume, then launches the bridge. Override only when needed:
 
 ```bash
-MAKE_NTU_TTS_VOLUME_GAIN=3.6 BEEP_VOLUME=0.25 MUSIC_MPV_VOLUME=60 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+MAKE_NTU_TTS_VOLUME_GAIN=3.6 BEEP_VOLUME=0.25 MUSIC_MPV_VOLUME=125 MUSIC_MPV_VOLUME_MAX=200 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+`MUSIC_MPV_VOLUME` controls only mpv music playback. The default launcher now uses `125` so music is louder without changing Piper TTS speech volume.
+
+For the ESP32-S3 BLE board, prefer pinning the MAC discovered by scan-only:
+
+```bash
+ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A ESP32_BLE_ADAPTER=hci0 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+If the fan reports `FAN=ON` but stalls at low slider values, raise the minimum nonzero PWM:
+
+```bash
+FAN_MIN_PWM=120 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
 ```
 
 Do not hand-type the last few parameters in manual mode; the common mistake is accidentally typing `--uart-debug\terval 0.75`. The correct tail is:
@@ -350,7 +398,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
   --music-backend mpv \
   --music-mpv-audio-device auto \
-  --music-mpv-volume 70 \
+  --music-mpv-volume 125 \
+  --music-mpv-volume-max 200 \
   --music-mpv-ready-timeout 1.5 \
   --music-timeout 5 \
   --music-wake-pause-timeout 0.25 \
@@ -364,6 +413,8 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --esp32-temperature-host 0.0.0.0 \
   --esp32-temperature-port 8790 \
   --esp32-temperature-path /temperature \
+  --temp-room-uart-interval-sec 10 \
+  --temp-room-uart-max-age-sec 30 \
   --motor-step-delay 0.55 \
   --motor-smooth-step-deg 120 \
   --motor-speaking-step-delay 0.72 \
@@ -508,9 +559,21 @@ Music is playing
 -> detect_music_intent(transcript)
 -> no music intent: do nothing with Music Player; music stays paused until the user says resume
 -> play/change/resume music: TTS speaks confirmation first, then POST play/query or resume
--> pause/stop music: POST pause/stop before TTS
+-> pause/stop music: POST pause/stop before TTS, then speak a short local confirmation
 -> bridge returns to standby and keeps listening for Hey Jarvis
 ```
+
+Music control timing is intentionally asymmetric:
+
+```text
+play/change  -> TTS first, then start mpv, then FRDM Music 0 0, wake-only standby
+resume       -> TTS first, then resume mpv from IPC pause position, FRDM Music 0 0, wake-only standby
+pause        -> pause mpv first, speak "好，我先暫停音樂。", FRDM Normal 0 0, wake-only standby
+stop         -> stop mpv first, speak "好，我把音樂關掉了。", FRDM Normal 0 0, wake-only standby
+stop no mpv  -> speak "音樂現在沒有在播放。", FRDM Normal 0 0, wake-only standby
+```
+
+The pause/stop confirmations are local control replies. They still use Piper TTS, but force `head_motion=none`; the Wake Bridge also clears any stale speaking-motion thread before speaking them. This prevents the failure mode where music was stopped successfully but the robot made no sound while the head motor kept moving.
 
 Example phrases:
 
@@ -530,13 +593,25 @@ For the live demo, keep Terminal 4 running:
 ```bash
 cd /home/asrlab-yian/MakeNTU/music_web_player
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --weather-default-location Taipei
+python3 music_web_player.py \
+  --server \
+  --host 127.0.0.1 \
+  --port 8788 \
+  --backend mpv \
+  --mpv-audio-device auto \
+  --mpv-volume 125 \
+  --mpv-volume-max 200 \
+  --mpv-ready-timeout 1.5 \
+  --weather-default-location Taipei
 ```
 
 Important options:
 
 ```text
 --music-backend mpv              # real playback; auto also prefers mpv
+--music-mpv-audio-device auto    # prefer the UACDemo USB speaker for mpv
+--music-mpv-volume 125           # mpv music volume only; does not change Piper TTS
+--music-mpv-volume-max 200       # mpv --volume-max ceiling, needed for values above 100
 --music-timeout 5                # play/change request timeout
 --music-wake-pause-timeout 0.6   # short timeout for immediate pause on wake
 --music-debug                    # print Music routing / Music tool logs
@@ -547,6 +622,16 @@ Important options:
 
 The `mpv` backend streams the first `ytsearch1:<query>` result; it does not save music into the repository. `pause` and `resume` use the mpv IPC socket, so playback position is preserved. `browser` backend only opens a search page and cannot reliably pause/resume.
 
+Music volume is separate from Piper TTS volume:
+
+```text
+Piper TTS speech volume -> Terminal 3 --tts-volume-gain / Jetson TTS DEFAULT_VOLUME_GAIN
+mpv music volume        -> Terminal 4 --mpv-volume, or Terminal 3 --music-mpv-volume when autostarting
+launcher override       -> MUSIC_MPV_VOLUME=95 MUSIC_MPV_VOLUME_MAX=200 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+If the music itself is quiet but TTS is fine, adjust `MUSIC_MPV_VOLUME` / `--music-mpv-volume`, not `--tts-volume-gain`. Values above 100 require `MUSIC_MPV_VOLUME_MAX` / `--music-mpv-volume-max`; otherwise mpv may clamp the request.
+
 Health fields from `curl http://127.0.0.1:8788/health`:
 
 ```text
@@ -555,6 +640,13 @@ mpv_available            : Jetson can find mpv
 yt_dlp_available         : Jetson can find yt-dlp or youtube-dl
 active                   : mpv process is active
 paused                   : current pause state
+requested_mpv_volume     : requested music volume before clamping
+requested_mpv_volume_max : requested mpv --volume-max before clamping
+mpv_volume               : configured mpv music volume
+mpv_volume_max           : configured mpv --volume-max ceiling
+mpv_actual_volume        : live volume read back from mpv IPC while active
+mpv_effective_volume     : actual volume when active, configured fallback when idle
+mpv_volume_clamped       : requested volume was capped to a safe mpv range
 last_query               : latest query
 ipc_path                 : mpv IPC socket; pause/resume depends on it
 weather_available        : /weather endpoint loaded
@@ -633,10 +725,13 @@ Wake Bridge options:
 ESP32 local-temperature merge:
 
 ```text
-DS18B20 -> ESP32-S3 GPIO4 -> WiFi LAN -> Jetson Terminal 3 -> Weather UART -> FRDM
+preferred : DS18B20 GPIO7 -> ESP32-S3 BLE notify -> Jetson Terminal 3 -> Weather UART -> FRDM
+legacy    : DS18B20 -> ESP32 HTTP POST/pull -> Jetson Terminal 3 -> Weather UART -> FRDM
 ```
 
 Startup weather sends two payloads: one whole-day payload from "今天天氣如何" and one current payload from "現在天氣如何". Explicit whole-day questions such as "明天天氣如何" still produce `Weather daily,...`; current/location weather questions produce `Weather current,...`.
+
+If `--esp32-ble` is enabled and BLE status notify is fresh, the `TEMP` field from `TEMP:27.31,FAN:ON,SPEED:180,LED:ON` is used as the local temperature. The older HTTP push/pull path below remains available for temperature-only boards.
 
 Recommended live mode is `push`. Terminal 3 opens an HTTP receiver on the Jetson, and the ESP32 periodically POSTs its current DS18B20 reading:
 
@@ -684,6 +779,232 @@ Open-Meteo unreachable  -> TTS says the local weather tool or source was unavail
 ESP32 temp unavailable  -> Weather UART keeps the old 5-field payload
 intent not matched      -> no weather call; normal desktop AI reply continues
 ```
+
+## ESP32-S3 BLE Fan LED Temperature
+
+The current preferred ESP32 path is BLE, not the older WiFi temperature-only path. One ESP32-S3 peripheral exposes fan control, MAX7219 LED control, and DS18B20 temperature status:
+
+```text
+BLE device name      : ESP32S3_FAN_LED_TEMP
+Service UUID         : 12345678-1234-1234-1234-1234567890ab
+Command char UUID    : 12345678-1234-1234-1234-1234567890ac
+Status char UUID     : 12345678-1234-1234-1234-1234567890ad
+Status notify format : TEMP:27.31,FAN:ON,SPEED:180,LED:ON
+```
+
+ESP32 hardware sketch:
+
+```text
+full sketch    : examples/esp32s3_ble_fan_led_temp/esp32s3_ble_fan_led_temp.ino
+BLE-only test  : examples/esp32s3_ble_advertise_minimal/esp32s3_ble_advertise_minimal.ino
+
+L9110S fan     : INA=GPIO5 PWM, INB=GPIO6 LOW, VCC=5V, GND common
+MAX7219 8x8    : DIN=GPIO11, CS=GPIO10, CLK=GPIO12
+DS18B20        : DATA=GPIO7, VCC=3.3V, GND common, 4.7k pull-up to 3.3V
+```
+
+Jetson standalone BLE CLI:
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+source emotion_robot_controller/.venv/bin/activate
+
+python3 frdm_uart_context_sender/esp32s3_ble_fan_led_controller.py \
+  --address 78:E3:6D:18:94:6A \
+  --adapter hci0 \
+  --scan-duplicates \
+  --no-tts-reminder
+```
+
+CLI commands:
+
+```text
+TEMP?
+LED_ON
+LED_OFF
+FAN_ON
+FAN_OFF
+FAN_SPEED:180
+PERCENT:50      # FRDM/manual percent -> FAN_SPEED:128
+FanSpeed 16     # FRDM slider percent -> FAN_SPEED:96 by default
+voice fan faster
+voice led off
+```
+
+The percent conversion intentionally has a nonzero floor. Small DC fans often do not start at very low PWM duty, so values such as `FanSpeed 16` no longer send `41`; they send at least `FAN_MIN_PWM`, default `96`.
+
+```text
+0%      -> FAN_OFF
+1..37%  -> FAN_SPEED:96 by default
+50%     -> FAN_SPEED:128
+75%     -> FAN_SPEED:191
+100%    -> FAN_SPEED:255
+```
+
+Tune the floor if the motor still stalls:
+
+```bash
+FAN_MIN_PWM=120 python3 frdm_uart_context_sender/esp32s3_ble_fan_led_controller.py \
+  --address 78:E3:6D:18:94:6A \
+  --adapter hci0 \
+  --scan-duplicates \
+  --no-tts-reminder
+```
+
+Wake Bridge integration:
+
+```bash
+ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
+ESP32_BLE_ADAPTER=hci0 \
+FAN_MIN_PWM=96 \
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
+
+When `--esp32-ble` is enabled, Wake Bridge also exposes a local Dashboard control API:
+
+```text
+GET  http://127.0.0.1:8791/api/esp32/status
+POST http://127.0.0.1:8791/api/esp32/control
+```
+
+The Smart Home Dashboard uses this path for the Live tab appliance controls:
+
+```text
+LED Light toggle -> LED_ON / LED_OFF
+Fan Speed slider -> FAN_ON + FAN_SPEED:<0..255>, or FAN_OFF at 0%
+Local Temperature -> TEMP from BLE status notify
+```
+
+FRDM also receives the same BLE temperature as a direct periodic UART line:
+
+```text
+ESP32 notify TEMP:25.43,... -> TempRoom 254 every 10 seconds
+```
+
+Tune with `TEMP_ROOM_UART_INTERVAL_SEC` / `--temp-room-uart-interval-sec`; disable with `--no-temp-room-uart`.
+
+Two runtime paths can send `TempRoom`:
+
+```text
+normal demo path : wake_voice_chat_frdm_bridge.py owns FRDM UART and sends TempRoom from BLE notify
+standalone path  : esp32s3_ble_fan_led_controller.py --frdm-uart-port auto sends TempRoom while testing BLE only
+```
+
+Standalone BLE-to-FRDM test:
+
+```bash
+python3 frdm_uart_context_sender/esp32s3_ble_fan_led_controller.py \
+  --address 78:E3:6D:18:94:6A \
+  --adapter hci0 \
+  --scan-duplicates \
+  --frdm-uart-port auto \
+  --frdm-temp-room-interval-sec 10 \
+  --no-tts-reminder
+```
+
+Use the standalone path only when the full Wake Bridge is stopped; otherwise both processes will compete for the same FRDM UART.
+
+Expected log:
+
+```text
+[12:00:01] ESP32 status: TEMP=25.43 C, FAN=OFF, SPEED=0, LED=OFF
+FRDM UART TX: TempRoom 254
+```
+
+Wake Bridge also writes live listening health for the Dashboard:
+
+```text
+frdm_uart_context_sender/logs/wake_status.json
+```
+
+That file contains the current listening phase, volume, recent peak, wake score, threshold, and noise floor. The Dashboard System Health label is `Wake Listen`, not `TTS`, so it reflects whether the microphone/wake loop is still updating.
+
+Boot auto-start:
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+./frdm_uart_context_sender/install_wake_bridge_service.sh \
+  --address 78:E3:6D:18:94:6A \
+  --adapter hci0
+
+systemctl --user start makentu-wake-bridge.service
+journalctl --user -u makentu-wake-bridge.service -f
+```
+
+The service loads `~/.config/makentu/wake-bridge.env`, enables user linger, and restarts the full Wake Bridge if the process exits. The BLE controller inside the bridge also reconnects after ESP32/BlueZ disconnects, so normal short BLE drops do not require manual restart. Edit the env file when the ESP32 MAC, Tailscale URL, or `FAN_MIN_PWM` changes:
+
+```bash
+nano ~/.config/makentu/wake-bridge.env
+systemctl --user restart makentu-wake-bridge.service
+```
+
+When voice fan/LED control is requested while BLE is disconnected, the Jetson reply explicitly says the ESP32-S3 Bluetooth link is not connected and that it is reconnecting. The command is queued, then sent automatically after the BLE bridge reconnects. If BLE is connected and the latest ESP32 status is already `FAN:OFF`, asking to turn the fan off gets a spoken already-off reply and skips the redundant `FAN_OFF` write.
+
+Voice appliance control is handled before the general AI route, like a local tool:
+
+```text
+voice "關風扇" with BLE connected        -> send FAN_OFF, speak confirmation, head_motion=none
+voice "關風扇" and ESP32 already FAN:OFF -> no duplicate BLE write, speak already-off reply
+voice "全部關掉" / ALL_OFF               -> send ALL_OFF, speak confirmation, head_motion=none
+voice command while BLE disconnected     -> queue command, speak reconnecting/queued explanation
+after local ESP32 control in conversation mode -> FRDM Normal 0 0, wake-only standby
+```
+
+The `head_motion=none` guarantee matters here too: closing a fan or LED should never start a speaking head-motion loop. If TTS cannot start, the bridge clears active speaking motion and returns the face/motor to idle instead of continuing to move silently.
+
+Wake Bridge behavior:
+
+```text
+ESP32 status notify      -> updates latest local temperature for Weather UART
+ESP32 status notify      -> sends TempRoom <Celsius*10> to FRDM every 10 seconds
+FRDM FanSpeed 0..100     -> FAN_OFF or FAN_SPEED 0..255 with min PWM floor
+voice "開風扇 / 關風扇" -> BLE fan commands handled locally before general AI route
+voice "轉快 / 轉慢"     -> relative fan speed commands
+voice "LED on/off"      -> LED_ON / LED_OFF
+TEMP > threshold         -> optional passive TTS reminder, user can answer by voice or FRDM
+BLE connected + FAN:OFF -> voice "關風扇" gets a spoken already-off reply, no duplicate FAN_OFF write
+connected FAN_OFF/ALL_OFF -> spoken confirmation, no head motion, return to wake-only standby in conversation mode
+```
+
+The full ESP32 sketch also protects the hardware side: `FAN_ON` uses a default speed, nonzero speeds are clamped to `FAN_MIN_RUNNING_SPEED=96`, and a short `255` PWM start kick helps the fan overcome static friction. If `FAN_SPEED:255` still does not move the motor, debug wiring/power before changing software.
+
+BLE scan and BlueZ notes:
+
+```bash
+python3 frdm_uart_context_sender/esp32s3_ble_fan_led_controller.py \
+  --scan-only \
+  --scan-target-only \
+  --adapter hci0 \
+  --scan-duplicates \
+  --scan-timeout 30
+```
+
+Expected target line may be unnamed but still valid:
+
+```text
+* 78:E3:6D:18:94:6A    (unnamed) rssi=-95 uuids=12345678-1234-1234-1234-1234567890ab
+```
+
+Use `--address <MAC>` when the name is missing or unstable. If BlueZ says the device address was not found, scan first with duplicates, then connect by the seen address. If the phone is connected to the ESP32 peripheral, disconnect it before Jetson connects.
+
+BLE recovery commands:
+
+```bash
+pkill -f esp32s3_ble_fan_led_controller.py || true
+pkill -f bluetoothctl || true
+sudo systemctl restart bluetooth
+sleep 3
+sudo rfkill unblock bluetooth
+bluetoothctl show
+```
+
+Dashboard warning note:
+
+```text
+WARNING: fan dashboard sync failed: <urlopen error [Errno 111] Connection refused>
+```
+
+This only means the optional `smart_home_dashboard/server.py` API on port `8789` is not running. It does not block BLE fan control. Start Terminal 5 or add `--no-fan-dashboard-sync` when dashboard sync is not needed.
 
 ## To-Do List
 
@@ -1493,17 +1814,37 @@ Flow:
 
 ```text
 POST /speak_async -> get job_id
+keep FRDM on Thinking while text exists but audio has not started
+poll /queue and /health
+when /health audio.playing=true -> send Speaking <emotion> and start speaking head motion
 poll /queue until job_id appears in last_result
-if queue status unavailable -> estimate by reply length
-send next FRDM screen after TTS finished or estimated finished
+stop speaking head motion and send the next FRDM screen only after TTS playback finishes
 ```
+
+The default is intentionally strict: `Speaking` is not sent from text readiness, queue position, or elapsed time alone. The cue starts only after the TTS server reports `audio.playing=true`, which means the audio player process is active for the UACDemo speaker. If a TTS job finishes before `audio.playing` is observed, the bridge does not flash `Speaking`; it moves to the post-reply screen after the job completes.
+
+Local control replies use the same playback cue, but some of them deliberately set `head_motion=none`:
+
+```text
+music pause/stop confirmation -> Speaking <emotion>, no head motor, then Normal 0 0
+ESP32 FAN_OFF/ALL_OFF reply   -> Speaking <emotion>, no head motor, then Normal 0 0
+TTS never starts              -> cue cleanup stops any previous speaking-motion thread
+low-RMS skipped turn          -> force motion idle and center the head
+conversation end without TTS  -> force motion idle and center the head
+```
+
+This keeps screen, TTS, and motor state aligned even when the user stops music, turns the fan off, or the TTS service fails mid-turn.
 
 Timeout and polling options:
 
 ```bash
 --tts-playback-timeout 45
 --tts-poll-interval 0.75
+--tts-start-poll-interval 0.12
+--tts-speaking-require-audio
 ```
+
+For emergency compatibility with an older TTS server that does not expose `audio.playing`, use `--no-tts-speaking-require-audio`. That restores the older fallback where `Speaking` may start after the TTS job becomes current for `--tts-speaking-start-timeout` seconds.
 
 TTS `.env` recommendation:
 
@@ -1730,8 +2071,29 @@ TTS is audible but too quiet
 -> Use --tts-volume-gain 4.8 first. If still too quiet, try 6.0 and restart Wake Bridge.
 -> If /speak_async with volume_gain returns 422, Terminal 2 is still the old TTS server; restart it.
 
+Music is audible but too quiet
+-> This is mpv volume, not Piper TTS. Check curl http://127.0.0.1:8788/health.
+-> Expected defaults are mpv_volume=125, mpv_volume_max=200, mpv_volume_clamped=false.
+-> Raise only music with MUSIC_MPV_VOLUME=150 MUSIC_MPV_VOLUME_MAX=220 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh.
+-> If mpv_actual_volume is missing while music should be playing, mpv is not active or IPC is not ready.
+
 Music starts when the user is complaining about audio volume
 -> Restart Terminal 4 and Terminal 3. Latest routing treats phrases about no sound / low sound / volume as audio complaints, not song requests.
+
+Music stop / fan off succeeds but there is no spoken reply, or the head moves silently
+-> Restart Terminal 3 so the local-control confirmation path is active.
+-> For music stop/pause, Terminal 3 should print "Music stop/pause handled before TTS; local confirmation will be spoken."
+-> For ESP32 fan/LED control, Terminal 3 should print "ESP32-S3 BLE control:" followed by head_motion none.
+-> During the local confirmation, logs may show "speaking head motion skipped: none"; that is correct.
+-> Run python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --self-test to verify the regression guards.
+
+FRDM room temperature does not update
+-> Terminal 3 should show "BLE: connected. Subscribing status notify..." and recurring "ESP32 status: TEMP=...".
+-> Terminal 3 should show "FRDM room temperature UART: TempRoom every 10s" at startup.
+-> When a fresh reading exists, Terminal 3 should print "TempRoom UART sent: TempRoom 254 (... C)" every 10 seconds.
+-> If Weather local temperature works but TempRoom does not, check --no-temp-room-uart and --temp-room-uart-interval-sec.
+-> If Terminal 3 prints "WARNING: refusing unknown UART raw line 'TempRoom ...'", an old bridge is running; restart Terminal 3.
+-> If Terminal 3 sends TempRoom but FRDM shows nothing, add a FRDM parser for single-argument "TempRoom <Celsius*10>".
 
 Emotion face is wrong
 -> Check Windows debug control.emotion and Terminal 3 FRDM UART TX: Speaking N.
@@ -1741,6 +2103,29 @@ Emotion face is wrong
 
 Music pause/resume does not work
 -> Ensure Terminal 4 music_web_player.py --backend mpv is running. Check active/paused from /health. Browser backend cannot reliably pause/resume.
+
+ESP32 BLE scan cannot find the name
+-> Scan by service UUID and allow duplicates:
+   python3 frdm_uart_context_sender/esp32s3_ble_fan_led_controller.py --scan-only --scan-target-only --adapter hci0 --scan-duplicates --scan-timeout 30
+-> The ESP32 may appear as "(unnamed)" while still advertising the correct service UUID. Use --address with that MAC.
+-> If a phone BLE app is connected, disconnect it before Jetson connects.
+
+BlueZ says Device with address ... was not found
+-> BlueZ cache is stale or the adapter did not create a device object yet. Run scan-only first, then connect by the MAC seen in that scan.
+-> If bluetoothctl reports Busy, kill old scanner processes and restart bluetooth:
+   pkill -f esp32s3_ble_fan_led_controller.py || true
+   pkill -f bluetoothctl || true
+   sudo systemctl restart bluetooth
+   sleep 3
+   sudo rfkill unblock bluetooth
+
+ESP32 status says FAN=ON but physical fan does not spin
+-> First send FAN_SPEED:255. If it still does not spin, check L9110S VCC=5V, common GND, INA=GPIO5, INB=GPIO6, and motor output wiring.
+-> If FAN_SPEED:255 works but low FRDM slider values do not, increase FAN_MIN_PWM, for example FAN_MIN_PWM=120.
+-> The ESP32 full sketch also applies FAN_MIN_RUNNING_SPEED=96 and a 250ms start kick; reflash the full sketch after changes.
+
+fan dashboard sync failed: Connection refused
+-> Optional dashboard server on port 8789 is not running. Start Terminal 5 or add --no-fan-dashboard-sync. BLE control is unaffected.
 
 vision_intent=True but used_vision=False
 -> Check image_received / image_size_bytes / vision_error.
@@ -1771,8 +2156,13 @@ Jetson:
 [ ] lsusb shows UACDemo / Global Shutter Camera / MCU-LINK
 [ ] Music Web Player /health ok=true
 [ ] Music backend is mpv; pause/resume tested
-[ ] ESP32-S3 and Jetson are on the same LAN if local temperature is enabled
-[ ] ESP32 POST or pull URL returns {"ok":true,"temperature_c":...}
+[ ] ESP32-S3 BLE scan sees service UUID 12345678-1234-1234-1234-1234567890ab
+[ ] ESP32 standalone BLE CLI can run TEMP?, LED_ON/OFF, FAN_SPEED:255, FAN_OFF
+[ ] ESP32 full sketch is flashed, not only the minimal advertise sketch
+[ ] Terminal 3 shows TempRoom UART sent every 10 seconds after BLE TEMP notify
+[ ] FRDM parser handles TempRoom <Celsius*10> and displays room temperature
+[ ] FRDM FanSpeed 16 relays to at least FAN_SPEED:96 or configured FAN_MIN_PWM
+[ ] Optional legacy ESP32 HTTP POST/pull returns {"ok":true,"temperature_c":...} if that path is used
 [ ] wake bridge self-test OK
 [ ] focus_work_mode.py self-test OK
 [ ] focus mock session writes focus_log.jsonl / focus_summary.json / focus_report.md

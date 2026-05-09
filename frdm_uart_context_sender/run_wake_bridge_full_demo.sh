@@ -9,11 +9,23 @@ FOCUS_SERVER_URL="${FOCUS_SERVER_URL:-http://100.108.141.26:8766/focus-check}"
 DEVICE_READY_TIMEOUT="${DEVICE_READY_TIMEOUT:-30}"
 TTS_VOLUME_GAIN="${MAKE_NTU_TTS_VOLUME_GAIN:-4.8}"
 MUSIC_MPV_AUDIO_DEVICE="${MUSIC_MPV_AUDIO_DEVICE:-auto}"
-MUSIC_MPV_VOLUME="${MUSIC_MPV_VOLUME:-70}"
+MUSIC_MPV_VOLUME="${MUSIC_MPV_VOLUME:-125}"
+MUSIC_MPV_VOLUME_MAX="${MUSIC_MPV_VOLUME_MAX:-200}"
 MUSIC_MPV_READY_TIMEOUT="${MUSIC_MPV_READY_TIMEOUT:-1.5}"
 BEEP_VOLUME="${BEEP_VOLUME:-0.35}"
 STARTUP_WEATHER_TEXT="${STARTUP_WEATHER_TEXT:-今天天氣如何}"
 STARTUP_WEATHER_CURRENT_TEXT="${STARTUP_WEATHER_CURRENT_TEXT:-現在天氣如何}"
+ESP32_BLE="${ESP32_BLE:-1}"
+ESP32_BLE_NAME="${ESP32_BLE_NAME:-ESP32S3_FAN_LED_TEMP}"
+ESP32_BLE_ADDRESS="${ESP32_BLE_ADDRESS:-}"
+ESP32_BLE_ADAPTER="${ESP32_BLE_ADAPTER:-${BLE_ADAPTER:-}}"
+ESP32_BLE_MIN_FAN_PWM="${ESP32_BLE_MIN_FAN_PWM:-${FAN_MIN_PWM:-96}}"
+ESP32_BLE_SCAN_DUPLICATES="${ESP32_BLE_SCAN_DUPLICATES:-1}"
+ESP32_DASHBOARD_HOST="${ESP32_DASHBOARD_HOST:-127.0.0.1}"
+ESP32_DASHBOARD_PORT="${ESP32_DASHBOARD_PORT:-8791}"
+TEMP_ROOM_UART_INTERVAL_SEC="${TEMP_ROOM_UART_INTERVAL_SEC:-10}"
+TEMP_ROOM_UART_MAX_AGE_SEC="${TEMP_ROOM_UART_MAX_AGE_SEC:-30}"
+WAKE_STATUS_PATH="${WAKE_STATUS_PATH:-$ROOT_DIR/frdm_uart_context_sender/logs/wake_status.json}"
 export UACDEMO_PCM_VOLUME="${MAKE_NTU_UACDEMO_PCM_VOLUME:-70%}"
 export UACDEMO_PULSE_VOLUME="${MAKE_NTU_UACDEMO_PULSE_VOLUME:-70%}"
 export DEFAULT_VOLUME_GAIN="$TTS_VOLUME_GAIN"
@@ -81,13 +93,15 @@ cmd=(
   --focus-alert-threshold 1
   --focus-alert-cooldown-sec 90
   --fan-device-id desk_fan
-  --fan-speed-max 3
+  --fan-speed-max 100
   --fan-duplicate-suppress-sec 2.0
   --todo-list-path "$ROOT_DIR/frdm_uart_context_sender/logs/todo_list.json"
+  --wake-status-path "$WAKE_STATUS_PATH"
   --focus-notify-mode discord
   --music-backend mpv
   --music-mpv-audio-device "$MUSIC_MPV_AUDIO_DEVICE"
   --music-mpv-volume "$MUSIC_MPV_VOLUME"
+  --music-mpv-volume-max "$MUSIC_MPV_VOLUME_MAX"
   --music-mpv-ready-timeout "$MUSIC_MPV_READY_TIMEOUT"
   --music-timeout 5
   --music-wake-pause-timeout 0.25
@@ -104,6 +118,8 @@ cmd=(
   --esp32-temperature-host 0.0.0.0
   --esp32-temperature-port 8790
   --esp32-temperature-path /temperature
+  --temp-room-uart-interval-sec "$TEMP_ROOM_UART_INTERVAL_SEC"
+  --temp-room-uart-max-age-sec "$TEMP_ROOM_UART_MAX_AGE_SEC"
   --motor-step-delay 0.55
   --motor-smooth-step-deg 120
   --motor-speaking-step-delay 0.72
@@ -116,9 +132,31 @@ cmd=(
   --tts-poll-interval 0.75
   --tts-start-poll-interval 0.12
   --tts-speaking-start-timeout 1.2
+  --tts-speaking-require-audio
   --tts-debug
   --uart-debug
 )
+
+case "${ESP32_BLE,,}" in
+  1|true|yes|on)
+    cmd+=(--esp32-ble --esp32-ble-name "$ESP32_BLE_NAME")
+    cmd+=(--esp32-dashboard-host "$ESP32_DASHBOARD_HOST" --esp32-dashboard-port "$ESP32_DASHBOARD_PORT")
+    if [[ -n "$ESP32_BLE_ADDRESS" ]]; then
+      cmd+=(--esp32-ble-address "$ESP32_BLE_ADDRESS")
+    fi
+    if [[ -n "$ESP32_BLE_ADAPTER" ]]; then
+      cmd+=(--esp32-ble-adapter "$ESP32_BLE_ADAPTER")
+    fi
+    if [[ -n "$ESP32_BLE_MIN_FAN_PWM" ]]; then
+      cmd+=(--esp32-ble-min-fan-pwm "$ESP32_BLE_MIN_FAN_PWM")
+    fi
+    case "${ESP32_BLE_SCAN_DUPLICATES,,}" in
+      1|true|yes|on)
+        cmd+=(--esp32-ble-scan-duplicates)
+        ;;
+    esac
+    ;;
+esac
 
 if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
   cmd+=(--focus-discord-webhook-url "$DISCORD_WEBHOOK_URL")

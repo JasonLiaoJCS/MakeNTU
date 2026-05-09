@@ -27,6 +27,7 @@ import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 try:
     from zoneinfo import ZoneInfo
@@ -77,7 +78,8 @@ DEFAULT_MPV_AUDIO_DEVICE = os.getenv("MPV_AUDIO_DEVICE", "auto")
 DEFAULT_MPV_AUDIO_DEVICE_KEYWORD = os.getenv("MPV_AUDIO_DEVICE_KEYWORD", "UACDemo")
 DEFAULT_MPV_YTDL_COOKIES = os.getenv("MPV_YTDL_COOKIES", os.getenv("YTDLP_COOKIES", ""))
 DEFAULT_MPV_YTDL_COOKIES_FROM_BROWSER = os.getenv("MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("YTDLP_COOKIES_FROM_BROWSER", ""))
-DEFAULT_MPV_VOLUME = _env_int("MPV_VOLUME", 100)
+DEFAULT_MPV_VOLUME = _env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 125))
+DEFAULT_MPV_VOLUME_MAX = _env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 200))
 DEFAULT_MPV_READY_TIMEOUT_SEC = _env_float("MPV_READY_TIMEOUT_SEC", _env_float("MPV_READY_TIMEOUT", 1.5))
 
 WAKE_WORD_PATTERNS = (
@@ -950,6 +952,7 @@ class MusicPlayer:
         mpv_ytdl_cookies: str = DEFAULT_MPV_YTDL_COOKIES,
         mpv_ytdl_cookies_from_browser: str = DEFAULT_MPV_YTDL_COOKIES_FROM_BROWSER,
         mpv_volume: int = DEFAULT_MPV_VOLUME,
+        mpv_volume_max: int = DEFAULT_MPV_VOLUME_MAX,
         mpv_ready_timeout: float = DEFAULT_MPV_READY_TIMEOUT_SEC,
     ) -> None:
         self.backend = backend
@@ -959,7 +962,10 @@ class MusicPlayer:
         self.mpv_audio_device = resolve_mpv_audio_device(self.requested_mpv_audio_device, keyword=self.mpv_audio_keyword)
         self.mpv_ytdl_cookies = str(mpv_ytdl_cookies or "").strip()
         self.mpv_ytdl_cookies_from_browser = str(mpv_ytdl_cookies_from_browser or "").strip()
-        self.mpv_volume = max(0, min(150, int(mpv_volume)))
+        self.requested_mpv_volume = int(mpv_volume)
+        self.requested_mpv_volume_max = int(mpv_volume_max)
+        self.mpv_volume_max = max(100, min(1000, self.requested_mpv_volume_max))
+        self.mpv_volume = max(0, min(self.mpv_volume_max, self.requested_mpv_volume))
         self.mpv_ready_timeout = max(0.0, float(mpv_ready_timeout))
         self._lock = threading.RLock()
         self._process: subprocess.Popen[Any] | None = None
@@ -1139,7 +1145,13 @@ class MusicPlayer:
                 "mpv_ytdl_cookies": self.mpv_ytdl_cookies,
                 "mpv_ytdl_cookies_configured": bool(self.mpv_ytdl_cookies),
                 "mpv_ytdl_cookies_from_browser": self.mpv_ytdl_cookies_from_browser,
+                "requested_mpv_volume": self.requested_mpv_volume,
+                "requested_mpv_volume_max": self.requested_mpv_volume_max,
                 "mpv_volume": self.mpv_volume,
+                "mpv_volume_max": self.mpv_volume_max,
+                "mpv_volume_clamped": self.mpv_volume != self.requested_mpv_volume or self.mpv_volume_max != self.requested_mpv_volume_max,
+                "mpv_actual_volume": playback.get("volume") if active else None,
+                "mpv_effective_volume": playback.get("volume") if active and playback.get("volume") is not None else self.mpv_volume,
                 "playback_ready": bool(playback.get("audio_out") or playback.get("title")) if active else False,
                 "audio_out": playback.get("audio_out") if active else None,
                 "audio_params": playback.get("audio_params") if active else None,
@@ -1297,6 +1309,7 @@ class MusicPlayer:
         ]
         if audio_device:
             command.append(f"--audio-device={audio_device}")
+        command.append(f"--volume-max={self.mpv_volume_max}")
         command.append(f"--volume={self.mpv_volume}")
         if cookies_path:
             command.extend(
@@ -1340,6 +1353,9 @@ class MusicPlayer:
                 "cookies_configured": bool(cookies_path),
                 "cookies_from_browser": "" if cookies_path else cookies_from_browser,
                 "volume": self.mpv_volume,
+                "volume_max": self.mpv_volume_max,
+                "volume_clamped": self.mpv_volume != self.requested_mpv_volume or self.mpv_volume_max != self.requested_mpv_volume_max,
+                "actual_volume": playback.get("volume") if ipc_ready else None,
                 "ipc_path": ipc_path,
                 "ipc_ready": ipc_ready,
                 "playback_ready": playback.get("playback_ready") if ipc_ready else False,
@@ -1451,7 +1467,13 @@ def make_handler(
                         "mpv_ytdl_cookies": status.get("mpv_ytdl_cookies"),
                         "mpv_ytdl_cookies_configured": status.get("mpv_ytdl_cookies_configured"),
                         "mpv_ytdl_cookies_from_browser": status.get("mpv_ytdl_cookies_from_browser"),
+                        "requested_mpv_volume": status.get("requested_mpv_volume"),
+                        "requested_mpv_volume_max": status.get("requested_mpv_volume_max"),
                         "mpv_volume": status.get("mpv_volume"),
+                        "mpv_volume_max": status.get("mpv_volume_max"),
+                        "mpv_volume_clamped": status.get("mpv_volume_clamped"),
+                        "mpv_actual_volume": status.get("mpv_actual_volume"),
+                        "mpv_effective_volume": status.get("mpv_effective_volume"),
                         "playback_ready": status.get("playback_ready"),
                         "audio_out": status.get("audio_out"),
                         "audio_params": status.get("audio_params"),
@@ -1548,6 +1570,7 @@ def run_server(args: argparse.Namespace) -> int:
         mpv_ytdl_cookies=args.mpv_ytdl_cookies,
         mpv_ytdl_cookies_from_browser=args.mpv_ytdl_cookies_from_browser,
         mpv_volume=args.mpv_volume,
+        mpv_volume_max=args.mpv_volume_max,
         mpv_ready_timeout=args.mpv_ready_timeout,
     )
     try:
@@ -1586,7 +1609,7 @@ def run_server(args: argparse.Namespace) -> int:
     print(f"  dry_run : {args.dry_run}")
     if args.backend == "mpv":
         print(f"  mpv out : {player.mpv_audio_device or 'system-default'}")
-        print(f"  mpv vol : {player.mpv_volume}")
+        print(f"  mpv vol : {player.mpv_volume} (max {player.mpv_volume_max})")
         if player.mpv_ytdl_cookies:
             print(f"  cookies : {Path(player.mpv_ytdl_cookies).expanduser()}")
         elif player.mpv_ytdl_cookies_from_browser:
@@ -1627,6 +1650,16 @@ def run_self_test() -> int:
     result = handle_text(player, "幫我放稻香", dry_run=True)
     if not result.get("ok") or result.get("query") != "稻香":
         raise AssertionError(f"dry-run play failed: {result}")
+    if player.mpv_volume != 125 or player.mpv_volume_max != 200:
+        raise AssertionError(f"default mpv volume changed unexpectedly: {player.mpv_volume}/{player.mpv_volume_max}")
+    loud_player = MusicPlayer(backend="mpv", dry_run=True, mpv_audio_device="default", mpv_volume=250, mpv_volume_max=200)
+    loud_status = loud_player.status()
+    if loud_player.mpv_volume != 200 or loud_player.mpv_volume_max != 200 or not loud_status.get("mpv_volume_clamped"):
+        raise AssertionError(f"mpv volume clamp failed: {loud_status}")
+    quiet_player = MusicPlayer(backend="mpv", dry_run=True, mpv_audio_device="default", mpv_volume=80, mpv_volume_max=200)
+    quiet_status = quiet_player.status()
+    if quiet_status.get("mpv_effective_volume") != 80 or quiet_status.get("mpv_volume_clamped"):
+        raise AssertionError(f"mpv volume status failed: {quiet_status}")
 
     class BrokenPipeWriter:
         def write(self, _body: bytes) -> None:
@@ -1676,7 +1709,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mpv-audio-keyword", default=DEFAULT_MPV_AUDIO_DEVICE_KEYWORD, help="Keyword used by --mpv-audio-device auto.")
     parser.add_argument("--mpv-ytdl-cookies", default=DEFAULT_MPV_YTDL_COOKIES, help="Optional cookies.txt passed to mpv/yt-dlp for logged-in YouTube playback.")
     parser.add_argument("--mpv-ytdl-cookies-from-browser", default=DEFAULT_MPV_YTDL_COOKIES_FROM_BROWSER, help="Optional yt-dlp browser cookie source, e.g. firefox or chrome:Profile 1.")
-    parser.add_argument("--mpv-volume", type=int, default=DEFAULT_MPV_VOLUME, help="mpv playback volume, default 100.")
+    parser.add_argument("--mpv-volume", type=int, default=DEFAULT_MPV_VOLUME, help=f"mpv playback volume, default {DEFAULT_MPV_VOLUME}.")
+    parser.add_argument("--mpv-volume-max", type=int, default=DEFAULT_MPV_VOLUME_MAX, help=f"mpv --volume-max ceiling, default {DEFAULT_MPV_VOLUME_MAX}.")
     parser.add_argument("--mpv-ready-timeout", type=float, default=DEFAULT_MPV_READY_TIMEOUT_SEC, help="Seconds to wait for mpv IPC/playback status.")
     parser.add_argument("--weather-default-location", default=DEFAULT_WEATHER_LOCATION, help="Default location for local/here weather requests.")
     parser.add_argument("--weather-language", default=DEFAULT_WEATHER_LANGUAGE, help="Open-Meteo geocoding language.")
@@ -1705,6 +1739,7 @@ def main() -> int:
         mpv_ytdl_cookies=args.mpv_ytdl_cookies,
         mpv_ytdl_cookies_from_browser=args.mpv_ytdl_cookies_from_browser,
         mpv_volume=args.mpv_volume,
+        mpv_volume_max=args.mpv_volume_max,
         mpv_ready_timeout=args.mpv_ready_timeout,
     )
     if args.stop:

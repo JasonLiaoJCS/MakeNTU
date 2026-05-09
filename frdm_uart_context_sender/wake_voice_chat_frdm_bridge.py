@@ -12,6 +12,7 @@ same FRDM UART and Piper TTS flow as the Enter-based bridge.
 from __future__ import annotations
 
 import argparse
+import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -67,6 +68,13 @@ try:
     import music_web_player as music_tool  # noqa: E402
 except Exception:
     music_tool = None  # type: ignore[assignment]
+try:
+    import esp32s3_ble_fan_led_controller as esp32_ble  # noqa: E402
+except Exception as exc:
+    esp32_ble = None  # type: ignore[assignment]
+    ESP32_BLE_IMPORT_ERROR = exc
+else:
+    ESP32_BLE_IMPORT_ERROR = None
 
 
 CLIENT_VERSION = "wake_voice_chat_frdm_bridge_vision_conversation_motor_natural_v6"
@@ -77,6 +85,9 @@ DEFAULT_WEATHER_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "Taipei")
 DEFAULT_ESP32_TEMPERATURE_PATH = os.getenv("ESP32_TEMPERATURE_PATH", "/temperature")
 DEFAULT_TODO_LIST_PATH = THIS_DIR / "logs" / "todo_list.json"
 DEFAULT_AI_TRACE_PATH = THIS_DIR / "logs" / "ai_trace.jsonl"
+DEFAULT_WAKE_STATUS_PATH = THIS_DIR / "logs" / "wake_status.json"
+DEFAULT_ESP32_DASHBOARD_HOST = os.getenv("ESP32_DASHBOARD_HOST", "127.0.0.1")
+DEFAULT_ESP32_DASHBOARD_PORT = 8791
 DEFAULT_FAN_DASHBOARD_URL = os.getenv("FAN_DASHBOARD_URL", "http://127.0.0.1:8789/api/devices/{device_id}/set")
 DEFAULT_DISCORD_WEBHOOK_FILE = Path(os.getenv("DISCORD_WEBHOOK_FILE", "~/.config/makentu/discord_webhook_url")).expanduser()
 PET_IDLE_SILENCE_TOKEN = "PET_IDLE_SILENCE"
@@ -147,9 +158,9 @@ MOTOR_COMMANDS = {"MotorPitch", "MotorYaw", "MotorYawPitch"}
 UTILITY_COMMANDS = {"ShowNum"}
 WEATHER_COMMANDS = {"Weather"}
 TIME_COMMANDS = {"Time"}
-DATA_COMMANDS = {"Todo", "TodoItem", "TodoEnd", "Health", "Device"}
+DATA_COMMANDS = {"Todo", "TodoItem", "TodoEnd", "Health", "Device", "TempRoom"}
 ALLOWED_UART_COMMANDS = CORE_SCREEN_COMMANDS | MOTOR_COMMANDS | UTILITY_COMMANDS | WEATHER_COMMANDS | TIME_COMMANDS | DATA_COMMANDS
-SINGLE_ARG_UART_COMMANDS = (MOTOR_COMMANDS - {"MotorYawPitch"}) | {"Speaking"}
+SINGLE_ARG_UART_COMMANDS = (MOTOR_COMMANDS - {"MotorYawPitch"}) | {"Speaking", "TempRoom"}
 
 VALID_PERSISTENT_STATES = {"normal", "sleep", "unchanged"}
 VALID_SCREEN_MODES = {"unchanged", "normal", "sleep", "thinking", "music", "focus"}
@@ -2081,6 +2092,30 @@ def todo_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def write_wake_status(args: argparse.Namespace, **fields: Any) -> None:
+    if getattr(args, "no_wake_status_log", False):
+        return
+    path = Path(getattr(args, "wake_status_path", "") or DEFAULT_WAKE_STATUS_PATH).expanduser()
+    record = {
+        "updated_at": todo_timestamp(),
+        "listening": True,
+        **fields,
+    }
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        if getattr(args, "debug", False):
+            print(f"WARN: failed to write wake status {path}: {exc}")
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def extract_json_object(text: str) -> dict[str, Any] | None:
     cleaned = str(text or "").strip()
     cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
@@ -2315,7 +2350,14 @@ def is_user_visible_transcript(transcript: str) -> bool:
     return True
 
 
-def append_ai_trace(response: dict[str, Any], args: argparse.Namespace, *, turn_source: str = "") -> None:
+def append_ai_trace(
+    response: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    turn_source: str = "",
+    recording_meta: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
     if getattr(args, "no_ai_trace_log", False):
         return
     transcript = str(response.get("transcript", "") or "").strip()
@@ -2338,6 +2380,24 @@ def append_ai_trace(response: dict[str, Any], args: argparse.Namespace, *, turn_
         "head_motion": control.get("head_motion", ""),
         "ok": bool(debug.get("ok", response.get("ok", True))),
     }
+    if isinstance(recording_meta, dict):
+        for key in (
+            "wake_score",
+            "peak_volume",
+            "noise_floor",
+            "speech_start_threshold",
+            "silence_base_threshold",
+            "duration_sec",
+            "reason",
+        ):
+            if key in recording_meta:
+                record[key] = recording_meta.get(key)
+    if isinstance(metadata, dict):
+        record["metadata"] = {
+            key: metadata.get(key)
+            for key in ("turn_source", "conversation_mode", "conversation_session_id", "conversation_turn_index", "latency_profile")
+            if key in metadata
+        }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
@@ -2657,7 +2717,8 @@ def maybe_autostart_music_tool(args: argparse.Namespace, *, tool_url: str | None
     if backend == "mpv":
         command.extend(["--mpv-audio-device", str(getattr(args, "music_mpv_audio_device", "auto") or "auto")])
         command.extend(["--mpv-audio-keyword", str(getattr(args, "music_mpv_audio_keyword", "UACDemo") or "UACDemo")])
-        command.extend(["--mpv-volume", str(getattr(args, "music_mpv_volume", 100))])
+        command.extend(["--mpv-volume", str(getattr(args, "music_mpv_volume", 125))])
+        command.extend(["--mpv-volume-max", str(getattr(args, "music_mpv_volume_max", 200))])
         command.extend(["--mpv-ready-timeout", str(getattr(args, "music_mpv_ready_timeout", 1.5))])
         cookies_path = str(getattr(args, "music_mpv_ytdl_cookies", "") or "").strip()
         if cookies_path:
@@ -3015,6 +3076,105 @@ def format_temperature_uart_field(temp_c: float | None) -> str | None:
     return str(temperature_c_to_uart_x10(coerced))
 
 
+def format_temp_room_uart_payload(temp_c: float | None) -> str | None:
+    return format_temperature_uart_field(temp_c)
+
+
+def send_temp_room_uart_update(
+    args: argparse.Namespace,
+    robot: "RobotUartController",
+    reading: dict[str, Any] | None,
+    *,
+    reason: str,
+) -> str | None:
+    if reading is None:
+        return None
+    payload = format_temp_room_uart_payload(reading.get("temperature_c"))
+    if payload is None:
+        return None
+    ok = robot.send_uart_raw_line(f"TempRoom {payload}", reason=reason, read_ms=60)
+    if ok:
+        age = reading.get("age_sec")
+        age_text = f", age={float(age):.1f}s" if isinstance(age, (int, float)) else ""
+        print(f"TempRoom UART sent: TempRoom {payload} ({float(reading['temperature_c']):.1f} C{age_text})")
+    else:
+        print("WARNING: TempRoom UART was not sent.")
+    return payload
+
+
+class FrdmRoomTemperaturePublisher:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        robot: "RobotUartController",
+        receiver: "Esp32TemperatureReceiver | None",
+    ) -> None:
+        self.args = args
+        self.robot = robot
+        self.receiver = receiver
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def enabled(self) -> bool:
+        if getattr(self.args, "no_uart", False) or getattr(self.args, "no_temp_room_uart", False):
+            return False
+        return self.interval_sec() > 0.0 and self.receiver is not None
+
+    def interval_sec(self) -> float:
+        return max(0.0, float(getattr(self.args, "temp_room_uart_interval_sec", 10.0) or 0.0))
+
+    def max_age_sec(self) -> float:
+        return max(0.0, float(getattr(self.args, "temp_room_uart_max_age_sec", 30.0) or 0.0))
+
+    def start(self) -> bool:
+        if not self.enabled():
+            return False
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="frdm-temp-room-publisher", daemon=True)
+        self._thread.start()
+        print(
+            "FRDM TempRoom UART: "
+            f"enabled, interval={self.interval_sec():g}s, max_age={self.max_age_sec():g}s."
+        )
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+    def _latest_reading(self) -> dict[str, Any] | None:
+        receiver = self.receiver
+        if receiver is None:
+            return None
+        return receiver.latest(max_age_sec=self.max_age_sec())
+
+    def _run(self) -> None:
+        interval_sec = self.interval_sec()
+        next_send_at = 0.0
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if now >= next_send_at:
+                reading = self._latest_reading()
+                if reading is None:
+                    wait_sec = min(1.0, interval_sec) if interval_sec > 0 else 1.0
+                    self._stop.wait(wait_sec)
+                    continue
+                send_temp_room_uart_update(
+                    self.args,
+                    self.robot,
+                    reading,
+                    reason="ESP32 BLE room temperature update",
+                )
+                next_send_at = time.monotonic() + interval_sec
+            wait_sec = max(0.1, min(1.0, next_send_at - time.monotonic()))
+            self._stop.wait(wait_sec)
+
+
 class Esp32TemperatureReceiver:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -3182,11 +3342,12 @@ def get_local_temperature_reading(args: argparse.Namespace) -> dict[str, Any] | 
     if getattr(args, "no_weather_local_temperature", False):
         return None
     mode = str(getattr(args, "esp32_temperature_mode", "disabled") or "disabled").strip().lower()
-    if mode not in {"push", "pull", "both"}:
+    ble_temperature_enabled = bool(getattr(args, "esp32_ble", False))
+    if mode not in {"push", "pull", "both"} and not ble_temperature_enabled:
         return None
     max_age_sec = max(0.0, float(getattr(args, "esp32_temperature_max_age_sec", 120.0) or 120.0))
     receiver = getattr(args, "_esp32_temperature_receiver", None)
-    if mode in {"push", "both"} and isinstance(receiver, Esp32TemperatureReceiver):
+    if (mode in {"push", "both"} or ble_temperature_enabled) and isinstance(receiver, Esp32TemperatureReceiver):
         latest = receiver.latest(max_age_sec=max_age_sec)
         if latest is not None:
             return latest
@@ -3206,6 +3367,461 @@ def attach_local_temperature_to_weather_result(args: argparse.Namespace, weather
     weather_result["local_temperature"] = reading
     weather_result["local_temperature_c"] = reading["temperature_c"]
     return reading
+
+
+def esp32_status_fan_is_off(status: Any | None) -> bool:
+    if status is None:
+        return False
+    fan = str(getattr(status, "fan", "") or "").strip().upper()
+    if fan == "OFF":
+        return True
+    if fan == "ON":
+        return False
+    speed = getattr(status, "speed", None)
+    if speed is None:
+        return False
+    try:
+        return int(speed) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
+def esp32_commands_are_fan_off_only(commands: list[str]) -> bool:
+    upper = [str(command or "").strip().upper() for command in commands if str(command or "").strip()]
+    return bool(upper) and all(command == "FAN_OFF" for command in upper)
+
+
+class Esp32BleBridgeManager:
+    """Background BLE bridge from the Wake Bridge to ESP32-S3 fan/LED/temp."""
+
+    def __init__(self, args: argparse.Namespace, temperature_receiver: Esp32TemperatureReceiver | None = None) -> None:
+        self.args = args
+        self.temperature_receiver = temperature_receiver
+        self._lock = threading.RLock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._controller: Any | None = None
+        self._thread: threading.Thread | None = None
+        self._pending_commands: list[str] = []
+        self._latest_status: Any | None = None
+        self._started = False
+
+    def is_enabled(self) -> bool:
+        return bool(getattr(self.args, "esp32_ble", False))
+
+    def is_running(self) -> bool:
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
+
+    def is_connected(self) -> bool:
+        controller = self._controller
+        try:
+            return bool(controller is not None and controller.connected.is_set())
+        except Exception:
+            return False
+
+    def latest_status(self) -> Any | None:
+        with self._lock:
+            return self._latest_status
+
+    def start(self) -> bool:
+        if not self.is_enabled():
+            return False
+        if esp32_ble is None:
+            print(f"WARNING: ESP32 BLE disabled because helper import failed: {ESP32_BLE_IMPORT_ERROR}")
+            return False
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        if self._thread is not None:
+            self._thread = None
+        self._thread = threading.Thread(target=self._run, name="esp32s3-ble-bridge", daemon=True)
+        self._thread.start()
+        self._started = True
+        return True
+
+    def ensure_reconnect_loop(self) -> bool:
+        if not self.is_enabled():
+            return False
+        started = self.start()
+        if started and not self.is_connected():
+            print("ESP32 BLE is not connected; reconnect loop is active.")
+        return started
+
+    def stop(self) -> None:
+        loop: asyncio.AbstractEventLoop | None
+        controller: Any | None
+        with self._lock:
+            loop = self._loop
+            controller = self._controller
+        if loop is not None and controller is not None:
+            def request_stop() -> None:
+                controller.stop.set()
+                try:
+                    controller.command_queue.put_nowait(None)
+                except Exception:
+                    pass
+
+            try:
+                loop.call_soon_threadsafe(request_stop)
+            except RuntimeError:
+                pass
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._thread = None
+
+    def _controller_args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            name=str(getattr(self.args, "esp32_ble_name", esp32_ble.DEVICE_NAME) or esp32_ble.DEVICE_NAME),
+            address=str(getattr(self.args, "esp32_ble_address", "") or ""),
+            adapter=str(getattr(self.args, "esp32_ble_adapter", "") or ""),
+            scan_mode=str(getattr(self.args, "esp32_ble_scan_mode", "active") or "active"),
+            scan_duplicates=bool(getattr(self.args, "esp32_ble_scan_duplicates", False)),
+            scan_filter_service=bool(getattr(self.args, "esp32_ble_scan_filter_service", False)),
+            scan_sort="name",
+            min_rssi=None,
+            scan_timeout=max(0.1, float(getattr(self.args, "esp32_ble_scan_timeout", 8.0) or 8.0)),
+            connect_timeout=max(0.1, float(getattr(self.args, "esp32_ble_connect_timeout", 12.0) or 12.0)),
+            reconnect_sec=max(0.1, float(getattr(self.args, "esp32_ble_reconnect_sec", 3.0) or 3.0)),
+            write_with_response=bool(getattr(self.args, "esp32_ble_write_with_response", False)),
+            write_response_auto=bool(getattr(self.args, "esp32_ble_write_response_auto", True)),
+            read_status_on_connect=bool(getattr(self.args, "esp32_ble_read_status_on_connect", True)),
+            no_passive_reminder=bool(getattr(self.args, "no_esp32_ble_passive_reminder", False)),
+            passive_threshold=float(getattr(self.args, "esp32_ble_passive_threshold", 25.0) or 25.0),
+            passive_cooldown_sec=max(0.0, float(getattr(self.args, "esp32_ble_passive_cooldown_sec", 120.0) or 120.0)),
+            passive_message=str(
+                getattr(
+                    self.args,
+                    "esp32_ble_passive_message",
+                    "現在溫度 {temp:.1f} 度，有點熱，要不要幫你開風扇？",
+                )
+                or "現在溫度 {temp:.1f} 度，有點熱，要不要幫你開風扇？"
+            ),
+            no_tts_reminder=bool(getattr(self.args, "no_tts", False) or getattr(self.args, "no_esp32_ble_tts_reminder", False)),
+            tts_url=str(getattr(self.args, "tts_url", "") or ""),
+            tts_timeout=max(0.1, float(getattr(self.args, "esp32_ble_tts_timeout", getattr(self.args, "tts_timeout", 1.5)) or 1.5)),
+            voice_speed_step=max(1, int(getattr(self.args, "esp32_ble_voice_speed_step", 32) or 32)),
+        )
+
+    def _run(self) -> None:
+        if esp32_ble is None:
+            return
+        manager = self
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        class WakeBridgeEsp32BleController(esp32_ble.Esp32BleController):  # type: ignore[misc, union-attr]
+            def _accept_status_bytes(self, data: bytes) -> None:
+                super()._accept_status_bytes(data)
+                status = self.latest_status
+                if status is not None:
+                    manager._handle_status(status)
+
+        controller = WakeBridgeEsp32BleController(self._controller_args())
+        with self._lock:
+            self._loop = loop
+            self._controller = controller
+            pending = list(self._pending_commands)
+            self._pending_commands.clear()
+        for command in pending:
+            controller.command_queue.put_nowait(command)
+        try:
+            loop.run_until_complete(controller.run_ble_forever())
+        except Exception as exc:
+            if self.is_enabled():
+                print(f"WARNING: ESP32 BLE bridge stopped: {exc}")
+        finally:
+            with self._lock:
+                self._controller = None
+                self._loop = None
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+
+    def _handle_status(self, status: Any) -> None:
+        with self._lock:
+            self._latest_status = status
+        temp_c = getattr(status, "temp_c", None)
+        if temp_c is None:
+            return
+        receiver = self.temperature_receiver or getattr(self.args, "_esp32_temperature_receiver", None)
+        if isinstance(receiver, Esp32TemperatureReceiver):
+            receiver.update(float(temp_c), source="esp32-ble-notify")
+
+    def send_command(self, command: str, *, source: str = "") -> bool:
+        command = str(command or "").strip()
+        if not command or not self.is_enabled():
+            return False
+        if esp32_ble is None:
+            return False
+        with self._lock:
+            loop = self._loop
+            controller = self._controller
+            if loop is None or controller is None:
+                if self._started:
+                    self._pending_commands.append(command)
+                    return True
+                return False
+        try:
+            asyncio.run_coroutine_threadsafe(controller.command_queue.put(command), loop)
+            if source:
+                print(f"ESP32 BLE queued ({source}): {command}")
+            return True
+        except Exception as exc:
+            print(f"WARNING: ESP32 BLE queue failed for {command!r}: {exc}")
+            return False
+
+    def send_commands(self, commands: list[str], *, source: str = "") -> dict[str, Any]:
+        cleaned = [str(command or "").strip() for command in commands if str(command or "").strip()]
+        connected_before = self.is_connected()
+        reconnect_requested = False
+        if cleaned and not connected_before:
+            reconnect_requested = self.ensure_reconnect_loop()
+        ok_count = 0
+        for command in cleaned:
+            if self.send_command(command, source=source):
+                ok_count += 1
+        return {
+            "ok": bool(cleaned) and ok_count == len(cleaned),
+            "queued": ok_count,
+            "commands": cleaned,
+            "connected": self.is_connected(),
+            "was_connected": connected_before,
+            "reconnect_requested": reconnect_requested,
+            "source": source,
+        }
+
+    def handle_frdm_fan_event(self, event: dict[str, Any]) -> bool:
+        if not self.is_enabled() or getattr(self.args, "no_esp32_ble_frdm_control", False):
+            return False
+        percent = clamp_int(int(event.get("percent", 0) or 0), 0, 100)
+        if not bool(event.get("power", percent > 0)):
+            commands = ["FAN_OFF"]
+        else:
+            commands = ["FAN_ON", f"FAN_SPEED:{esp32_ble.percent_to_pwm(percent)}"]  # type: ignore[union-attr]
+        result = self.send_commands(commands, source="frdm_uart")
+        print(
+            "ESP32 BLE fan relay: "
+            f"percent={percent} commands={','.join(commands)} "
+            f"queued={result['queued']}/{len(commands)} connected={result['connected']}"
+        )
+        return bool(result.get("ok"))
+
+    def handle_voice_transcript(self, transcript: str) -> dict[str, Any] | None:
+        if not self.is_enabled() or getattr(self.args, "no_esp32_ble_voice_control", False):
+            return None
+        if esp32_ble is None:
+            return None
+        status = self.latest_status()
+        commands = esp32_ble.resolve_input_to_ble_commands(  # type: ignore[union-attr]
+            transcript,
+            status,
+            speed_step=max(1, int(getattr(self.args, "esp32_ble_voice_speed_step", 32) or 32)),
+        )
+        if not commands:
+            return None
+        connected_before = self.is_connected()
+        if connected_before and esp32_commands_are_fan_off_only(commands) and esp32_status_fan_is_off(status):
+            return {
+                "ok": True,
+                "queued": 0,
+                "commands": commands,
+                "connected": connected_before,
+                "was_connected": connected_before,
+                "reconnect_requested": False,
+                "source": "voice",
+                "intent": True,
+                "transcript": transcript,
+                "noop": True,
+                "already_state": "fan_off",
+            }
+        result = self.send_commands(commands, source="voice")
+        result["intent"] = True
+        result["transcript"] = transcript
+        return result
+
+
+def esp32_status_payload(manager: Esp32BleBridgeManager | None) -> dict[str, Any]:
+    if manager is None:
+        return {"ok": False, "enabled": False, "running": False, "connected": False, "error": "esp32 manager unavailable"}
+    status = manager.latest_status()
+    payload: dict[str, Any] = {
+        "ok": manager.is_enabled(),
+        "enabled": manager.is_enabled(),
+        "running": manager.is_running(),
+        "connected": manager.is_connected(),
+        "updated_at": "",
+        "raw": "",
+    }
+    if status is None:
+        payload["ok"] = False
+        payload["error"] = "no ESP32 status yet"
+        return payload
+    speed = getattr(status, "speed", None)
+    try:
+        speed_percent = esp32_ble.pwm_to_percent(speed) if esp32_ble is not None and speed is not None else 0
+    except Exception:
+        speed_percent = 0
+    received_at = getattr(status, "received_at", None)
+    payload.update(
+        {
+            "ok": True,
+            "temp_c": getattr(status, "temp_c", None),
+            "temperature_c": getattr(status, "temp_c", None),
+            "fan": getattr(status, "fan", None),
+            "speed": speed,
+            "speed_percent": speed_percent,
+            "led": getattr(status, "led", None),
+            "updated_at": received_at.isoformat(timespec="seconds") if hasattr(received_at, "isoformat") else "",
+            "raw": getattr(status, "raw", "") or "",
+        }
+    )
+    return payload
+
+
+class Esp32DashboardControlServer:
+    """Small local HTTP bridge: dashboard device controls -> ESP32 BLE commands."""
+
+    def __init__(self, args: argparse.Namespace, manager: Esp32BleBridgeManager) -> None:
+        self.args = args
+        self.manager = manager
+        self.host = str(getattr(args, "esp32_dashboard_host", DEFAULT_ESP32_DASHBOARD_HOST) or DEFAULT_ESP32_DASHBOARD_HOST)
+        self.port = int(getattr(args, "esp32_dashboard_port", DEFAULT_ESP32_DASHBOARD_PORT) or DEFAULT_ESP32_DASHBOARD_PORT)
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> bool:
+        if self._server is not None:
+            return True
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = "MakeNTUEsp32DashboardHTTP/1.0"
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                if getattr(owner.args, "esp32_dashboard_debug", False):
+                    print("ESP32 dashboard HTTP: " + (fmt % args))
+
+            def end_headers(self) -> None:
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                super().end_headers()
+
+            def send_json(self, status_code: int, payload: dict[str, Any]) -> None:
+                body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def read_payload(self) -> tuple[dict[str, Any] | None, str | None]:
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                except ValueError:
+                    return None, "invalid Content-Length"
+                if length > 4096:
+                    return None, "request too large"
+                raw = self.rfile.read(max(0, length)).decode("utf-8", errors="replace")
+                if not raw.strip():
+                    return {}, None
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    return None, f"invalid JSON: {exc}"
+                if not isinstance(parsed, dict):
+                    return None, "JSON body must be an object"
+                return parsed, None
+
+            def do_OPTIONS(self) -> None:
+                self.send_response(204)
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+                if path == "/api/esp32/status":
+                    self.send_json(200, esp32_status_payload(owner.manager))
+                    return
+                self.send_json(404, {"ok": False, "error": "not found"})
+
+            def do_POST(self) -> None:
+                path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+                if path != "/api/esp32/control":
+                    self.send_json(404, {"ok": False, "error": "not found"})
+                    return
+                payload, error = self.read_payload()
+                if error:
+                    self.send_json(400, {"ok": False, "error": error})
+                    return
+                assert payload is not None
+                result = owner.handle_control(payload)
+                self.send_json(200 if result.get("ok") or result.get("queued") else 503, result)
+
+        class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        try:
+            self._server = ReusableThreadingHTTPServer((self.host, self.port), Handler)
+        except OSError as exc:
+            print(f"WARNING: ESP32 dashboard control could not listen on {self.host}:{self.port}: {exc}")
+            return False
+        self._thread = threading.Thread(target=self._server.serve_forever, name="esp32-dashboard-http", daemon=True)
+        self._thread.start()
+        print(f"ESP32 dashboard control: http://{self.host}:{self.port}/api/esp32/status")
+        return True
+
+    def stop(self) -> None:
+        server = self._server
+        self._server = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+    def handle_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.manager.is_enabled():
+            return {"ok": False, "error": "ESP32 BLE is disabled"}
+        if esp32_ble is None:
+            return {"ok": False, "error": f"ESP32 BLE helper unavailable: {ESP32_BLE_IMPORT_ERROR}"}
+        commands = self.commands_from_payload(payload)
+        if not commands:
+            return {"ok": False, "error": "no ESP32 command resolved", "request": payload}
+        result = self.manager.send_commands(commands, source=str(payload.get("source") or "dashboard_http"))
+        return {**result, "ok": bool(result.get("ok")), "request": payload, "status": esp32_status_payload(self.manager)}
+
+    def commands_from_payload(self, payload: dict[str, Any]) -> list[str]:
+        raw_commands = payload.get("commands")
+        if isinstance(raw_commands, list):
+            return [str(command).strip() for command in raw_commands if str(command).strip()]
+        if payload.get("command"):
+            return [str(payload.get("command")).strip()]
+        if payload.get("text"):
+            resolved = esp32_ble.resolve_input_to_ble_commands(  # type: ignore[union-attr]
+                str(payload.get("text") or ""),
+                self.manager.latest_status(),
+                speed_step=max(1, int(getattr(self.args, "esp32_ble_voice_speed_step", 32) or 32)),
+            )
+            return resolved or []
+
+        device_id = str(payload.get("device_id") or "").strip().lower()
+        device_type = str(payload.get("type") or "").strip().lower()
+        state = str(payload.get("state") or "").strip().lower()
+        value = payload.get("value")
+        is_light = device_type == "light" or device_id in {"living_light", "led", "led_light"}
+        is_fan = device_type == "fan" or device_id in {"desk_fan", "fan"}
+        if is_light:
+            return ["LED_OFF"] if state == "off" else ["LED_ON"]
+        if is_fan:
+            percent = clamp_int(value if value is not None else (100 if state != "off" else 0), 0, 100)
+            if state == "off" or percent <= 0:
+                return ["FAN_OFF"]
+            return ["FAN_ON", f"FAN_SPEED:{esp32_ble.percent_to_pwm(percent)}"]  # type: ignore[union-attr]
+        return []
 
 
 def _weather_int(value: Any, default: int = 0) -> int:
@@ -3948,6 +4564,8 @@ class RobotUartController:
         self._lock = threading.RLock()
         self._motor_safety_lockout_reason = ""
         self._last_motor_step: MotorStep | None = None
+        self._active_speaking_thread: threading.Thread | None = None
+        self._active_speaking_stop: threading.Event | None = None
         self._screen_state = ""
         self._screen_state_at = 0.0
         self.uart_bus: FrdmUartBus | None = None
@@ -4063,6 +4681,9 @@ class RobotUartController:
             "todo_end": "TodoEnd",
             "health": "Health",
             "device": "Device",
+            "temproom": "TempRoom",
+            "roomtemp": "TempRoom",
+            "roomtemperature": "TempRoom",
             "weather": "Weather",
             "weatherinfo": "Weather",
             "motorpitch": "MotorPitch",
@@ -4572,6 +5193,7 @@ class RobotUartController:
 
     def start_speaking_head_motion(self, head_motion: str) -> tuple[threading.Thread | None, threading.Event | None]:
         motion = head_motion if head_motion in SPEAKING_HEAD_MOTION_LOOPS else "none"
+        self.stop_active_speaking_head_motion(reason="before applying speaking head motion")
         if motion == "none":
             print("speaking head motion skipped: none")
             return None, None
@@ -4586,6 +5208,9 @@ class RobotUartController:
             name=f"speaking_head_motion_{motion}",
             daemon=True,
         )
+        with self._lock:
+            self._active_speaking_thread = thread
+            self._active_speaking_stop = stop_event
         thread.start()
         return thread, stop_event
 
@@ -4599,10 +5224,34 @@ class RobotUartController:
         if thread is None or stop_event is None:
             return
         stop_event.set()
+        if thread is threading.current_thread():
+            with self._lock:
+                if self._active_speaking_thread is thread:
+                    self._active_speaking_thread = None
+                    self._active_speaking_stop = None
+            print(f"WARNING: speaking head motion stop requested from its own thread; stop event set ({reason}).")
+            return
         thread.join(timeout=self.motor_stop_timeout())
         if thread.is_alive():
             print(f"WARNING: speaking head motion still running after stop timeout; sending center reset ({reason}).")
             self.reset_head_position(reason=reason)
+        with self._lock:
+            if self._active_speaking_thread is thread:
+                self._active_speaking_thread = None
+                self._active_speaking_stop = None
+
+    def stop_active_speaking_head_motion(self, *, reason: str = "stop active speaking head motion") -> None:
+        with self._lock:
+            thread = self._active_speaking_thread
+            stop_event = self._active_speaking_stop
+            self._active_speaking_thread = None
+            self._active_speaking_stop = None
+        if thread is not None and stop_event is not None:
+            self.stop_speaking_head_motion(thread, stop_event, reason=reason)
+
+    def force_motion_idle(self, *, reason: str = "force motion idle") -> None:
+        self.stop_active_speaking_head_motion(reason=reason)
+        self.reset_head_position(reason=reason)
 
 
 class FrdmUartProxyServer:
@@ -5627,8 +6276,9 @@ class FrdmTodoEventListener:
 
 
 class FrdmFanControlManager:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, esp32_ble_manager: Esp32BleBridgeManager | None = None) -> None:
         self.args = args
+        self.esp32_ble_manager = esp32_ble_manager
         self.last_event_key = ""
         self.last_event_at = 0.0
         self.suppressed_duplicate_count = 0
@@ -5676,11 +6326,26 @@ class FrdmFanControlManager:
         if suppressed:
             detail += f" suppressed_duplicates={suppressed}"
         print(f"FRDM fan event: {detail}")
+        ble_ok = self._sync_ble(event)
         dashboard_ok = self._sync_dashboard(event)
         command_ok = self._run_control_command(event)
-        if not dashboard_ok and not command_ok and not str(getattr(self.args, "fan_control_command", "") or "").strip():
+        if (
+            not ble_ok
+            and not dashboard_ok
+            and not command_ok
+            and not str(getattr(self.args, "fan_control_command", "") or "").strip()
+        ):
             print("FRDM fan event handled in software only; configure --fan-control-command for GPIO/PWM hardware control.")
         return True
+
+    def _sync_ble(self, event: dict[str, Any]) -> bool:
+        if self.esp32_ble_manager is None:
+            return False
+        try:
+            return self.esp32_ble_manager.handle_frdm_fan_event(event)
+        except Exception as exc:
+            print(f"WARNING: ESP32 BLE fan relay failed: {exc}")
+            return False
 
     def _dashboard_url(self) -> str:
         template = str(getattr(self.args, "fan_dashboard_url", "") or DEFAULT_FAN_DASHBOARD_URL)
@@ -6467,6 +7132,7 @@ class WakeVolumeRecorder:
         wake_context: dict[str, Any] = {}
         last_ignored_wake_at = 0.0
         last_standby_progress_log_at = 0.0
+        last_wake_status_write_at = 0.0
         last_recording_progress_log_at = 0.0
         ambient_volumes: list[int] = []
         ambient_max_chunks = max(5, int(round(5.0 * self.sample_rate / self.frames_per_chunk)))
@@ -6499,6 +7165,16 @@ class WakeVolumeRecorder:
         standby_progress_interval = max(0.0, float(getattr(self.args, "standby_progress_interval", 1.5) or 0.0))
         audio_queue: queue.Queue = queue.Queue(maxsize=max_queue_chunks)
         callback_state = {"dropped_chunks": 0}
+        write_wake_status(
+            self.args,
+            phase="standby",
+            volume=0,
+            recent_peak=0,
+            wake_score=0.0,
+            wake_threshold=float(self.args.wake_threshold),
+            wake_volume_threshold=int(getattr(self.args, "wake_volume_min", 0) or 0),
+            noise_floor=0,
+        )
 
         def audio_callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
             del frames, time_info
@@ -6649,6 +7325,19 @@ class WakeVolumeRecorder:
                         music_wake_volume_min = int(getattr(self.args, "music_wake_volume_min", 0) or 0)
                         if music_wake_volume_min > 0:
                             wake_volume_threshold = max(wake_volume_threshold, music_wake_volume_min)
+                    if now - last_wake_status_write_at >= max(0.5, standby_progress_interval or 1.0):
+                        write_wake_status(
+                            self.args,
+                            phase="standby",
+                            volume=volume,
+                            recent_peak=wake_gate_volume,
+                            wake_score=round(score, 4),
+                            wake_threshold=round(active_wake_threshold, 4),
+                            wake_volume_threshold=wake_volume_threshold,
+                            noise_floor=wake_noise_floor,
+                            music_guard=music_guard_active,
+                        )
+                        last_wake_status_write_at = now
                     if self.args.listen_debug:
                         print(
                             f"vol={volume:5d} | recent_peak={wake_gate_volume:5d} | wake={score:.3f} | "
@@ -6744,6 +7433,19 @@ class WakeVolumeRecorder:
                             f"music_guard={'on' if music_guard_active else 'off'}, "
                             f"adaptive={'off' if self.args.no_adaptive_volume else 'on'}"
                         )
+                        write_wake_status(
+                            self.args,
+                            phase="wake_detected",
+                            volume=volume,
+                            recent_peak=wake_gate_volume,
+                            wake_score=round(score, 4),
+                            wake_threshold=round(active_wake_threshold, 4),
+                            wake_volume_threshold=wake_volume_threshold,
+                            noise_floor=noise_floor,
+                            speech_start_threshold=speech_start_threshold,
+                            silence_base_threshold=silence_base_threshold,
+                        )
+                        last_wake_status_write_at = now
                         if self.wake_hook is not None:
                             try:
                                 hook_result = self.wake_hook(
@@ -6836,6 +7538,18 @@ class WakeVolumeRecorder:
                         f"Recording progress: phase={phase}, elapsed={elapsed_since_wake:.1f}s, "
                         f"volume={volume}, start_threshold={speech_start_threshold}, "
                         f"silence_threshold={current_silence_threshold}, peak={peak_volume}{cap_label}{wait_label}"
+                    )
+                    write_wake_status(
+                        self.args,
+                        phase=phase,
+                        volume=volume,
+                        recent_peak=max(peak_volume, volume),
+                        wake_score=round(wake_score_at_start, 4),
+                        wake_threshold=round(float(self.args.wake_threshold), 4),
+                        noise_floor=noise_floor,
+                        speech_start_threshold=speech_start_threshold,
+                        silence_base_threshold=silence_base_threshold,
+                        silence_threshold=current_silence_threshold,
                     )
                     last_recording_progress_log_at = now
 
@@ -7526,7 +8240,19 @@ def wait_for_tts_job(
     on_playback_start: Callable[[], None] | None = None,
 ) -> bool:
     if not job_id:
-        if on_playback_start is not None:
+        require_audio_playing = bool(getattr(args, "tts_speaking_require_audio", True))
+        if require_audio_playing:
+            deadline = time.monotonic() + max(0.1, float(getattr(args, "tts_speaking_start_timeout", 1.2) or 1.2))
+            while time.monotonic() < deadline:
+                if tts_audio_playing(args):
+                    if on_playback_start is not None:
+                        on_playback_start()
+                    break
+                time.sleep(max(0.05, min(float(getattr(args, "tts_start_poll_interval", 0.12) or 0.12), 0.25)))
+            else:
+                if getattr(args, "tts_debug", False):
+                    print("TTS playback was not observed for job without id; Speaking UART was not sent.")
+        elif on_playback_start is not None:
             on_playback_start()
         time.sleep(timeout_sec)
         print(f"TTS estimated finished after {timeout_sec:.1f}s (no job id).")
@@ -7538,6 +8264,7 @@ def wait_for_tts_job(
     saw_current_job = False
     current_job_seen_at = 0.0
     playback_start_notified = False
+    require_audio_playing = bool(getattr(args, "tts_speaking_require_audio", True))
     poll_interval = max(0.1, min(float(getattr(args, "tts_poll_interval", 0.75) or 0.75), 2.0))
     start_poll_interval = max(
         0.05,
@@ -7560,12 +8287,18 @@ def wait_for_tts_job(
             status = voice_chat.get_json(queue_url, timeout_sec=min(args.tts_timeout, 2.0))
         except Exception as exc:
             last_error = str(exc)
+            if not playback_start_notified and tts_audio_playing(args):
+                notify_playback_start("TTS audio player reports output while queue status is unavailable")
             time.sleep(start_poll_interval if not playback_start_notified else poll_interval)
             continue
 
         last_result = status.get("last_result") if isinstance(status.get("last_result"), dict) else {}
         if last_result.get("job_id") == job_id:
-            notify_playback_start("job finished before start poll observed output")
+            if not playback_start_notified:
+                if not require_audio_playing:
+                    notify_playback_start("job finished before start poll observed output")
+                elif getattr(args, "tts_debug", False):
+                    print("TTS finished before audio.playing was observed; Speaking UART was not sent.")
             if getattr(args, "tts_debug", False):
                 playback = last_result.get("playback") if isinstance(last_result.get("playback"), dict) else {}
                 print(f"TTS finished: job_id={job_id}, playback_volume_gain={playback.get('volume_gain', 'unknown')}")
@@ -7580,7 +8313,7 @@ def wait_for_tts_job(
             if not playback_start_notified:
                 if tts_audio_playing(args):
                     notify_playback_start("TTS audio player reports output")
-                elif time.monotonic() - current_job_seen_at >= start_fallback_sec:
+                elif not require_audio_playing and time.monotonic() - current_job_seen_at >= start_fallback_sec:
                     notify_playback_start("TTS queue current fallback")
         last_error_value = str(status.get("last_error", "") or "").strip()
         if last_error_value and saw_current_job and not status.get("running"):
@@ -7618,14 +8351,23 @@ class SpeakingPlaybackCue:
             return
         self.started = True
         sent = self.robot.send_speaking_and_emotion(self.emotion)
-        self.head_thread, self.head_stop = self.robot.start_speaking_head_motion(self.head_motion)
+        if sent:
+            self.head_thread, self.head_stop = self.robot.start_speaking_head_motion(self.head_motion)
+        else:
+            self.robot.stop_active_speaking_head_motion(reason=f"{self.reset_reason}; Speaking UART not sent")
         if self.timing is not None and sent:
             self.timing.mark(self.timing_label)
 
     def stop(self) -> None:
         if not self.started:
+            self.robot.stop_active_speaking_head_motion(reason=f"{self.reset_reason}; playback cue never started")
             return
-        self.robot.stop_speaking_head_motion(self.head_thread, self.head_stop, reason=self.reset_reason)
+        self.started = False
+        head_thread = self.head_thread
+        head_stop = self.head_stop
+        self.head_thread = None
+        self.head_stop = None
+        self.robot.stop_speaking_head_motion(head_thread, head_stop, reason=self.reset_reason)
 
 
 def run_self_test() -> int:
@@ -7783,6 +8525,9 @@ def run_self_test() -> int:
         fan_control_command="",
         motor_step_delay=0.02,
         motor_smooth_step_deg=MOTOR_SMOOTH_STEP_DEG,
+        motor_speaking_step_delay=0.02,
+        motor_speaking_smooth_step_deg=MOTOR_SPEAKING_SMOOTH_STEP_DEG,
+        motor_stop_timeout=0.5,
         motor_reset_repeats=2,
         motor_reset_delay=0.02,
     )
@@ -7810,6 +8555,8 @@ def run_self_test() -> int:
         raise AssertionError("Weather+local-temperature raw dry-run failed")
     if not robot.send_uart_raw_line("Weather current,27,27,0,2", reason="self-test"):
         raise AssertionError("Weather current raw dry-run failed")
+    if not robot.send_uart_raw_line("TempRoom 254", reason="self-test"):
+        raise AssertionError("TempRoom raw dry-run failed")
     if not robot.send_uart_raw_line("Todo 3,1", reason="self-test"):
         raise AssertionError("Todo raw dry-run failed")
     if not robot.send_uart_raw_line("TodoItem 1,42,open,Write%20report", reason="self-test"):
@@ -7857,6 +8604,8 @@ def run_self_test() -> int:
         raise AssertionError("screen command wire format should keep two arguments")
     if format_uart_wire_command("Speaking", 3, 0) != "Speaking 3":
         raise AssertionError("Speaking should carry one 0..5 emotion-code argument")
+    if format_uart_wire_command("TempRoom", 254, 0) != "TempRoom 254":
+        raise AssertionError("TempRoom should carry one Celsius*10 argument")
     nod_control = normalize_control({"transcript": "你可以點頭嗎", "control": {"emotion": "neutral", "head_motion": "none"}})
     if nod_control["head_motion"] != "nod":
         raise AssertionError(f"direct nod intent should select nod head motion: {nod_control}")
@@ -7879,9 +8628,53 @@ def run_self_test() -> int:
     fan_event = parse_frdm_fan_event("EVT,Fan,1,2", speed_max=3)
     if not fan_event or fan_event["state"] != "on" or fan_event["speed"] != 2 or fan_event["percent"] != 67:
         raise AssertionError(f"FRDM fan event parsing failed: {fan_event}")
+    fan_percent_event = parse_frdm_fan_event("FanSpeed 75", speed_max=100)
+    if not fan_percent_event or fan_percent_event["state"] != "on" or fan_percent_event["percent"] != 75:
+        raise AssertionError(f"FRDM fan percent parsing failed: {fan_percent_event}")
     fan_off = parse_frdm_fan_event("Fan off,0", speed_max=3)
     if not fan_off or fan_off["state"] != "off" or fan_off["percent"] != 0:
         raise AssertionError(f"FRDM fan off parsing failed: {fan_off}")
+    if esp32_ble is None:
+        raise AssertionError(f"ESP32 BLE helper import failed: {ESP32_BLE_IMPORT_ERROR}")
+    if esp32_ble.percent_to_pwm(50) != esp32_ble.apply_min_nonzero_pwm(128):
+        raise AssertionError("ESP32 BLE percent->PWM conversion failed")
+    if esp32_ble.percent_to_pwm(16) != esp32_ble.apply_min_nonzero_pwm(41):
+        raise AssertionError("ESP32 BLE low nonzero PWM floor failed")
+    if esp32_ble.frdm_event_to_ble_commands("FanSpeed 75") != ["FAN_ON", f"FAN_SPEED:{esp32_ble.apply_min_nonzero_pwm(191)}"]:
+        raise AssertionError("ESP32 BLE FRDM percent command conversion failed")
+    voice_ble = esp32_ble.voice_text_to_ble_commands("請幫我開風扇", None)
+    if voice_ble != ["FAN_ON", f"FAN_SPEED:{esp32_ble.apply_min_nonzero_pwm(180)}"]:
+        raise AssertionError(f"ESP32 BLE voice fan command parsing failed: {voice_ble}")
+    multi_ble = esp32_ble.voice_text_to_ble_commands("幫我開燈以及開風扇", None)
+    if multi_ble != ["LED_ON", "FAN_ON", f"FAN_SPEED:{esp32_ble.apply_min_nonzero_pwm(180)}"]:
+        raise AssertionError(f"ESP32 BLE multi-command parsing failed: {multi_ble}")
+    off_ble_status = esp32_ble.Esp32Status(
+        raw="TEMP:24.00,FAN:OFF,SPEED:0,LED:OFF",
+        temp_c=24.0,
+        fan="OFF",
+        speed=0,
+        led="OFF",
+    )
+    faster_from_off = esp32_ble.voice_text_to_ble_commands("幫我調高風扇", off_ble_status)
+    expected_faster_from_off = ["FAN_ON", f"FAN_SPEED:{esp32_ble.apply_min_nonzero_pwm(32)}"]
+    if faster_from_off != expected_faster_from_off:
+        raise AssertionError(f"ESP32 BLE fan faster from off failed: {faster_from_off}")
+    if not esp32_status_fan_is_off(off_ble_status):
+        raise AssertionError("ESP32 BLE fan-off status detection failed")
+    fan_off_reply = esp32_ble_reply_for_commands(["FAN_OFF"], connected=True, queued=1)
+    if "風扇關掉" not in fan_off_reply:
+        raise AssertionError(f"ESP32 BLE fan-off confirmation should be spoken: {fan_off_reply}")
+    already_off_reply = esp32_ble_reply_for_commands(
+        ["FAN_OFF"],
+        connected=True,
+        queued=0,
+        already_state="fan_off",
+    )
+    if "明明已經是關的" not in already_off_reply:
+        raise AssertionError(f"ESP32 BLE already-off reply missing state wording: {already_off_reply}")
+    disconnected_ble_reply = esp32_ble_reply_for_commands(["FAN_ON"], connected=False, queued=1, reconnecting=True)
+    if "沒有連上 ESP32-S3 藍芽" not in disconnected_ble_reply or "正在重新連線" not in disconnected_ble_reply:
+        raise AssertionError(f"ESP32 BLE disconnected reply missing reconnect wording: {disconnected_ble_reply}")
     fan_manager = FrdmFanControlManager(dry_args)
     if not fan_manager.handle_line("EVT,Fan,1,2"):
         raise AssertionError("FRDM fan manager should handle fan event")
@@ -7967,12 +8760,89 @@ def run_self_test() -> int:
     head_thread.join(timeout=6.0)
     if head_thread.is_alive():
         raise AssertionError("head motion thread did not finish in self-test")
+    speaking_thread, speaking_stop = robot.start_speaking_head_motion("nod")
+    if speaking_thread is None or speaking_stop is None:
+        raise AssertionError("speaking head motion should start in dry-run self-test")
+    time.sleep(0.05)
+    none_thread, none_stop = robot.start_speaking_head_motion("none")
+    if none_thread is not None or none_stop is not None:
+        raise AssertionError("head_motion=none should not start a speaking motion thread")
+    speaking_thread.join(timeout=2.0)
+    if speaking_thread.is_alive():
+        raise AssertionError("head_motion=none should stop the previous speaking motion")
+    if robot._active_speaking_thread is not None or robot._active_speaking_stop is not None:
+        raise AssertionError("stopped speaking motion should not remain active")
+    stale_thread, stale_stop = robot.start_speaking_head_motion("nod")
+    if stale_thread is None or stale_stop is None:
+        raise AssertionError("stale speaking head motion should start in dry-run self-test")
+    time.sleep(0.05)
+    SpeakingPlaybackCue(robot, "neutral", "nod", None, reset_reason="self-test cue cleanup").stop()
+    stale_thread.join(timeout=2.0)
+    if stale_thread.is_alive():
+        raise AssertionError("unstarted playback cue stop should clear stale speaking motion")
 
     queue_url = tts_queue_url("http://127.0.0.1:8777/speak_async")
     if queue_url != "http://127.0.0.1:8777/queue":
         raise AssertionError(f"bad TTS queue URL: {queue_url}")
     if estimate_tts_seconds("好，我先安靜陪你休息。") < 1.2:
         raise AssertionError("TTS estimate below minimum")
+    tts_probe_args = argparse.Namespace(
+        tts_url="http://127.0.0.1:8777/speak_async",
+        tts_timeout=0.1,
+        tts_poll_interval=0.1,
+        tts_start_poll_interval=0.05,
+        tts_speaking_start_timeout=0.1,
+        tts_debug=False,
+        tts_speaking_require_audio=True,
+    )
+    original_get_json = voice_chat.get_json
+    try:
+        starts: list[str] = []
+
+        def fake_tts_finished_without_audio(url: str, timeout_sec: float = 0.0) -> dict[str, Any]:
+            return {
+                "running": False,
+                "last_result": {"job_id": "job-no-audio", "playback": {"volume_gain": 4.8}},
+            }
+
+        voice_chat.get_json = fake_tts_finished_without_audio  # type: ignore[assignment]
+        if not wait_for_tts_job(
+            "job-no-audio",
+            tts_probe_args,
+            timeout_sec=0.5,
+            on_playback_start=lambda: starts.append("started"),
+        ):
+            raise AssertionError("strict TTS queue wait should succeed when job finished")
+        if starts:
+            raise AssertionError("FRDM Speaking should not start unless TTS audio.playing is observed")
+
+        queue_polls = 0
+
+        def fake_tts_audio_observed(url: str, timeout_sec: float = 0.0) -> dict[str, Any]:
+            nonlocal queue_polls
+            if str(url).endswith("/queue"):
+                queue_polls += 1
+                if queue_polls == 1:
+                    return {"running": True, "current": {"id": "job-audio"}}
+                return {
+                    "running": False,
+                    "last_result": {"job_id": "job-audio", "playback": {"volume_gain": 4.8}},
+                }
+            return {"audio": {"playing": True}}
+
+        starts.clear()
+        voice_chat.get_json = fake_tts_audio_observed  # type: ignore[assignment]
+        if not wait_for_tts_job(
+            "job-audio",
+            tts_probe_args,
+            timeout_sec=0.5,
+            on_playback_start=lambda: starts.append("started"),
+        ):
+            raise AssertionError("TTS queue wait should succeed when audio is observed")
+        if starts != ["started"]:
+            raise AssertionError("FRDM Speaking should start exactly once when TTS audio.playing is observed")
+    finally:
+        voice_chat.get_json = original_get_json  # type: ignore[assignment]
 
     if detect_focus_mode_intent("開始專心工作 25 分鐘 寫 UART 報告") != "start":
         raise AssertionError("focus start intent detection failed")
@@ -8136,6 +9006,24 @@ def run_self_test() -> int:
     audio_volume_route = detect_music_route({"transcript": "我聽到聲音超小，幫我調大音量"}, music_args)
     if audio_volume_route.get("intent"):
         raise AssertionError(f"volume complaint was misdetected as music: {audio_volume_route}")
+    if "關掉" not in music_control_reply("stop", {"ok": True, "stopped": True}):
+        raise AssertionError("music stop confirmation should be spoken")
+    if "沒有在播放" not in music_control_reply("stop", {"ok": True, "stopped": False, "message": "no active mpv process"}):
+        raise AssertionError("music stop no-active confirmation should be spoken")
+    local_response: dict[str, Any] = {}
+    local_control = apply_local_control_reply(local_response, "好，我處理好了。", head_motion="nod", reason="self-test")
+    if local_response.get("reply") != "好，我處理好了。" or local_control["head_motion"] != "nod":
+        raise AssertionError(f"local control reply helper failed: {local_response}")
+    fan_local_response: dict[str, Any] = {}
+    fan_local_control = apply_local_control_reply(
+        fan_local_response,
+        "好，我幫你把風扇關掉。",
+        head_motion="none",
+        screen_mode="normal",
+        reason="self-test ESP32 local control",
+    )
+    if fan_local_control["head_motion"] != "none" or fan_local_control["screen_mode"] != "normal":
+        raise AssertionError(f"ESP32 local control should speak without head motion: {fan_local_response}")
 
     weather_args = argparse.Namespace(
         no_weather=False,
@@ -8194,6 +9082,8 @@ def run_self_test() -> int:
     )
     if weather_payload_with_local != "daily,22,29,41,61,254":
         raise AssertionError(f"weather local temperature UART payload formatting failed: {weather_payload_with_local}")
+    if format_temp_room_uart_payload(25.36) != "254":
+        raise AssertionError("TempRoom UART payload should use Celsius*10")
     if extract_temperature_c({"ok": True, "temperature_c": 25.36}) != 25.36:
         raise AssertionError("ESP32 temperature JSON parsing failed")
     if extract_temperature_c("25.4") != 25.4:
@@ -8268,15 +9158,22 @@ def speak_reply_and_wait(
             response["_client_tts_error"] = f"queue wait failed for job_id={job_id}"
         return ok
 
+    require_audio_playing = bool(getattr(args, "tts_speaking_require_audio", True))
     # /speak blocking path: returning from POST means playback is done.
     playback = result.get("playback") if isinstance(result.get("playback"), dict) else {}
     if playback:
-        notify_playback_start()
+        if not require_audio_playing:
+            notify_playback_start()
+        elif args.tts_debug:
+            print("TTS blocking playback already returned; Speaking UART was not sent after playback ended.")
         print("TTS finished: blocking playback returned.")
         response["_client_tts_ok"] = True
         return True
 
-    notify_playback_start()
+    if not require_audio_playing:
+        notify_playback_start()
+    elif args.tts_debug:
+        print("TTS response had no queue job/playback marker; Speaking UART waits for audio.playing and was not sent.")
     time.sleep(estimated_sec)
     print(f"TTS estimated finished after {estimated_sec:.1f}s.")
     response["_client_tts_ok"] = True
@@ -8391,6 +9288,50 @@ def set_post_reply_screen(
 
     robot.restore_persistent_screen_state()
     mark_uart("UART persistent screen state sent")
+
+
+def apply_local_control_reply(
+    response: dict[str, Any],
+    reply: str,
+    *,
+    emotion: str = "neutral",
+    head_motion: str = "none",
+    screen_mode: str = "unchanged",
+    persistent_state: str = "unchanged",
+    reason: str = "local control",
+) -> dict[str, str]:
+    control = {
+        "persistent_state": persistent_state,
+        "screen_mode": screen_mode,
+        "emotion": normalize_emotion_name(emotion, default="neutral"),
+        "head_motion": head_motion if head_motion in VALID_HEAD_MOTIONS else "none",
+        "reason": reason,
+    }
+    response["reply"] = str(reply or "").strip()
+    response["control"] = control
+    response["emotion"] = emotion_summary_from_control(control)
+    return control
+
+
+def music_control_reply(action: str, result: dict[str, Any] | None) -> str:
+    action = str(action or "").strip().lower()
+    result = result or {}
+    ok = bool(result.get("ok", False))
+    message = str(result.get("message", "") or "").strip().lower()
+    no_active = "no active" in message or result.get("stopped") is False or result.get("paused") is False
+    if action == "stop":
+        if ok and not no_active:
+            return "好，我把音樂關掉了。"
+        if ok:
+            return "音樂現在沒有在播放。"
+        return "我想關掉音樂，但音樂播放器目前沒有回應。"
+    if action == "pause":
+        if ok and not no_active:
+            return "好，我先暫停音樂。"
+        if ok:
+            return "音樂現在沒有在播放。"
+        return "我想暫停音樂，但音樂播放器目前沒有回應。"
+    return "音樂控制已處理。"
 
 
 def emotion_summary_from_control(control: dict[str, str]) -> dict[str, Any]:
@@ -8606,6 +9547,134 @@ def handle_todo_response(
     return tts_ok or not getattr(args, "require_tts", False)
 
 
+def esp32_ble_reply_for_commands(
+    commands: list[str],
+    *,
+    connected: bool,
+    queued: int | None = None,
+    reconnecting: bool = False,
+    already_state: str = "",
+) -> str:
+    upper = [command.upper() for command in commands]
+    already_state = str(already_state or "").strip().lower()
+    if already_state == "fan_off":
+        base = "電風扇明明已經是關的，我就不再重複送關閉指令。"
+    elif "ALL_OFF" in upper:
+        base = "好，我幫你把風扇和 LED 都關掉。"
+    elif any(command.startswith("LED_ON") for command in upper):
+        base = "好，我幫你把 LED 打開。"
+    elif any(command.startswith("LED_OFF") for command in upper):
+        base = "好，我幫你把 LED 關掉。"
+    elif any(command.startswith("LED_TOGGLE") for command in upper):
+        base = "好，我幫你切換 LED。"
+    elif "FAN_OFF" in upper:
+        base = "好，我幫你把風扇關掉。"
+    elif any(command.startswith("FAN_SPEED:") for command in upper):
+        speed = upper[-1].split(":", 1)[1] if ":" in upper[-1] else ""
+        for command in reversed(upper):
+            if command.startswith("FAN_SPEED:") and ":" in command:
+                speed = command.split(":", 1)[1]
+                break
+        base = f"好，我幫你把風扇速度調到 {speed}。"
+    elif "FAN_ON" in upper:
+        base = "好，我幫你打開風扇。"
+    elif "FAN_TOGGLE" in upper:
+        base = "好，我幫你切換風扇。"
+    elif "TEMP?" in upper:
+        base = "好，我幫你向 ESP32-S3 詢問目前溫度。"
+    else:
+        base = "好，我幫你送出 ESP32-S3 控制指令。"
+    if connected:
+        return base
+    if already_state == "fan_off":
+        reconnect_text = "我正在重新連線" if reconnecting else "我會繼續重新連線"
+        return f"{base}另外我現在沒有連上 ESP32-S3 藍芽；{reconnect_text}。"
+    if queued is None or queued > 0:
+        reconnect_text = "我正在重新連線" if reconnecting else "我會繼續重新連線"
+        return f"{base}不過我現在沒有連上 ESP32-S3 藍芽；我已經把指令排進佇列，{reconnect_text}，連上後會自動送出。"
+    return "我現在沒有連上 ESP32-S3 藍芽；我正在重新連線，這次指令還沒有排進去，請你稍後再說一次。"
+
+
+def handle_esp32_ble_response(
+    response: dict[str, Any],
+    args: argparse.Namespace,
+    robot: RobotUartController,
+    timing: TimingLogger | None,
+    esp32_ble_manager: Esp32BleBridgeManager,
+    *,
+    focus_running: bool = False,
+) -> bool | None:
+    transcript = str(response.get("transcript", "") or "").strip()
+    result = esp32_ble_manager.handle_voice_transcript(transcript)
+    if result is None:
+        return None
+
+    ok = bool(result.get("ok", False))
+    connected = bool(result.get("connected", False))
+    commands = [str(command) for command in result.get("commands", [])]
+    reply = esp32_ble_reply_for_commands(
+        commands,
+        connected=connected,
+        queued=int(result.get("queued", 0) or 0),
+        reconnecting=bool(result.get("reconnect_requested", False)),
+        already_state=str(result.get("already_state", "") or ""),
+    )
+    noop = bool(result.get("noop", False))
+    emotion = "neutral" if noop else ("happy" if ok else "confused")
+    control = apply_local_control_reply(
+        response,
+        reply,
+        emotion=emotion,
+        head_motion="none",
+        screen_mode="normal",
+        reason="local ESP32-S3 BLE control",
+    )
+    response["esp32_ble"] = result
+    response["_end_conversation_after_esp32_ble"] = bool(getattr(args, "conversation_mode", False))
+
+    if getattr(args, "quiet_dialog", False):
+        print_quiet_turn_summary(response)
+    else:
+        print()
+        print("ESP32-S3 BLE control:")
+        print(f"  ok        : {ok}")
+        print(f"  connected : {connected}")
+        print(f"  queued    : {result.get('queued')}/{len(commands)}")
+        print(f"  commands  : {', '.join(commands)}")
+        print_control_summary(control)
+        print(f"parsed reply: {reply}")
+        voice_chat.print_result(response, verbose_debug=args.debug)
+
+    if timing is not None:
+        timing.mark("ESP32-S3 BLE command queued")
+
+    robot.stop_active_speaking_head_motion(reason="before ESP32-S3 BLE local control reply")
+    speaking_cue = SpeakingPlaybackCue(
+        robot,
+        emotion,
+        control["head_motion"],
+        timing,
+        timing_label="UART Speaking emotion code sent",
+        reset_reason="speaking_head_motion esp32 ble stop reset",
+    )
+    try:
+        tts_ok = speak_reply_and_wait(response, args, on_playback_start=speaking_cue.start)
+    finally:
+        speaking_cue.stop()
+    if timing is not None:
+        timing.mark("TTS finished or estimated finished")
+
+    set_post_reply_screen(
+        args,
+        robot,
+        timing,
+        control=control,
+        focus_running=focus_running,
+        reason="ESP32-S3 BLE command complete",
+    )
+    return (ok and tts_ok) or (ok and not getattr(args, "require_tts", False))
+
+
 def handle_wake_chat_response(
     response: dict[str, Any],
     args: argparse.Namespace,
@@ -8613,6 +9682,7 @@ def handle_wake_chat_response(
     timing: TimingLogger | None,
     focus_manager: FocusModeManager | None = None,
     todo_manager: TodoListManager | None = None,
+    esp32_ble_manager: Esp32BleBridgeManager | None = None,
 ) -> bool:
     focus_gate_closed_for_turn = False
     if focus_manager is not None and focus_manager.is_running():
@@ -8628,6 +9698,20 @@ def handle_wake_chat_response(
     if focus_manager is not None:
         handled = handle_focus_mode_response(response, args, robot, timing, focus_manager)
         if handled is not None:
+            return handled
+
+    if esp32_ble_manager is not None:
+        handled = handle_esp32_ble_response(
+            response,
+            args,
+            robot,
+            timing,
+            esp32_ble_manager,
+            focus_running=focus_manager.is_running() if focus_manager is not None else False,
+        )
+        if handled is not None:
+            if focus_gate_closed_for_turn and focus_manager is not None and focus_manager.is_running():
+                focus_manager.open_uart_gate()
             return handled
 
     weather_result = maybe_apply_weather_response(response, args)
@@ -8660,6 +9744,47 @@ def handle_wake_chat_response(
     if music_route.get("action") in {"stop", "pause"}:
         music_before_result = execute_music_route(music_route, args, response, phase="before_tts")
         send_music_uart_update(args, robot, music_before_result, reason=f"music {music_route.get('action')} dashboard")
+        action = str(music_route.get("action", "") or "")
+        control = apply_local_control_reply(
+            response,
+            music_control_reply(action, music_before_result),
+            emotion="neutral",
+            head_motion="none",
+            reason=f"local music {action} control",
+        )
+        print("Music stop/pause handled before TTS; local confirmation will be spoken.")
+        if not quiet_dialog:
+            print_control_summary(control)
+            print(f"parsed reply: {response.get('reply', '')}")
+
+        robot.stop_active_speaking_head_motion(reason="before music stop/pause local control reply")
+        speaking_cue = SpeakingPlaybackCue(
+            robot,
+            control["emotion"],
+            control["head_motion"],
+            timing,
+            timing_label="UART Speaking emotion code sent",
+            reset_reason="speaking_head_motion music stop/pause reset",
+        )
+        try:
+            tts_ok = speak_reply_and_wait(response, args, on_playback_start=speaking_cue.start)
+        finally:
+            speaking_cue.stop()
+        if timing is not None:
+            timing.mark("music stop/pause TTS finished or estimated finished")
+
+        set_post_reply_screen(
+            args,
+            robot,
+            timing,
+            control=control,
+            music_action=action,
+            focus_running=focus_manager.is_running() if focus_manager is not None else False,
+            reason="music stop/pause confirmation complete",
+        )
+        if focus_gate_closed_for_turn and focus_manager is not None and focus_manager.is_running():
+            focus_manager.open_uart_gate()
+        return tts_ok or not getattr(args, "require_tts", False)
 
     if control["persistent_state"] in {"normal", "sleep"}:
         robot.set_persistent_state(control["persistent_state"])
@@ -8731,7 +9856,7 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
         raw_preview = str(debug_obj.get("ollama_content_preview", "")).strip()
         if raw_preview:
             print(f"AI raw response preview: {raw_preview}")
-        return 0 if handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager) else 1
+        return 0 if handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager, None) else 1
     finally:
         focus_manager.shutdown()
 
@@ -8926,6 +10051,7 @@ def send_and_handle_audio_turn(
     robot: RobotUartController,
     focus_manager: FocusModeManager | None,
     todo_manager: TodoListManager | None,
+    esp32_ble_manager: Esp32BleBridgeManager | None,
     turn_state: dict[str, Any],
     audio: np.ndarray,
     meta: dict[str, Any],
@@ -8971,6 +10097,7 @@ def send_and_handle_audio_turn(
             )
         if rms < args.rms_threshold:
             print("SKIP: audio RMS too low; not sending.")
+            robot.force_motion_idle(reason="low RMS turn skipped")
             robot.restore_persistent_screen_state()
             return True, False
         meta["audio_rms"] = rms
@@ -9017,7 +10144,13 @@ def send_and_handle_audio_turn(
             print(f"AI raw response preview: {raw_preview}")
 
         transcript = str(response.get("transcript", "") or "")
-        append_ai_trace(response, args, turn_source=str(metadata.get("turn_source") or meta.get("turn_source") or "wake"))
+        append_ai_trace(
+            response,
+            args,
+            turn_source=str(metadata.get("turn_source") or meta.get("turn_source") or "wake"),
+            recording_meta=meta,
+            metadata=metadata,
+        )
         focus_intent = detect_focus_mode_intent(transcript) if focus_manager is not None else None
         focus_was_running = focus_manager.is_running() if focus_manager is not None else False
         end_keyword = end_session_keyword(transcript)
@@ -9029,16 +10162,21 @@ def send_and_handle_audio_turn(
                 response_vision_summary(response)
             print(f"Conversation end keyword detected ({end_keyword}); returning to Normal and wake-only standby.")
             if getattr(args, "speak_end_reply", False):
-                ok = handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager)
+                ok = handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager, esp32_ble_manager)
                 restore_after_conversation_end(args, robot, timing)
                 recorder.reset_wake()
                 return ok, True
             print("TTS skipped for end command.")
+            robot.force_motion_idle(reason="conversation end without TTS")
             restore_after_conversation_end(args, robot, timing)
             recorder.reset_wake()
             return True, True
 
-        ok = handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager)
+        ok = handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager, esp32_ble_manager)
+        if getattr(args, "conversation_mode", False) and response.get("_end_conversation_after_esp32_ble"):
+            print("ESP32-S3 BLE control command handled; returning to wake-only standby.")
+            recorder.reset_wake()
+            return ok, True
         if conversation_should_end_after_sleep_control(response, args):
             print("Sleep mode requested; returning to wake-only standby so the next command requires Hey Jarvis.")
             recorder.reset_wake()
@@ -9102,11 +10240,25 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     pet_idle_manager: PetIdleReflectionManager | None = None
     todo_event_listener: FrdmTodoEventListener | None = None
     fan_event_manager: FrdmFanControlManager | None = None
+    esp32_ble_manager: Esp32BleBridgeManager | None = None
+    esp32_dashboard_server: Esp32DashboardControlServer | None = None
+    temp_room_publisher: FrdmRoomTemperaturePublisher | None = None
     uart_bus: FrdmUartBus | None = None
     uart_proxy_server: FrdmUartProxyServer | None = None
     temperature_receiver: Esp32TemperatureReceiver | None = None
     try:
         temperature_receiver = maybe_start_esp32_temperature_receiver(args)
+        temp_room_uart_enabled = (
+            not getattr(args, "no_temp_room_uart", False)
+            and float(getattr(args, "temp_room_uart_interval_sec", 10.0) or 0.0) > 0.0
+        )
+        if (
+            bool(getattr(args, "esp32_ble", False))
+            and temperature_receiver is None
+            and (not getattr(args, "no_weather_local_temperature", False) or temp_room_uart_enabled)
+        ):
+            temperature_receiver = Esp32TemperatureReceiver(args)
+            setattr(args, "_esp32_temperature_receiver", temperature_receiver)
         if not voice_chat.preflight_server(args):
             signal.signal(signal.SIGINT, previous_sigint)
             if temperature_receiver is not None:
@@ -9172,8 +10324,15 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     focus_manager = FocusModeManager(args, camera_manager, uart_proxy_url=uart_proxy_server.url if uart_proxy_server is not None else "")
     pet_idle_manager = PetIdleReflectionManager(args, robot, focus_manager)
     todo_manager = TodoListManager(args)
+    esp32_ble_manager = Esp32BleBridgeManager(args, temperature_receiver)
+    esp32_ble_manager.start()
+    temp_room_publisher = FrdmRoomTemperaturePublisher(args, robot, temperature_receiver)
+    temp_room_publisher.start()
+    if not getattr(args, "no_esp32_dashboard_control", False) and esp32_ble_manager.is_enabled():
+        esp32_dashboard_server = Esp32DashboardControlServer(args, esp32_ble_manager)
+        esp32_dashboard_server.start()
     todo_event_listener = FrdmTodoEventListener(args, robot, todo_manager)
-    fan_event_manager = FrdmFanControlManager(args)
+    fan_event_manager = FrdmFanControlManager(args, esp32_ble_manager)
     event_router.add_handler("todo", todo_event_listener.handle_line)
     event_router.add_handler("fan", fan_event_manager.handle_line)
     todo_event_listener.start()
@@ -9190,6 +10349,12 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}")
         if fan_event_manager is not None:
             fan_event_manager.stop()
+        if esp32_dashboard_server is not None:
+            esp32_dashboard_server.stop()
+        if temp_room_publisher is not None:
+            temp_room_publisher.stop()
+        if esp32_ble_manager is not None:
+            esp32_ble_manager.stop()
         if todo_event_listener is not None:
             todo_event_listener.stop()
         if uart_proxy_server is not None:
@@ -9300,6 +10465,21 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         f"dashboard_sync={not args.no_fan_dashboard_sync}, command={'set' if args.fan_control_command else 'not set'}"
     )
     print(f"FRDM fan touch events: {fan_desc}")
+    if getattr(args, "esp32_ble", False):
+        esp32_ble_desc = (
+            f"enabled, name={args.esp32_ble_name}, "
+            f"address={args.esp32_ble_address or 'scan-by-name'}, "
+            f"voice_control={not args.no_esp32_ble_voice_control}, "
+            f"frdm_relay={not args.no_esp32_ble_frdm_control}, "
+            f"min_pwm={esp32_ble.min_nonzero_pwm() if esp32_ble is not None else '?'}, "
+            f"passive_reminder={not args.no_esp32_ble_passive_reminder} "
+            f"(>{args.esp32_ble_passive_threshold:g} C)"
+        )
+    else:
+        esp32_ble_desc = "disabled"
+    print(f"ESP32-S3 BLE fan/LED/temp: {esp32_ble_desc}")
+    if esp32_dashboard_server is not None:
+        print(f"ESP32 dashboard API: http://{esp32_dashboard_server.host}:{esp32_dashboard_server.port}/api/esp32/status")
     print(
         "Recording cues: start beep before each turn; "
         f"speech-end beep + image capture before upload (delay={args.speech_end_image_delay:g}s)"
@@ -9311,6 +10491,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             f"{args.music_url}, backend={args.music_backend}->{resolve_music_backend(args)}, "
             f"autostart={not args.no_music_autostart}, "
             f"mpv_audio={args.music_mpv_audio_device}, "
+            f"mpv_volume={args.music_mpv_volume}/{args.music_mpv_volume_max}, "
             f"mpv_cookies={'set' if (args.music_mpv_ytdl_cookies or args.music_mpv_ytdl_cookies_from_browser) else 'not set'}, "
             f"pause_on_wake={not args.no_music_pause_on_wake}, "
             f"wake_guard={f'threshold={args.music_wake_threshold:g}/confirm={args.music_wake_confirm_chunks}' if (args.music_wake_guard and not args.no_music_wake_guard) else 'off'}, "
@@ -9334,7 +10515,11 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             f"source=Open-Meteo, startup_uart={startup_weather}"
         )
     print(f"Weather tool: {weather_desc}")
-    if args.no_weather_local_temperature or args.esp32_temperature_mode == "disabled":
+    if args.no_weather_local_temperature:
+        local_temp_desc = "disabled"
+    elif getattr(args, "esp32_ble", False) and args.esp32_temperature_mode == "disabled":
+        local_temp_desc = "BLE notify from ESP32-S3 status characteristic"
+    elif args.esp32_temperature_mode == "disabled":
         local_temp_desc = "disabled"
     elif args.esp32_temperature_mode == "push":
         local_temp_desc = f"push receiver http://{args.esp32_temperature_host}:{args.esp32_temperature_port}{normalize_temperature_path(args.esp32_temperature_path)}"
@@ -9346,6 +10531,18 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             f"pull fallback {args.esp32_temperature_url or '(none)'}"
         )
     print(f"Weather local temperature: {local_temp_desc}")
+    if getattr(args, "no_uart", False) or getattr(args, "no_temp_room_uart", False):
+        temp_room_desc = "disabled"
+    elif float(getattr(args, "temp_room_uart_interval_sec", 10.0) or 0.0) <= 0.0:
+        temp_room_desc = "disabled (interval <= 0)"
+    elif temperature_receiver is None:
+        temp_room_desc = "disabled (no ESP32 temperature source)"
+    else:
+        temp_room_desc = (
+            f"TempRoom every {args.temp_room_uart_interval_sec:g}s, "
+            f"max_age={args.temp_room_uart_max_age_sec:g}s, payload=Celsius*10"
+        )
+    print(f"FRDM room temperature UART: {temp_room_desc}")
     print(
         "Head motor motion: "
         f"enabled={robot.head_motor_enabled()}, "
@@ -9363,6 +10560,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         f"TTS queue polling: every {args.tts_poll_interval:g}s, "
         f"start_poll={args.tts_start_poll_interval:g}s, "
         f"speaking_start_timeout={args.tts_speaking_start_timeout:g}s, "
+        f"speaking_requires_audio={getattr(args, 'tts_speaking_require_audio', True)}, "
         f"playback_timeout={args.tts_playback_timeout:g}s, "
         f"volume_gain={getattr(args, 'tts_volume_gain', 1.0):g}"
     )
@@ -9415,6 +10613,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                         robot=robot,
                         focus_manager=focus_manager,
                         todo_manager=todo_manager,
+                        esp32_ble_manager=esp32_ble_manager,
                         turn_state=turn_state,
                         audio=audio,
                         meta=meta,
@@ -9479,6 +10678,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                             robot=robot,
                             focus_manager=focus_manager,
                             todo_manager=todo_manager,
+                            esp32_ble_manager=esp32_ble_manager,
                             turn_state=turn_state,
                             audio=followup_audio,
                             meta=followup_meta,
@@ -9512,6 +10712,12 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                 pet_idle_manager.shutdown()
             if fan_event_manager is not None:
                 fan_event_manager.stop()
+            if esp32_dashboard_server is not None:
+                esp32_dashboard_server.stop()
+            if temp_room_publisher is not None:
+                temp_room_publisher.stop()
+            if esp32_ble_manager is not None:
+                esp32_ble_manager.stop()
             if todo_event_listener is not None:
                 todo_event_listener.stop()
             if focus_manager is not None:
@@ -9670,6 +10876,16 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--no-ai-trace-log",
         action="store_true",
         help="Disable writing the dashboard AI trace JSONL.",
+    )
+    conversation_group.add_argument(
+        "--wake-status-path",
+        default=os.getenv("WAKE_STATUS_PATH", str(DEFAULT_WAKE_STATUS_PATH)),
+        help="JSON status file consumed by the smart home dashboard for live listening/volume/wake-score display.",
+    )
+    conversation_group.add_argument(
+        "--no-wake-status-log",
+        action="store_true",
+        help="Disable writing live wake/listening status for the dashboard.",
     )
     conversation_group.add_argument(
         "--speak-end-reply",
@@ -9852,7 +11068,8 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     music_group.add_argument("--music-mpv-audio-keyword", default=os.getenv("MUSIC_MPV_AUDIO_KEYWORD", os.getenv("MPV_AUDIO_DEVICE_KEYWORD", "UACDemo")), help="Keyword for auto mpv audio device discovery.")
     music_group.add_argument("--music-mpv-ytdl-cookies", default=os.getenv("MUSIC_MPV_YTDL_COOKIES", os.getenv("MPV_YTDL_COOKIES", os.getenv("YTDLP_COOKIES", ""))), help="Optional cookies.txt passed to auto-started mpv/yt-dlp for logged-in YouTube playback.")
     music_group.add_argument("--music-mpv-ytdl-cookies-from-browser", default=os.getenv("MUSIC_MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("YTDLP_COOKIES_FROM_BROWSER", ""))), help="Optional yt-dlp browser cookie source for auto-started mpv, e.g. firefox or chrome:Profile 1.")
-    music_group.add_argument("--music-mpv-volume", type=int, default=_env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 100)), help="mpv music volume passed to auto-started sidecar.")
+    music_group.add_argument("--music-mpv-volume", type=int, default=_env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 125)), help="mpv music volume passed to auto-started sidecar.")
+    music_group.add_argument("--music-mpv-volume-max", type=int, default=_env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 200)), help="mpv --volume-max ceiling passed to auto-started sidecar.")
     music_group.add_argument("--music-mpv-ready-timeout", type=float, default=_env_float("MUSIC_MPV_READY_TIMEOUT", _env_float("MPV_READY_TIMEOUT", 1.5)), help="Seconds the music sidecar waits for mpv playback status.")
     music_group.add_argument(
         "--music-wake-pause-timeout",
@@ -9957,13 +11174,68 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     weather_group.add_argument("--frdm-event-poll-interval", type=float, default=_env_float("FRDM_EVENT_POLL_INTERVAL", 0.25), help="Seconds between short UART polls for FRDM-originated events.")
     weather_group.add_argument("--no-frdm-fan-events", action="store_true", help="Do not listen for FRDM fan UI events.")
     weather_group.add_argument("--fan-device-id", default=os.getenv("FAN_DEVICE_ID", "desk_fan"), help="Dashboard device id controlled by FRDM fan events.")
-    weather_group.add_argument("--fan-speed-max", type=int, default=_env_int("FAN_SPEED_MAX", 3), help="Maximum FRDM fan speed level. Levels are mapped to 0..100 percent for dashboard state.")
+    weather_group.add_argument(
+        "--fan-speed-max",
+        type=int,
+        default=_env_int("FAN_SPEED_MAX", 100),
+        help="Maximum FRDM fan speed value. Use 100 for the current slider percent, or 3 for legacy fan levels.",
+    )
     weather_group.add_argument("--fan-duplicate-suppress-sec", type=float, default=_env_float("FAN_DUPLICATE_SUPPRESS_SEC", 2.0), help="Ignore repeated identical FRDM fan events for this many seconds to avoid slider log/dashboard spam.")
     weather_group.add_argument("--fan-dashboard-url", default=DEFAULT_FAN_DASHBOARD_URL, help="Dashboard set-device URL template. Use {device_id} for the URL-escaped device id.")
     weather_group.add_argument("--no-fan-dashboard-sync", action="store_true", help="Do not POST FRDM fan events to the Jetson dashboard API.")
     weather_group.add_argument("--fan-dashboard-timeout", type=float, default=_env_float("FAN_DASHBOARD_TIMEOUT", 1.5))
     weather_group.add_argument("--fan-control-command", default=os.getenv("FAN_CONTROL_COMMAND", ""), help="Optional hardware command template for fan control. Placeholders: {power}, {state}, {speed}, {percent}, {device_id}.")
     weather_group.add_argument("--fan-command-timeout", type=float, default=_env_float("FAN_COMMAND_TIMEOUT", 2.0))
+    esp32_ble_group = parser.add_argument_group("ESP32-S3 BLE fan/LED/temperature")
+    esp32_ble_group.add_argument(
+        "--esp32-ble",
+        action="store_true",
+        default=_env_bool("ESP32_BLE", False),
+        help="Enable ESP32-S3 BLE control for fan, LED, and DS18B20 status notify.",
+    )
+    esp32_ble_group.add_argument("--esp32-ble-name", default=os.getenv("ESP32_BLE_NAME", "ESP32S3_FAN_LED_TEMP"), help="ESP32-S3 BLE advertised device name.")
+    esp32_ble_group.add_argument("--esp32-ble-address", default=os.getenv("ESP32_BLE_ADDRESS", ""), help="Optional BLE address/MAC; skips scanning by name.")
+    esp32_ble_group.add_argument("--esp32-ble-adapter", default=os.getenv("ESP32_BLE_ADAPTER", os.getenv("BLE_ADAPTER", "")), help="Optional BlueZ adapter, e.g. hci0.")
+    esp32_ble_group.add_argument("--esp32-ble-scan-mode", choices=["active", "passive"], default=os.getenv("ESP32_BLE_SCAN_MODE", "active"))
+    esp32_ble_group.add_argument("--esp32-ble-scan-duplicates", action="store_true", default=_env_bool("ESP32_BLE_SCAN_DUPLICATES", False), help="Ask BlueZ to report duplicate advertisement data during scans.")
+    esp32_ble_group.add_argument("--esp32-ble-scan-filter-service", action="store_true", default=_env_bool("ESP32_BLE_SCAN_FILTER_SERVICE", False), help="Ask BlueZ to filter scan results by the ESP32 service UUID.")
+    esp32_ble_group.add_argument("--esp32-ble-scan-timeout", type=float, default=_env_float("ESP32_BLE_SCAN_TIMEOUT", 8.0))
+    esp32_ble_group.add_argument("--esp32-ble-connect-timeout", type=float, default=_env_float("ESP32_BLE_CONNECT_TIMEOUT", 12.0))
+    esp32_ble_group.add_argument("--esp32-ble-reconnect-sec", type=float, default=_env_float("ESP32_BLE_RECONNECT_SEC", 3.0))
+    esp32_ble_group.add_argument("--esp32-ble-write-with-response", action="store_true", help="Force BLE writes to use write-with-response.")
+    esp32_ble_group.add_argument(
+        "--esp32-ble-write-response-auto",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("ESP32_BLE_WRITE_RESPONSE_AUTO", True),
+        help="Let bleak choose BLE write response mode from characteristic properties.",
+    )
+    esp32_ble_group.add_argument(
+        "--esp32-ble-read-status-on-connect",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("ESP32_BLE_READ_STATUS_ON_CONNECT", True),
+        help="Read the status characteristic once immediately after connecting.",
+    )
+    esp32_ble_group.add_argument("--no-esp32-ble-voice-control", action="store_true", help="Do not intercept voice transcripts such as 開風扇 / LED off.")
+    esp32_ble_group.add_argument("--no-esp32-ble-frdm-control", action="store_true", help="Do not relay FRDM Fan/FanSpeed UART events to ESP32 BLE.")
+    esp32_ble_group.add_argument("--esp32-ble-min-fan-pwm", type=int, default=_env_int("FAN_MIN_PWM", 96), help="Minimum nonzero PWM sent to ESP32 for FRDM percent fan speeds.")
+    esp32_ble_group.add_argument("--esp32-ble-voice-speed-step", type=int, default=_env_int("ESP32_BLE_VOICE_SPEED_STEP", 32), help="PWM step used for voice faster/slower commands.")
+    esp32_ble_group.add_argument("--esp32-ble-passive-threshold", type=float, default=_env_float("ESP32_BLE_PASSIVE_THRESHOLD_C", 25.0), help="Temperature above which the bridge reminds the user about the fan.")
+    esp32_ble_group.add_argument("--esp32-ble-passive-cooldown-sec", type=float, default=_env_float("ESP32_BLE_PASSIVE_COOLDOWN_SEC", 120.0))
+    esp32_ble_group.add_argument("--no-esp32-ble-passive-reminder", action="store_true", help="Do not remind when ESP32 BLE temperature is above threshold.")
+    esp32_ble_group.add_argument(
+        "--esp32-ble-passive-message",
+        default=os.getenv("ESP32_BLE_PASSIVE_MESSAGE", "現在溫度 {temp:.1f} 度，有點熱，要不要幫你開風扇？"),
+        help="Passive reminder text. Supports {temp} and {threshold}.",
+    )
+    esp32_ble_group.add_argument("--no-esp32-ble-tts-reminder", action="store_true", help="Print passive reminders without calling Piper TTS.")
+    esp32_ble_group.add_argument("--esp32-ble-tts-timeout", type=float, default=_env_float("ESP32_BLE_TTS_TIMEOUT", 1.5))
+    esp32_ble_group.add_argument("--esp32-dashboard-host", default=DEFAULT_ESP32_DASHBOARD_HOST, help="Local host for dashboard -> ESP32 BLE HTTP control.")
+    esp32_ble_group.add_argument("--esp32-dashboard-port", type=int, default=_env_int("ESP32_DASHBOARD_PORT", DEFAULT_ESP32_DASHBOARD_PORT), help="Local port for dashboard -> ESP32 BLE HTTP control.")
+    esp32_ble_group.add_argument("--no-esp32-dashboard-control", action="store_true", help="Do not expose the local dashboard ESP32 BLE control API.")
+    esp32_ble_group.add_argument("--esp32-dashboard-debug", action="store_true", help="Log dashboard ESP32 HTTP control requests.")
+    esp32_ble_group.add_argument("--temp-room-uart-interval-sec", type=float, default=_env_float("TEMP_ROOM_UART_INTERVAL_SEC", 10.0), help="Send latest ESP32 room temperature to FRDM as TempRoom <Celsius*10> at this interval. Use 0 to disable.")
+    esp32_ble_group.add_argument("--temp-room-uart-max-age-sec", type=float, default=_env_float("TEMP_ROOM_UART_MAX_AGE_SEC", 30.0), help="Maximum age of an ESP32 temperature reading before skipping TempRoom UART.")
+    esp32_ble_group.add_argument("--no-temp-room-uart", action="store_true", help="Do not send periodic TempRoom UART updates to FRDM.")
     weather_group.add_argument("--no-startup-time", action="store_true", help="Do not send Time UART once at bridge startup.")
     weather_group.add_argument("--no-startup-weather", action="store_true", help="Do not fetch and send startup Weather daily/current UART payloads.")
     weather_group.add_argument(
@@ -10114,7 +11386,13 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--tts-speaking-start-timeout",
         type=float,
         default=_env_float("TTS_SPEAKING_START_TIMEOUT", 1.2),
-        help="Fallback seconds after a TTS job becomes current before entering Speaking if audio.playing cannot be observed.",
+        help="Fallback seconds after a TTS job becomes current before entering Speaking when --no-tts-speaking-require-audio is used.",
+    )
+    tts_timing_group.add_argument(
+        "--tts-speaking-require-audio",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("TTS_SPEAKING_REQUIRE_AUDIO", True),
+        help="Only send FRDM Speaking after TTS /health reports audio.playing=true. This keeps Speaking aligned with real speaker output.",
     )
     return parser
 
@@ -10289,6 +11567,9 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
     if int(getattr(args, "music_mpv_volume", 100) or 0) < 0:
         print("ERROR: --music-mpv-volume must be >= 0.")
         return False
+    if int(getattr(args, "music_mpv_volume_max", 200) or 0) < 100:
+        print("ERROR: --music-mpv-volume-max must be >= 100.")
+        return False
     if float(getattr(args, "music_mpv_ready_timeout", 0.0) or 0.0) < 0.0:
         print("ERROR: --music-mpv-ready-timeout must be >= 0.")
         return False
@@ -10349,6 +11630,43 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
         return False
     if float(getattr(args, "fan_command_timeout", 0.0) or 0.0) <= 0.0:
         print("ERROR: --fan-command-timeout must be > 0.")
+        return False
+    if bool(getattr(args, "esp32_ble", False)) and esp32_ble is None:
+        print(f"ERROR: --esp32-ble requested but ESP32 BLE helper could not be imported: {ESP32_BLE_IMPORT_ERROR}")
+        return False
+    if bool(getattr(args, "esp32_ble", False)):
+        try:
+            __import__("bleak")
+        except Exception as exc:
+            print(f"ERROR: --esp32-ble requires bleak. Install it with: python3 -m pip install bleak ({exc})")
+            return False
+        if float(getattr(args, "esp32_ble_scan_timeout", 0.0) or 0.0) <= 0.0:
+            print("ERROR: --esp32-ble-scan-timeout must be > 0.")
+            return False
+        if float(getattr(args, "esp32_ble_connect_timeout", 0.0) or 0.0) <= 0.0:
+            print("ERROR: --esp32-ble-connect-timeout must be > 0.")
+            return False
+        if float(getattr(args, "esp32_ble_reconnect_sec", 0.0) or 0.0) <= 0.0:
+            print("ERROR: --esp32-ble-reconnect-sec must be > 0.")
+            return False
+        if not 0 <= int(getattr(args, "esp32_ble_min_fan_pwm", 0) or 0) <= 255:
+            print("ERROR: --esp32-ble-min-fan-pwm must be 0..255.")
+            return False
+        os.environ["FAN_MIN_PWM"] = str(int(getattr(args, "esp32_ble_min_fan_pwm", 96) or 96))
+        if int(getattr(args, "esp32_ble_voice_speed_step", 0) or 0) <= 0:
+            print("ERROR: --esp32-ble-voice-speed-step must be > 0.")
+            return False
+        if float(getattr(args, "esp32_ble_passive_cooldown_sec", 0.0) or 0.0) < 0.0:
+            print("ERROR: --esp32-ble-passive-cooldown-sec must be >= 0.")
+            return False
+        if float(getattr(args, "esp32_ble_tts_timeout", 0.0) or 0.0) <= 0.0:
+            print("ERROR: --esp32-ble-tts-timeout must be > 0.")
+            return False
+    if float(getattr(args, "temp_room_uart_interval_sec", 0.0) or 0.0) < 0.0:
+        print("ERROR: --temp-room-uart-interval-sec must be >= 0.")
+        return False
+    if float(getattr(args, "temp_room_uart_max_age_sec", 0.0) or 0.0) < 0.0:
+        print("ERROR: --temp-room-uart-max-age-sec must be >= 0.")
         return False
     if not getattr(args, "no_pet_idle_reflection", False):
         if float(getattr(args, "pet_idle_interval_sec", 0.0) or 0.0) <= 0.0:

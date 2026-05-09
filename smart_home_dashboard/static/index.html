@@ -89,6 +89,65 @@
       </div>
 
       <div class="section">
+        <div class="section-title">Smart Appliances</div>
+        <div class="appliance-grid">
+          <div class="card appliance-card temperature-card">
+            <div class="appliance-icon temp">℃</div>
+            <div class="appliance-body">
+              <div class="appliance-label">Local Temperature</div>
+              <div class="appliance-value"><span id="local-temp">--</span><span class="appliance-unit">°C</span></div>
+              <div class="appliance-sub" id="local-temp-source">ESP32 BLE</div>
+            </div>
+          </div>
+
+          <div class="card appliance-card">
+            <div class="appliance-icon light">◉</div>
+            <div class="appliance-body">
+              <div class="appliance-label">LED Light</div>
+              <div class="appliance-sub" id="led-status">--</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="appliance-led-toggle">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="card appliance-card appliance-fan-card">
+            <div class="appliance-row">
+              <div class="appliance-icon fan">✦</div>
+              <div class="appliance-body">
+                <div class="appliance-label">Fan Speed</div>
+                <div class="appliance-sub" id="fan-status">--</div>
+              </div>
+              <div class="range-value" id="appliance-fan-value">0%</div>
+            </div>
+            <input type="range" class="range-slider" id="appliance-fan-slider" min="0" max="100" step="5" value="0">
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Wake Monitor</div>
+        <div class="wake-grid">
+          <div class="stat-card wake-card">
+            <div class="stat-label">Listening</div>
+            <div class="stat-value small" id="wake-listening">--</div>
+            <div class="stat-sub" id="wake-phase">phase --</div>
+          </div>
+          <div class="stat-card wake-card">
+            <div class="stat-label">Volume</div>
+            <div class="stat-value small" id="wake-volume">--</div>
+            <div class="stat-sub" id="wake-volume-sub">recent peak --</div>
+          </div>
+          <div class="stat-card wake-card">
+            <div class="stat-label">Wake Score</div>
+            <div class="stat-value small" id="wake-score">--</div>
+            <div class="stat-sub" id="wake-score-sub">threshold --</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
         <div class="section-title">System Health</div>
         <div class="health-grid" id="health-grid"></div>
       </div>

@@ -1,0 +1,23 @@
+[Unit]
+Description=MakeNTU Wake Bridge with FRDM UART and ESP32-S3 BLE
+After=default.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/asrlab-yian/MakeNTU
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/makentu/wake-bridge.env
+ExecStartPre=/bin/bash -lc 'bluetoothctl power on >/dev/null 2>&1 || true'
+ExecStartPre=/bin/bash -lc 'for i in {1..20}; do bluetoothctl show 2>/dev/null | grep -q "Powered: yes" && exit 0; bluetoothctl power on >/dev/null 2>&1 || true; sleep 2; done; exit 0'
+ExecStart=/home/asrlab-yian/MakeNTU/frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=makentu-wake-bridge
+
+[Install]
+WantedBy=default.target

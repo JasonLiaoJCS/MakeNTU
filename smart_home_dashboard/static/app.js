@@ -13,6 +13,7 @@
     devices: [],
     todo: [],
     music: { status: 'stopped' },
+    statusPayload: {},
     statusTimer: null,
     cameraTimer: null,
     eventsTimer: null,
@@ -85,6 +86,30 @@
     return [];
   }
 
+  function numberOrNull(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function fmtNumber(value, digits = 1) {
+    const n = numberOrNull(value);
+    if (n === null) return '--';
+    return Number.isInteger(n) ? String(n) : n.toFixed(digits);
+  }
+
+  function findDevice(id, type = '') {
+    return state.devices.find(item => item.id === id)
+      || state.devices.find(item => type && item.type === type)
+      || null;
+  }
+
+  function findSensor(sensors, id, type = '') {
+    return sensors.find(item => item.id === id)
+      || sensors.find(item => type && item.type === type)
+      || null;
+  }
+
   function setActiveTab(tabName) {
     state.activeTab = tabName;
     $$('.tab-panel').forEach(panel => {
@@ -118,6 +143,7 @@
     }
 
     const s = res.data;
+    state.statusPayload = s;
     dot.classList.remove('danger', 'warn');
     dot.classList.add('ok');
     txt.textContent = 'connected';
@@ -125,10 +151,12 @@
 
     renderHome(s.home, s.health);
     renderWeather(s.weather);
+    renderWakeMonitor(s.wake || {});
     renderHealth(s.health || {});
 
     state.devices = asArray(s.devices, 'devices');
     renderDevices();
+    renderAppliancePanel(s);
 
     state.todo = asArray(s.todo?.items || s.todo, 'items');
     renderTodo();
@@ -178,7 +206,7 @@
     const grid = $('#health-grid');
     const items = [
       { key: 'ai_server', label: 'AI Server', icon: '◆' },
-      { key: 'tts', label: 'TTS', icon: '◒' },
+      { key: 'wake', label: 'Wake Listen', icon: '◒' },
       { key: 'camera', label: 'Camera', icon: '◉' },
       { key: 'music', label: 'Music', icon: '♪' },
       { key: 'weather', label: 'Weather', icon: '⛅' },
@@ -193,6 +221,49 @@
         </div>
       `;
     }).join('');
+  }
+
+  function renderAppliancePanel(status = state.statusPayload || {}) {
+    if (!$('#local-temp')) return;
+    const sensors = asArray(status.sensors || status.sensor_state, 'sensors');
+    const tempSensor = findSensor(sensors, 'home_temperature', 'temperature');
+    const local = status.local_temperature || {};
+    const tempValue = local.ok ? local.temperature_c : tempSensor?.value;
+    const tempOnline = !!local.ok || !!tempSensor?.online;
+    $('#local-temp').textContent = fmtNumber(tempValue, 1);
+    const tempSource = local.source || tempSensor?.source || 'ESP32 BLE';
+    const tempAge = local.age_sec != null ? `${Math.round(Number(local.age_sec) || 0)}s ago` : fmtRelative(local.updated_at || tempSensor?.updated_at);
+    $('#local-temp-source').textContent = tempOnline ? `${tempSource} · ${tempAge}` : 'waiting for ESP32 reading';
+
+    const light = findDevice('living_light', 'light');
+    const ledOn = light?.state === 'on';
+    const ledToggle = $('#appliance-led-toggle');
+    ledToggle.checked = ledOn;
+    ledToggle.disabled = !light;
+    $('#led-status').textContent = light ? `${ledOn ? 'On' : 'Off'} · ${light.online === false ? 'offline' : 'ready'}` : 'not configured';
+
+    const fan = findDevice('desk_fan', 'fan');
+    const fanValue = Math.max(0, Math.min(100, Number(fan?.value || 0)));
+    const fanSlider = $('#appliance-fan-slider');
+    fanSlider.value = String(fanValue);
+    fanSlider.disabled = !fan;
+    $('#appliance-fan-value').textContent = `${fanValue}%`;
+    $('#fan-status').textContent = fan ? `${fan.state === 'on' && fanValue > 0 ? 'On' : 'Off'} · ${fan.online === false ? 'offline' : 'ready'}` : 'not configured';
+  }
+
+  function renderWakeMonitor(wake) {
+    if (!$('#wake-listening')) return;
+    const listening = !!wake.listening;
+    const stale = !!wake.stale;
+    $('#wake-listening').textContent = listening ? 'OK' : (stale ? 'Stale' : 'Offline');
+    $('#wake-listening').classList.toggle('ok', listening);
+    $('#wake-listening').classList.toggle('danger', !listening);
+    const age = wake.age_sec == null ? '--' : `${Math.round(Number(wake.age_sec) || 0)}s ago`;
+    $('#wake-phase').textContent = `${wake.phase || '--'} · ${age}`;
+    $('#wake-volume').textContent = fmtNumber(wake.volume, 0);
+    $('#wake-volume-sub').textContent = `recent peak ${fmtNumber(wake.recent_peak, 0)}`;
+    $('#wake-score').textContent = fmtNumber(wake.wake_score, 3);
+    $('#wake-score-sub').textContent = `threshold ${fmtNumber(wake.wake_threshold, 2)}`;
   }
 
   function refreshCamera() {
@@ -316,6 +387,7 @@
       if ('state' in payload) device.state = payload.state;
       if ('value' in payload) device.value = payload.value;
       renderDevices();
+      renderAppliancePanel();
     }
 
     const res = await api(`/api/devices/${encodeURIComponent(deviceId)}/set`, {
@@ -332,9 +404,39 @@
       const idx = state.devices.findIndex(item => item.id === deviceId);
       if (idx >= 0) state.devices[idx] = res.data.device;
       renderDevices();
+      renderAppliancePanel();
     }
-    toast(`${device?.name || 'Device'} updated`);
+    const esp32 = res.data.esp32_control;
+    if (esp32 && esp32.ok === false && !esp32.skipped) {
+      toast(`Saved, BLE not reached: ${esp32.error || esp32.reason || 'ESP32 bridge offline'}`, true);
+    } else {
+      toast(`${device?.name || 'Device'} updated`);
+    }
     refreshEvents();
+  }
+
+  function bindApplianceControls() {
+    const led = $('#appliance-led-toggle');
+    if (led) {
+      led.addEventListener('change', event => {
+        setDevice('living_light', {
+          state: event.target.checked ? 'on' : 'off',
+          value: event.target.checked ? 100 : 0,
+        });
+      });
+    }
+
+    const fan = $('#appliance-fan-slider');
+    if (fan) {
+      fan.addEventListener('input', event => {
+        $('#appliance-fan-value').textContent = `${event.target.value}%`;
+        $('#fan-status').textContent = Number(event.target.value) > 0 ? 'On · adjusting' : 'Off · adjusting';
+      });
+      fan.addEventListener('change', event => {
+        const value = parseInt(event.target.value, 10) || 0;
+        setDevice('desk_fan', { state: value > 0 ? 'on' : 'off', value });
+      });
+    }
   }
 
   function renderTodo() {
@@ -736,6 +838,7 @@
     bindCamera();
     bindTodoForm();
     bindMusicControls();
+    bindApplianceControls();
     bindMaintenance();
     bindFocusRange();
     bindAiTrace();
