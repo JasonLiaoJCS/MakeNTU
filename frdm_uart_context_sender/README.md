@@ -31,12 +31,12 @@ camera                : auto, 320x240, JPEG quality 70, memory-only
 image_capture         : after end-of-speech beep, before upload
 uart                  : auto, 115200, CRLF
 tts                   : local Piper /speak_async, AUDIO_DEVICE=auto:UACDemo
-tts volume            : --tts-volume-gain 4.8, server accepts volume_gain 0.05..8.0
-beep volume           : --beep-volume 0.35
+tts volume            : --tts-volume-gain 3.6, server accepts volume_gain 0.05..8.0
+beep cue              : --beep-player aplay, --beep-volume 0.55
 USB output volume     : PulseAudio UACDemo ~70%, ALSA PCM 70%
 music/weather         : local tool server on 127.0.0.1:8788, mpv + Open-Meteo
 ESP32-S3 BLE          : fan + MAX7219 LED + DS18B20 status over BLE, ESP32S3_FAN_LED_TEMP
-local temperature     : preferred from ESP32-S3 BLE notify, legacy HTTP push/pull still supported
+local temperature     : preferred from ESP32-S3 BLE sidecar status, legacy HTTP push/pull still supported
 to-do list            : local JSON voice tool, frdm_uart_context_sender/logs/todo_list.json
 focus work mode       : voice-triggered start/stop, periodic /focus-check, JSONL log + Markdown report
 pet idle reflection   : every ~30s ask /text-chat an internal self-question; most checks stay silent, occasional worthy shares use TTS
@@ -47,23 +47,34 @@ Do not pin numeric USB indexes. After a USB replug, `--device 25`, `--beep-devic
 Conservative on-site volume settings:
 
 ```text
-TTS .env default      : DEFAULT_VOLUME_GAIN=4.8
-Wake Bridge default   : --tts-volume-gain 4.8
+TTS .env default      : DEFAULT_VOLUME_GAIN=3.6
+Wake Bridge default   : --tts-volume-gain 3.6
 PulseAudio USB sink   : about 70%
 ALSA USB PCM          : 70%
-Too loud              : try 3.6 and --beep-volume 0.25
+Too loud/distorted    : try 2.8 and BEEP_VOLUME=0.35 or 0.25
 Too quiet             : try 6.0 before going higher
 ```
 
 Volume is reset to absolute values in three places: `~/.config/systemd/user/makentu-uacdemo-volume.service` at boot/login with user linger enabled, `~/.config/autostart/makentu-uacdemo-volume.desktop` after the desktop session starts, and `~/.bashrc` whenever a new terminal opens. `set_uacdemo_volume.sh` rejects relative values such as `+5%`, so repeated boots or terminals do not drift louder or quieter.
 
-When code changes, restart the matching terminal:
+When code changes during a live demo, prefer restarting the Jetson pipeline so
+the service order, ESP32 sidecar, audio defaults, and parser flags stay
+consistent:
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
+```
+
+For narrow debugging, restart or inspect the matching service:
 
 ```text
 Windows server / prompt / emotion changed     -> restart Windows Terminal 1
 TTS server / volume_gain changed              -> restart Jetson Terminal 2
-Wake Bridge / UART / routing / docs changed   -> restart Jetson Terminal 3
+ESP32 BLE / fan / LED / temp changed          -> restart Jetson Terminal 6
 Music/weather intent changed                  -> restart Jetson Terminal 4
+Dashboard UI/API changed                      -> restart Jetson Terminal 5
+Wake Bridge / UART / routing changed          -> restart Jetson Terminal 3
 ```
 
 ## What This Does
@@ -289,11 +300,12 @@ Demo Checklist
 
 ```text
 wake_voice_chat_frdm_bridge.py   # official Hey Jarvis hands-free demo
-run_wake_bridge_full_demo.sh      # recommended Terminal 3 launcher with auto device detection
+run_jetson_full_demo_pipeline.sh  # recommended Jetson launcher for Terminal 2/6/4/5/3
+run_wake_bridge_full_demo.sh      # Terminal-3-only launcher with auto device detection
 auto_demo_devices.sh              # waits for UACDemo speaker/mic, FRDM UART, and camera
 set_uacdemo_volume.sh             # normalizes UACDemo PulseAudio/ALSA volume
 focus_work_mode.py               # focus work mode subprocess, started/stopped by the Wake Bridge
-esp32s3_ble_fan_led_controller.py # standalone BLE CLI + helper used by Wake Bridge
+esp32s3_ble_fan_led_controller.py # standalone BLE CLI + Terminal 6 sidecar API used by pipeline
 voice_chat_frdm_uart_bridge.py   # manual Enter-to-record version
 frdm_uart_context_sender.py      # standalone FRDM UART command sender
 recover_demo_usb.sh              # Jetson USB host controller recovery
@@ -313,32 +325,66 @@ The Windows desktop runs the bundle copy, so server changes must be synced with 
 
 ## Standard Startup
 
-The full copy-paste Terminal 1/2/4/3 flow is in [QUICK_START.md](QUICK_START.md). The recommended Terminal 3 path is:
+The full operating guide is in [QUICK_START.md](QUICK_START.md). Windows Terminal 1 still runs on the Windows desktop. On the Jetson side, the recommended path is the one-command pipeline:
 
 ```bash
 cd /home/asrlab-yian/MakeNTU
-bash frdm_uart_context_sender/auto_demo_devices.sh
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh start
 ```
 
-`run_wake_bridge_full_demo.sh` exports the auto/keyword device settings, normalizes UACDemo volume, then launches the bridge. Override only when needed:
+`run_jetson_full_demo_pipeline.sh` starts Terminal 2/6/4/5/3 in order: Piper TTS, ESP32 BLE sidecar API, Music/Weather, Dashboard, then the full Wake Bridge parser/settings. The ESP32 BLE reconnect/status notify loop now lives in Terminal 6 on `127.0.0.1:8791`, so Terminal 3 only makes short local API calls and normal conversation is not blocked by BLE polling or reconnect logs. Before starting, the pipeline deep-cleans stale Jetson demo state: recorded pipeline PIDs/process groups, old same-user demo processes, the user `makentu-wake-bridge.service`, and fixed demo ports `8777/8788/8789/8790/8791`. It does not touch Windows Terminal 1.
+
+Pipeline order and ownership:
+
+```text
+Terminal 2  tts       : jetson_piper_tts.server on 8777
+Terminal 6  esp32     : ESP32 BLE API sidecar on 8791
+Terminal 4  music     : music + weather local tool on 8788
+Terminal 5  dashboard : phone/web dashboard on 8789
+Terminal 3  bridge    : wake word, audio, Windows AI, TTS, FRDM UART
+```
+
+Common pipeline commands:
 
 ```bash
-MAKE_NTU_TTS_VOLUME_GAIN=3.6 BEEP_VOLUME=0.25 MUSIC_MPV_VOLUME=220 MUSIC_MPV_VOLUME_MAX=300 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh plan
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh status
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh monitor
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh logs esp32
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh logs bridge
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart --terminals
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh stop
 ```
 
-`MUSIC_MPV_VOLUME` controls only mpv music playback. The default launcher now uses `220` with `MUSIC_MPV_VOLUME_MAX=300`, so music is much louder without changing Piper TTS speech volume.
+Use `plan` when you want to audit the exact ordered commands without touching running processes. The pipeline starts services in the background, so a plain `restart` returns to the shell when startup succeeds. Use `restart --terminals` to open one live log terminal per service, `monitor` to open those terminals after services are already running, or `start --tail` to follow all logs in the current terminal.
+
+For live demo changes, override the pipeline environment and restart the whole Jetson stack so Terminal 6 sidecar and Terminal 3 parser stay matched:
+
+```bash
+PIPELINE_TTS_VOLUME_GAIN=3.0 PET_IDLE_REFLECTION=0 BEEP_VOLUME=0.35 MUSIC_MPV_VOLUME=120 MUSIC_MPV_VOLUME_MAX=200 ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart --terminals
+```
+
+`MUSIC_MPV_VOLUME` controls only mpv music playback. The default pipeline uses `150` with `MUSIC_MPV_VOLUME_MAX=200`, which keeps music louder than raw 100% while avoiding the clipping that can happen at very high mpv gain.
+
+`PET_IDLE_REFLECTION=0` is the default for the pipeline. It disables the background idle `/text-chat` self-reflection loop so Ollama/Windows server capacity is reserved for real user turns. Set `PET_IDLE_REFLECTION=1` only when you intentionally want spontaneous pet idle comments.
+
+For Terminal-3-only debugging, `run_wake_bridge_full_demo.sh` is still available. It exports the auto/keyword device settings, normalizes UACDemo volume, then launches only the bridge. Use it for narrow mic/beep/camera/UART/TTS checks, not for the normal ESP32 BLE full demo:
+
+```bash
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh --print-command
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+```
 
 For the ESP32-S3 BLE board, prefer pinning the MAC discovered by scan-only:
 
 ```bash
-ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A ESP32_BLE_ADAPTER=hci0 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A ESP32_BLE_ADAPTER=hci0 ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 If the fan reports `FAN=ON` but stalls at low slider values, raise the minimum nonzero PWM:
 
 ```bash
-FAN_MIN_PWM=120 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+FAN_MIN_PWM=120 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 Do not hand-type the last few parameters in manual mode; the common mistake is accidentally typing `--uart-debug\terval 0.75`. The correct tail is:
@@ -351,104 +397,48 @@ Do not hand-type the last few parameters in manual mode; the common mistake is a
 
 Core Wake Bridge command:
 
+Do not maintain a second hand-written copy of the long Terminal 3 parser in
+this README. The canonical full-demo parser is the pipeline plan; it expands
+`run_wake_bridge_full_demo.sh` with the Terminal 6 sidecar environment before
+you run anything:
+
 ```bash
 cd /home/asrlab-yian/MakeNTU
-source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-
-python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
-  --server-url http://100.108.141.26:8766/voice-chat \
-  --mic-keyword UACDemo \
-  --beep-keyword UACDemo \
-  --beep-player auto \
-  --noisy-room \
-  --tts-volume-gain 4.8 \
-  --beep-volume 0.35 \
-  --uart-port auto \
-  --uart-baudrate 115200 \
-  --enable-head-motor \
-  --boot-normal-delay 2.0 \
-  --wake-threshold 0.75 \
-  --wake-volume-min 500 \
-  --volume-min 1100 \
-  --speech-start-margin 750 \
-  --silence-duration 1.2 \
-  --silence-margin 900 \
-  --max-speech-seconds 5 \
-  --max-recording-seconds 7 \
-  --audio-read-timeout 0.75 \
-  --recording-progress-interval 1.0 \
-  --conversation-mode \
-  --turn-listen-timeout 8 \
-  --session-idle-timeout 30 \
-  --max-session-turns 20 \
-  --camera-id auto \
-  --camera-width 320 \
-  --camera-height 240 \
-  --camera-jpeg-quality 70 \
-  --camera-latest-timeout 1.0 \
-  --camera-frame-max-age 2.0 \
-  --focus-script /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py \
-  --focus-server-url http://100.108.141.26:8766/focus-check \
-  --focus-interval-sec 60 \
-  --focus-duration-min 0 \
-  --focus-log-root /tmp/focus_voice_test \
-  --focus-alert-threshold 1 \
-  --fan-device-id desk_fan \
-  --fan-speed-max 100 \
-  --esp32-ble \
-  --esp32-ble-adapter hci0 \
-  --esp32-ble-scan-duplicates \
-  --esp32-ble-min-fan-pwm 96 \
-  --esp32-ble-command-queue-max 64 \
-  --esp32-dashboard-host 127.0.0.1 \
-  --esp32-dashboard-port 8791 \
-  --fan-duplicate-suppress-sec 2.0 \
-  --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
-  --focus-notify-mode discord \
-  --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
-  --music-backend mpv \
-  --music-mpv-audio-device auto \
-  --music-mpv-volume 220 \
-  --music-mpv-volume-max 300 \
-  --music-mpv-ready-timeout 1.5 \
-  --music-timeout 5 \
-  --music-wake-pause-timeout 0.25 \
-  --music-wake-beep-settle 0.05 \
-  --post-music-standby-cooldown 0.8 \
-  --music-debug \
-  --weather-default-location Taipei \
-  --weather-timeout 6 \
-  --weather-debug \
-  --esp32-temperature-mode push \
-  --esp32-temperature-host 0.0.0.0 \
-  --esp32-temperature-port 8790 \
-  --esp32-temperature-path /temperature \
-  --temp-room-uart-interval-sec 10 \
-  --temp-room-uart-max-age-sec 30 \
-  --motor-step-delay 0.55 \
-  --motor-smooth-step-deg 120 \
-  --motor-speaking-step-delay 0.72 \
-  --motor-speaking-smooth-step-deg 120 \
-  --motor-reset-repeats 1 \
-  --motor-reset-delay 0.35 \
-  --motor-stop-timeout 6 \
-  --motor-join-timeout 6 \
-  --device-preflight-verbose \
-  --tts-poll-interval 0.75 \
-  --tts-debug \
-  --uart-debug
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh plan
 ```
+
+`run_wake_bridge_full_demo.sh --print-command` is still useful for
+Terminal-3-only debugging, but by itself it shows the standalone bridge parser,
+not the full pipeline's sidecar-owned ESP32 parser.
+
+In pipeline mode, the important ESP32 parser difference is intentional:
+
+```text
+Terminal 6 owns BLE and serves :8791:
+  esp32s3_ble_fan_led_controller.py --api-server --api-port 8791
+
+Terminal 3 reads Terminal 6 through a short local API timeout:
+  --esp32-temperature-mode pull
+  --esp32-temperature-url http://127.0.0.1:8791/api/esp32/status
+  --esp32-ble-sidecar
+  --esp32-ble-api-url http://127.0.0.1:8791/api/esp32
+  --esp32-ble-api-timeout 0.2
+  --no-esp32-dashboard-control
+```
+
+Use `--esp32-temperature-mode push` only for the legacy temperature-only HTTP
+ESP32 path. It is not the normal full fan/LED/temp BLE demo path anymore.
 
 This full mode enables wake word, conversation mode, speech-end image capture, FRDM UART, TTS, To-Do, Music, Weather, and Focus Work Mode. After the first `Hey Jarvis`, follow-up turns do not need the wake word. The bridge returns to wake-only standby after a goodbye phrase, sleep command, music command, focus command, or follow-up timeout.
 
 For one-shot Q&A, remove `--conversation-mode`, `--turn-listen-timeout`, `--session-idle-timeout`, and `--max-session-turns`. For lower latency, add `--ultra-response`; if speech is cut too early, use the more conservative `--turbo-response`.
 
-Keep `--noisy-room` for loud demo spaces. It raises speech/silence gates; the live demo launcher also passes `--beep-volume 0.35` so the cue beep stays controlled. TTS uses a fixed absolute `--tts-volume-gain 4.8`, which is `2x` over the previous `2.4`. If TTS is too loud, try `3.6`; if it is still too quiet, try `6.0`.
+Keep `--noisy-room` for loud demo spaces. It raises speech/silence gates; the live demo launcher also passes `--beep-player aplay --beep-volume 0.55` so the cue beep goes directly to the UACDemo ALSA device. TTS uses a fixed absolute `--tts-volume-gain 3.6`. If TTS sounds distorted or too loud, try `2.8`; if the beep is too sharp, set `BEEP_VOLUME=0.35` or `0.25`.
 
 Beep-only test:
 
 ```bash
-python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --noisy-room --beep-volume 0.35 --test-beep
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --beep-player aplay --noisy-room --beep-volume 0.55 --test-beep
 ```
 
 For a room with background volume around `10000` and speech around `19000`, `--noisy-room` should put thresholds near:
@@ -570,6 +560,7 @@ Music is playing
 -> no music intent: do nothing with Music Player; music stays paused until the user says resume
 -> play/change/resume music: TTS speaks confirmation first, then POST play/query or resume
 -> pause/stop music: POST pause/stop before TTS, then speak a short local confirmation
+-> volume up/down/set: POST volume before TTS, then speak a short local confirmation
 -> bridge returns to standby and keeps listening for Hey Jarvis
 ```
 
@@ -581,6 +572,7 @@ resume       -> TTS first, then resume mpv from IPC pause position, FRDM Music 0
 pause        -> pause mpv first, speak "好，我先暫停音樂。", FRDM Normal 0 0, wake-only standby
 stop         -> stop mpv first, speak "好，我把音樂關掉了。", FRDM Normal 0 0, wake-only standby
 stop no mpv  -> speak "音樂現在沒有在播放。", FRDM Normal 0 0, wake-only standby
+volume       -> adjust current mpv volume first, speak "好，音量調到 X。"; voice up/down changes by 10
 ```
 
 The pause/stop confirmations are local control replies. They still use Piper TTS, but force `head_motion=none`; the Wake Bridge also clears any stale speaking-motion thread before speaking them. This prevents the failure mode where music was stopped successfully but the robot made no sound while the head motor kept moving.
@@ -594,6 +586,9 @@ Hey Jarvis，換成 七里香            -> action=play, query=七里香
 Hey Jarvis，暫停音樂               -> action=pause
 Hey Jarvis，繼續播放音樂           -> action=resume
 Hey Jarvis，停止音樂               -> action=stop
+Hey Jarvis，音樂太小聲，調大音量   -> action=volume, query=+10
+Hey Jarvis，音量小聲一點           -> action=volume, query=-10
+Hey Jarvis，音量調到 120           -> action=volume, query=120
 Hey Jarvis，講個笑話               -> no music call
 Hey Jarvis，我現在是什麼表情       -> no music call, may use vision
 ```
@@ -609,8 +604,8 @@ python3 music_web_player.py \
   --port 8788 \
   --backend mpv \
   --mpv-audio-device auto \
-  --mpv-volume 220 \
-  --mpv-volume-max 300 \
+  --mpv-volume 150 \
+  --mpv-volume-max 200 \
   --mpv-ready-timeout 1.5 \
   --weather-default-location Taipei
 ```
@@ -620,8 +615,8 @@ Important options:
 ```text
 --music-backend mpv              # real playback; auto also prefers mpv
 --music-mpv-audio-device auto    # prefer the UACDemo USB speaker for mpv
---music-mpv-volume 220           # mpv music volume only; does not change Piper TTS
---music-mpv-volume-max 300       # mpv --volume-max ceiling, needed for values above 100
+--music-mpv-volume 150           # mpv music volume only; does not change Piper TTS
+--music-mpv-volume-max 200       # mpv --volume-max ceiling, needed for values above 100
 --music-timeout 5                # play/change request timeout
 --music-wake-pause-timeout 0.6   # short timeout for immediate pause on wake
 --music-debug                    # print Music routing / Music tool logs
@@ -637,10 +632,31 @@ Music volume is separate from Piper TTS volume:
 ```text
 Piper TTS speech volume -> Terminal 3 --tts-volume-gain / Jetson TTS DEFAULT_VOLUME_GAIN
 mpv music volume        -> Terminal 4 --mpv-volume, or Terminal 3 --music-mpv-volume when autostarting
-launcher override       -> MUSIC_MPV_VOLUME=180 MUSIC_MPV_VOLUME_MAX=300 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+pipeline override       -> MUSIC_MPV_VOLUME=120 MUSIC_MPV_VOLUME_MAX=200 ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 If the music itself is quiet but TTS is fine, adjust `MUSIC_MPV_VOLUME` / `--music-mpv-volume`, not `--tts-volume-gain`. Values above 100 require `MUSIC_MPV_VOLUME_MAX` / `--music-mpv-volume-max`; otherwise mpv may clamp the request.
+
+Runtime music volume can be changed without restarting:
+
+```bash
+# Relative voice/API-style step. Voice "調大音量 / 音樂太小聲 / 加十" maps to +10.
+curl -X POST http://127.0.0.1:8788/music \
+  -H "Content-Type: application/json" \
+  -d '{"action":"volume","delta":10}'
+
+# Absolute current volume. Voice "音量調到 120" maps to the same behavior.
+curl -X POST http://127.0.0.1:8788/music \
+  -H "Content-Type: application/json" \
+  -d '{"action":"volume","volume":120}'
+
+# Dashboard proxy used by the website slider.
+curl -X POST http://127.0.0.1:8789/api/music/control \
+  -H "Content-Type: application/json" \
+  -d '{"action":"volume","volume":120}'
+```
+
+The dashboard Music card slider controls the current sidecar volume. If music is playing, mpv is updated immediately through IPC; if music is idle, the value is stored and used for the next play request. Voice relative commands intentionally move only `10` at a time (`+10` / `-10`) so a noisy ASR result cannot jump from comfortable to painfully loud. All runtime values are clamped to `0..volume_max` (`200` by default), and a process restart returns to the CLI/env defaults.
 
 Health fields from `curl http://127.0.0.1:8788/health`:
 
@@ -657,6 +673,9 @@ mpv_volume_max           : configured mpv --volume-max ceiling
 mpv_actual_volume        : live volume read back from mpv IPC while active
 mpv_effective_volume     : actual volume when active, configured fallback when idle
 mpv_volume_clamped       : requested volume was capped to a safe mpv range
+volume                   : current public music volume value
+volume_percent           : current public music volume percent shown by the dashboard
+volume_max               : runtime volume ceiling, normally the same as mpv_volume_max
 last_query               : latest query
 ipc_path                 : mpv IPC socket; pause/resume depends on it
 weather_available        : /weather endpoint loaded
@@ -735,15 +754,15 @@ Wake Bridge options:
 ESP32 local-temperature merge:
 
 ```text
-preferred : DS18B20 GPIO7 -> ESP32-S3 BLE notify -> Jetson Terminal 3 -> Weather UART -> FRDM
+preferred : DS18B20 GPIO7 -> ESP32-S3 BLE notify -> Jetson Terminal 6 sidecar -> Terminal 3 Weather UART -> FRDM
 legacy    : DS18B20 -> ESP32 HTTP POST/pull -> Jetson Terminal 3 -> Weather UART -> FRDM
 ```
 
 Startup weather sends two payloads: one whole-day payload from "今天天氣如何" and one current payload from "現在天氣如何". Explicit whole-day questions such as "明天天氣如何" still produce `Weather daily,...`; current/location weather questions produce `Weather current,...`.
 
-If `--esp32-ble` is enabled and BLE status notify is fresh, the `TEMP` field from `TEMP:27.31,FAN:ON,SPEED:180,LED:ON` is used as the local temperature. The older HTTP push/pull path below remains available for temperature-only boards.
+In the normal pipeline, Terminal 6 owns BLE and Terminal 3 reads the sidecar through `--esp32-temperature-mode pull --esp32-temperature-url http://127.0.0.1:8791/api/esp32/status`. If the sidecar status notify is fresh, the `TEMP` field from `TEMP:27.31,FAN:ON,SPEED:180,LED:ON` is used as the local temperature. The older HTTP push/pull path below remains available for temperature-only boards.
 
-Recommended live mode is `push`. Terminal 3 opens an HTTP receiver on the Jetson, and the ESP32 periodically POSTs its current DS18B20 reading:
+Legacy HTTP mode uses `push`. Terminal 3 opens an HTTP receiver on the Jetson, and the ESP32 periodically POSTs its current DS18B20 reading:
 
 ```text
 Jetson receiver : http://JETSON_LAN_IP:8790/temperature
@@ -752,7 +771,7 @@ UART output     : Weather daily,19,23,76,53,254
 UART output     : Weather current,20,20,0,3,254
 ```
 
-Use `pull` only if the ESP32 already exposes its own HTTP API, for example `http://ESP32_IP/temperature`. In `both` mode, the Wake Bridge first uses a recent pushed reading and falls back to pulling the ESP32 URL. A pushed reading older than `--esp32-temperature-max-age-sec` is ignored.
+For legacy WiFi ESP32 boards, use `pull` only if the ESP32 already exposes its own HTTP API, for example `http://ESP32_IP/temperature`. In `both` mode, the Wake Bridge first uses a recent pushed reading and falls back to pulling the ESP32 URL. A pushed reading older than `--esp32-temperature-max-age-sec` is ignored. This legacy HTTP pull is different from the pipeline's local sidecar pull from `127.0.0.1:8791`.
 
 Manual ESP32 receiver test after Terminal 3 is running:
 
@@ -868,16 +887,16 @@ ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
 ESP32_BLE_ADAPTER=hci0 \
 ESP32_BLE_COMMAND_QUEUE_MAX=64 \
 FAN_MIN_PWM=96 \
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
-BLE is intentionally isolated from the rest of the Wake Bridge. The reconnect loop runs in its own background thread named `esp32s3-ble-reconnect-loop`; scan/connect retries must not block wake-word recording, TTS, music, weather, FRDM UART, to-do, focus mode, or the dashboard. If `bleak` or the helper module is missing, the bridge prints a warning and starts in degraded mode instead of exiting.
+BLE is intentionally isolated from the rest of the Wake Bridge. In the normal pipeline, `esp32s3_ble_fan_led_controller.py --api-server` runs as its own sidecar process on `127.0.0.1:8791`; scan/connect retries, status notify logs, and the BLE command queue stay in that sidecar. Wake Bridge keeps only a short-timeout API client, so wake-word recording, TTS, music, weather, FRDM UART, to-do, focus mode, and the dashboard do not wait on the ESP32 loop. If `bleak` or the helper module is missing, the ESP32 sidecar fails/degrades independently and the rest of the pipeline can continue.
 
 Runtime behavior:
 
 ```text
-BLE connected                  -> fan/LED commands write immediately, TEMP notify feeds Weather + TempRoom
-BLE disconnected               -> reconnect loop keeps scanning/connecting in the background
+BLE connected                  -> fan/LED commands write immediately, TEMP notify feeds Weather + TempRoom through sidecar status
+BLE disconnected               -> sidecar reconnect loop keeps scanning/connecting in its own process
 voice/dashboard/FRDM command   -> command is queued while disconnected, then sent after reconnect
 command queue full             -> oldest pending BLE command is dropped; other bridge features continue
 bleak/helper unavailable       -> ESP32 BLE is disabled for this run; Wake/TTS/music/weather/FRDM continue
@@ -885,7 +904,7 @@ bleak/helper unavailable       -> ESP32 BLE is disabled for this run; Wake/TTS/m
 
 The disconnected command queue is bounded by `--esp32-ble-command-queue-max` / `ESP32_BLE_COMMAND_QUEUE_MAX`, default `64`.
 
-When `--esp32-ble` is enabled, Wake Bridge also exposes a local Dashboard control API:
+The ESP32 sidecar exposes the local Dashboard control API:
 
 ```text
 GET  http://127.0.0.1:8791/api/esp32/status
@@ -923,7 +942,7 @@ Tune with `TEMP_ROOM_UART_INTERVAL_SEC` / `--temp-room-uart-interval-sec`; disab
 Two runtime paths can send `TempRoom`:
 
 ```text
-normal demo path : wake_voice_chat_frdm_bridge.py owns FRDM UART and sends TempRoom from BLE notify
+normal demo path : ESP32 sidecar owns BLE; wake_voice_chat_frdm_bridge.py owns FRDM UART and polls sidecar status for TempRoom
 standalone path  : esp32s3_ble_fan_led_controller.py --frdm-uart-port auto sends TempRoom while testing BLE only
 ```
 
@@ -986,7 +1005,7 @@ voice "關風扇" with BLE connected        -> send FAN_OFF, speak confirmation,
 voice "關風扇" and ESP32 already FAN:OFF -> no duplicate BLE write, speak already-off reply
 voice "全部關掉" / ALL_OFF               -> send ALL_OFF, speak confirmation, head_motion=none
 voice command while BLE disconnected     -> queue command, speak reconnecting/queued explanation
-voice "音樂太小聲，調大音量"             -> not BLE; handled as audio/music volume context
+voice "音樂太小聲，調大音量"             -> not BLE; handled by music volume control as +10
 after local ESP32 control in conversation mode -> FRDM Normal 0 0, wake-only standby
 ```
 
@@ -1044,7 +1063,7 @@ Dashboard warning note:
 WARNING: fan dashboard sync failed: <urlopen error [Errno 111] Connection refused>
 ```
 
-This only means the optional `smart_home_dashboard/server.py` API on port `8789` is not running. It does not block BLE fan control. Start Terminal 5 or add `--no-fan-dashboard-sync` when dashboard sync is not needed.
+This only means the optional `smart_home_dashboard/server.py` API on port `8789` is not running. It does not block BLE fan control. Start Terminal 5 through the pipeline, or pass `--no-fan-dashboard-sync` after `--` when dashboard sync is not needed.
 
 ## To-Do List
 
@@ -1891,7 +1910,7 @@ TTS `.env` recommendation:
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=4.8
+DEFAULT_VOLUME_GAIN=3.6
 ENABLE_STREAM_PLAYBACK=true
 ```
 
@@ -1977,7 +1996,7 @@ TTS volume API smoke test:
 ```bash
 curl -X POST http://127.0.0.1:8777/speak_async \
   -H "Content-Type: application/json" \
-  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":4.8}'
+  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":3.6}'
 ```
 
 Focus work mode self-test:
@@ -2109,28 +2128,39 @@ TTS ready but no sound
 -> Check /health. Confirm configured_device is auto:UACDemo and audio.device resolved to UACDemo. Restart TTS.
 
 TTS is audible but too quiet
--> Use --tts-volume-gain 4.8 first. If still too quiet, try 6.0 and restart Wake Bridge.
+-> Use --tts-volume-gain 3.6 first. If still too quiet, try 4.8 and restart Wake Bridge.
 -> If /speak_async with volume_gain returns 422, Terminal 2 is still the old TTS server; restart it.
 
-Music is audible but too quiet
+Music is audible but too quiet / too loud
 -> This is mpv volume, not Piper TTS. Check curl http://127.0.0.1:8788/health.
--> Expected defaults are mpv_volume=220, mpv_volume_max=300, mpv_volume_clamped=false.
--> Raise only music with MUSIC_MPV_VOLUME=260 MUSIC_MPV_VOLUME_MAX=350 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh.
+-> Expected defaults are mpv_volume=150, mpv_volume_max=200, volume_percent=150, mpv_volume_clamped=false.
+-> Use the website Music slider for current volume, or say "音量調大 / 音量小聲一點 / 音量調到 120".
+-> Voice up/down changes only 10 each time. This is intentional for live demo safety.
+-> API test: curl -X POST http://127.0.0.1:8788/music -H "Content-Type: application/json" -d '{"action":"volume","volume":150}'.
+-> Raise only the startup default with MUSIC_MPV_VOLUME=180 MUSIC_MPV_VOLUME_MAX=250 ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart.
 -> If mpv_actual_volume is missing while music should be playing, mpv is not active or IPC is not ready.
+
+Music quality is rough, distorted, or the volume jumps
+-> First lower current music volume from the website slider or say "音量小聲一點" once or twice.
+-> Keep the live default near mpv volume 150 / max 200. Avoid jumping to 220+ unless the room is extremely noisy.
+-> Check /health. mpv_audio_device should resolve to the UACDemo USB speaker, usually alsa/plughw:CARD=UACDemo...
+-> If playback routes to the built-in/default output, restart Terminal 4 with --mpv-audio-device auto and confirm UACDemo is visible.
+-> Beep auto mode now uses PulseAudio UACDemo only when that sink is found; otherwise it falls through to ALSA UACDemo to avoid inconsistent default-sink volume.
 
 Music starts when the user is complaining about audio volume
 -> Restart Terminal 4 and Terminal 3. Latest routing treats phrases about no sound / low sound / volume as audio complaints, not song requests.
+-> Runtime music volume commands are handled as action=volume, not action=play.
 -> ESP32 BLE should also ignore "音樂太小聲 / 調大音量" unless the phrase contains fan context such as 風扇, 風量, 風速, 好熱, or 好冷.
 
 Music stop / fan off succeeds but there is no spoken reply, or the head moves silently
--> Restart Terminal 3 so the local-control confirmation path is active.
+-> Restart the Jetson pipeline so Terminal 6 sidecar and Terminal 3 local-control confirmation path are both current.
 -> For music stop/pause, Terminal 3 should print "Music stop/pause handled before TTS; local confirmation will be spoken."
 -> For ESP32 fan/LED control, Terminal 3 should print "ESP32-S3 BLE control:" followed by head_motion none.
 -> During the local confirmation, logs may show "speaking head motion skipped: none"; that is correct.
 -> Run python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --self-test to verify the regression guards.
 
 FRDM room temperature does not update
--> Terminal 3 should show "BLE: connected. Subscribing status notify..." and recurring "ESP32 status: TEMP=...".
+-> Terminal 6 / `logs esp32` should show "BLE: connected. Subscribing status notify..." and recurring "ESP32 status: TEMP=...".
 -> Terminal 3 should show "FRDM room temperature UART: TempRoom every 10s" at startup.
 -> When a fresh reading exists, Terminal 3 should print "TempRoom UART sent: TempRoom 254 (... C)" every 10 seconds.
 -> If Weather local temperature works but TempRoom does not, check --no-temp-room-uart and --temp-room-uart-interval-sec.
@@ -2138,11 +2168,11 @@ FRDM room temperature does not update
 -> If Terminal 3 sends TempRoom but FRDM shows nothing, add a FRDM parser for single-argument "TempRoom <Celsius*10>".
 
 ESP32 BLE is disconnected but wake/TTS/music should keep working
--> This is expected. BLE reconnect runs in the esp32s3-ble-reconnect-loop worker and must not block the main Wake Bridge.
+-> This is expected. In the normal pipeline, BLE reconnect runs in the Terminal 6 ESP32 sidecar and must not block the main Wake Bridge.
 -> Check curl http://127.0.0.1:8791/api/esp32/status. running=true, connected=false means the background reconnect loop is alive.
 -> queued_pending shows fan/LED commands waiting for reconnect; dropped_pending increments if the queue exceeded --esp32-ble-command-queue-max.
 -> If enabled=false with unavailable_reason, install/fix bleak or the helper module. Other features continue in degraded mode.
--> To intentionally run without ESP32 BLE, start with ESP32_BLE=0.
+-> To intentionally run without ESP32 BLE, start the pipeline with ESP32_BLE=0.
 
 Emotion face is wrong
 -> Check Windows debug control.emotion and Terminal 3 FRDM UART TX: Speaking N.
@@ -2174,7 +2204,7 @@ ESP32 status says FAN=ON but physical fan does not spin
 -> The ESP32 full sketch also applies FAN_MIN_RUNNING_SPEED=96 and a 250ms start kick; reflash the full sketch after changes.
 
 fan dashboard sync failed: Connection refused
--> Optional dashboard server on port 8789 is not running. Start Terminal 5 or add --no-fan-dashboard-sync. BLE control is unaffected.
+-> Optional dashboard server on port 8789 is not running. Start Terminal 5 through the pipeline or use ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart -- --no-fan-dashboard-sync. BLE control is unaffected.
 
 vision_intent=True but used_vision=False
 -> Check image_received / image_size_bytes / vision_error.
@@ -2208,7 +2238,7 @@ Jetson:
 [ ] ESP32-S3 BLE scan sees service UUID 12345678-1234-1234-1234-1234567890ab
 [ ] ESP32 standalone BLE CLI can run TEMP?, LED_ON/OFF, FAN_SPEED:255, FAN_OFF
 [ ] ESP32 full sketch is flashed, not only the minimal advertise sketch
-[ ] Terminal 3 shows TempRoom UART sent every 10 seconds after BLE TEMP notify
+[ ] Terminal 6 sidecar receives BLE TEMP notify and Terminal 3 shows TempRoom UART sent every 10 seconds
 [ ] FRDM parser handles TempRoom <Celsius*10> and displays room temperature
 [ ] FRDM FanSpeed 16 relays to at least FAN_SPEED:96 or configured FAN_MIN_PWM
 [ ] Optional legacy ESP32 HTTP POST/pull returns {"ok":true,"temperature_c":...} if that path is used

@@ -668,12 +668,31 @@ def public_music(data: dict[str, Any]) -> dict[str, Any]:
     else:
         status = "stopped"
     title = music_display_title(data)
+    raw_volume = (
+        data.get("volume_percent")
+        if data.get("volume_percent") is not None
+        else data.get("mpv_effective_volume")
+        if data.get("mpv_effective_volume") is not None
+        else data.get("volume")
+        if data.get("volume") is not None
+        else data.get("mpv_volume")
+    )
+    try:
+        volume_percent = int(round(float(raw_volume)))
+    except (TypeError, ValueError):
+        volume_percent = None
+    try:
+        volume_max = int(round(float(data.get("volume_max", data.get("mpv_volume_max", 200)))))
+    except (TypeError, ValueError):
+        volume_max = 200
     return {
         **data,
         "ok": bool(data.get("ok", False)),
         "status": status,
         "title": title if status != "stopped" else "",
         "artist": music_display_artist(data) if status != "stopped" else "",
+        "volume_percent": volume_percent,
+        "volume_max": volume_max,
         "requested_query": data.get("last_query") or data.get("query") or "",
         "active": active,
         "paused": paused,

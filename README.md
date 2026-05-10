@@ -121,7 +121,7 @@ Recommended `.env`:
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=4.8
+DEFAULT_VOLUME_GAIN=3.6
 ENABLE_STREAM_PLAYBACK=true
 ```
 
@@ -139,7 +139,8 @@ python3 music_web_player.py \
   --port 8788 \
   --backend mpv \
   --mpv-audio-device auto \
-  --mpv-volume 70 \
+  --mpv-volume 150 \
+  --mpv-volume-max 200 \
   --weather-default-location Taipei
 ```
 
@@ -278,7 +279,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --beep-keyword UACDemo \
   --beep-player auto \
   --noisy-room \
-  --tts-volume-gain 4.8 \
+  --tts-volume-gain 3.6 \
   --beep-volume 0.35 \
   --uart-port auto \
   --uart-baudrate 115200 \

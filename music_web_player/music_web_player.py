@@ -78,8 +78,8 @@ DEFAULT_MPV_AUDIO_DEVICE = os.getenv("MPV_AUDIO_DEVICE", "auto")
 DEFAULT_MPV_AUDIO_DEVICE_KEYWORD = os.getenv("MPV_AUDIO_DEVICE_KEYWORD", "UACDemo")
 DEFAULT_MPV_YTDL_COOKIES = os.getenv("MPV_YTDL_COOKIES", os.getenv("YTDLP_COOKIES", ""))
 DEFAULT_MPV_YTDL_COOKIES_FROM_BROWSER = os.getenv("MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("YTDLP_COOKIES_FROM_BROWSER", ""))
-DEFAULT_MPV_VOLUME = _env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 220))
-DEFAULT_MPV_VOLUME_MAX = _env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 300))
+DEFAULT_MPV_VOLUME = _env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 150))
+DEFAULT_MPV_VOLUME_MAX = _env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 200))
 DEFAULT_MPV_READY_TIMEOUT_SEC = _env_float("MPV_READY_TIMEOUT_SEC", _env_float("MPV_READY_TIMEOUT", 1.5))
 
 WAKE_WORD_PATTERNS = (
@@ -377,6 +377,104 @@ def looks_like_audio_complaint(text: str) -> bool:
     return any(word in lowered for word in AUDIO_COMPLAINT_WORDS)
 
 
+def detect_volume_intent(text: str) -> MusicIntent | None:
+    normalized = normalize_text(text)
+    lowered = normalized.lower()
+    if not normalized:
+        return None
+
+    volume_context_words = (
+        "音量",
+        "聲音",
+        "声音",
+        "喇叭",
+        "揚聲器",
+        "扬声器",
+        "音響",
+        "音响",
+        "音樂",
+        "音乐",
+        "歌曲",
+        "speaker",
+        "volume",
+        "music",
+        "song",
+        "audio",
+    )
+    if not any(word in lowered for word in volume_context_words):
+        return None
+
+    set_match = re.search(
+        r"(?:音量|volume).{0,8}?(?:到|成|設成|设成|設定|设置|調到|调到|調成|调成)\s*(?P<value>\d{1,3})\s*%?",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not set_match:
+        set_match = re.search(
+            r"(?:set|change|turn).{0,12}?(?:volume).{0,8}?(?:to)?\s*(?P<value>\d{1,3})\s*%?",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+    if set_match:
+        return MusicIntent(
+            True,
+            action="volume",
+            query=set_match.group("value"),
+            reason="volume:set",
+            normalized_text=normalized,
+        )
+
+    up_words = (
+        "調大",
+        "调大",
+        "大聲",
+        "大声",
+        "提高",
+        "升高",
+        "加大",
+        "加十",
+        "加 10",
+        "往上",
+        "太小",
+        "聽不到",
+        "听不到",
+        "turn up",
+        "volume up",
+        "louder",
+        "increase",
+        "raise",
+    )
+    down_words = (
+        "調小",
+        "调小",
+        "小聲一點",
+        "小声一点",
+        "降低",
+        "降下",
+        "減小",
+        "减小",
+        "減十",
+        "减十",
+        "減 10",
+        "减 10",
+        "往下",
+        "太大",
+        "太吵",
+        "破音",
+        "爆音",
+        "turn down",
+        "volume down",
+        "quieter",
+        "decrease",
+        "lower",
+    )
+    if any(word in lowered for word in up_words):
+        return MusicIntent(True, action="volume", query="+10", reason="volume:up10", normalized_text=normalized)
+    if any(word in lowered for word in down_words):
+        return MusicIntent(True, action="volume", query="-10", reason="volume:down10", normalized_text=normalized)
+    return None
+
+
 def detect_music_intent(text: str | None) -> MusicIntent:
     normalized = strip_wake_words(text or "")
     lowered = normalized.lower()
@@ -394,6 +492,10 @@ def detect_music_intent(text: str | None) -> MusicIntent:
     for pattern in RESUME_PATTERNS:
         if re.search(pattern, lowered, flags=re.IGNORECASE):
             return MusicIntent(True, action="resume", reason=f"resume:{pattern}", normalized_text=normalized)
+
+    volume_intent = detect_volume_intent(normalized)
+    if volume_intent is not None:
+        return volume_intent
 
     if looks_like_audio_complaint(normalized):
         return MusicIntent(False, reason="audio_complaint_not_music", normalized_text=normalized)
@@ -941,6 +1043,31 @@ def resolve_mpv_audio_device(requested: str | None, *, keyword: str = DEFAULT_MP
     return ""
 
 
+def clamp_volume(value: Any, volume_max: int) -> int:
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        number = DEFAULT_MPV_VOLUME
+    return max(0, min(max(100, int(volume_max)), number))
+
+
+def parse_volume_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(round(float(value)))
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(r"[-+]?\d{1,4}", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+
 class MusicPlayer:
     def __init__(
         self,
@@ -1127,6 +1254,7 @@ class MusicPlayer:
         if active:
             self._refresh_now_playing()
             playback = self._mpv_playback_snapshot()
+        effective_volume = playback.get("volume") if active and playback.get("volume") is not None else self.mpv_volume
         with self._lock:
             active = self._is_active_locked()
             return {
@@ -1151,7 +1279,10 @@ class MusicPlayer:
                 "mpv_volume_max": self.mpv_volume_max,
                 "mpv_volume_clamped": self.mpv_volume != self.requested_mpv_volume or self.mpv_volume_max != self.requested_mpv_volume_max,
                 "mpv_actual_volume": playback.get("volume") if active else None,
-                "mpv_effective_volume": playback.get("volume") if active and playback.get("volume") is not None else self.mpv_volume,
+                "mpv_effective_volume": effective_volume,
+                "volume": effective_volume,
+                "volume_percent": int(round(float(effective_volume))) if effective_volume is not None else self.mpv_volume,
+                "volume_max": self.mpv_volume_max,
                 "playback_ready": bool(playback.get("audio_out") or playback.get("title")) if active else False,
                 "audio_out": playback.get("audio_out") if active else None,
                 "audio_params": playback.get("audio_params") if active else None,
@@ -1203,6 +1334,54 @@ class MusicPlayer:
             result.update({"action": "resume", "resumed": True, "paused": False, "message": "mpv resumed"})
             return result
         result.update({"action": "resume", "resumed": False})
+        return result
+
+    def set_volume(self, volume: Any) -> dict[str, Any]:
+        requested = parse_volume_value(volume)
+        if requested is None:
+            return {"ok": False, "action": "volume", "error": "missing volume"}
+        previous = self._mpv_property("volume")
+        with self._lock:
+            was_active = self._is_active_locked()
+            was_paused = bool(self._paused and was_active)
+            previous_value = previous if previous is not None else self.mpv_volume
+            new_volume = clamp_volume(requested, self.mpv_volume_max)
+            self.requested_mpv_volume = requested
+            self.mpv_volume = new_volume
+        command_result: dict[str, Any] = {"ok": True}
+        if was_active:
+            command_result = self._mpv_command(["set_property", "volume", new_volume])
+        actual = self._mpv_property("volume") if was_active else new_volume
+        ok = bool(command_result.get("ok", True))
+        status = self.status()
+        return {
+            **status,
+            "ok": ok,
+            "handled": ok,
+            "action": "volume",
+            "volume": new_volume,
+            "volume_percent": new_volume,
+            "volume_max": self.mpv_volume_max,
+            "requested_volume": requested,
+            "previous_volume": previous_value,
+            "actual_volume": actual,
+            "active": was_active,
+            "paused": was_paused,
+            "volume_clamped": new_volume != requested,
+            "message": f"mpv volume set to {new_volume}",
+            **({"mpv_command": command_result} if not ok else {}),
+        }
+
+    def adjust_volume(self, delta: Any) -> dict[str, Any]:
+        parsed_delta = parse_volume_value(delta)
+        if parsed_delta is None:
+            parsed_delta = 0
+        current = self._mpv_property("volume")
+        with self._lock:
+            base = int(round(float(current))) if current is not None else self.mpv_volume
+        result = self.set_volume(base + parsed_delta)
+        result["volume_delta"] = parsed_delta
+        result["action"] = "volume"
         return result
 
     def play(self, query: str, *, backend: str | None = None, dry_run: bool | None = None) -> dict[str, Any]:
@@ -1353,6 +1532,7 @@ class MusicPlayer:
                 "cookies_configured": bool(cookies_path),
                 "cookies_from_browser": "" if cookies_path else cookies_from_browser,
                 "volume": self.mpv_volume,
+                "volume_percent": self.mpv_volume,
                 "volume_max": self.mpv_volume_max,
                 "volume_clamped": self.mpv_volume != self.requested_mpv_volume or self.mpv_volume_max != self.requested_mpv_volume_max,
                 "actual_volume": playback.get("volume") if ipc_ready else None,
@@ -1398,6 +1578,14 @@ def handle_text(player: MusicPlayer, text: str, *, backend: str | None = None, d
     if intent.action == "resume":
         result.update(player.resume())
         result["handled"] = bool(result.get("ok"))
+        return result
+    if intent.action == "volume":
+        if str(intent.query).strip().startswith(("+", "-")):
+            volume_result = player.adjust_volume(intent.query)
+        else:
+            volume_result = player.set_volume(intent.query)
+        result.update(volume_result)
+        result["handled"] = bool(volume_result.get("ok"))
         return result
     if intent.action == "play":
         play_result = player.play(intent.query, backend=backend, dry_run=dry_run)
@@ -1474,6 +1662,9 @@ def make_handler(
                         "mpv_volume_clamped": status.get("mpv_volume_clamped"),
                         "mpv_actual_volume": status.get("mpv_actual_volume"),
                         "mpv_effective_volume": status.get("mpv_effective_volume"),
+                        "volume": status.get("volume"),
+                        "volume_percent": status.get("volume_percent"),
+                        "volume_max": status.get("volume_max"),
                         "playback_ready": status.get("playback_ready"),
                         "audio_out": status.get("audio_out"),
                         "audio_params": status.get("audio_params"),
@@ -1542,6 +1733,19 @@ def make_handler(
             if action == "resume":
                 result = player.resume()
                 json_response(self, 200, result)
+                return
+            if action == "volume":
+                if data.get("delta") is not None:
+                    result = player.adjust_volume(data.get("delta"))
+                elif data.get("volume") is not None:
+                    result = player.set_volume(data.get("volume"))
+                elif data.get("value") is not None:
+                    result = player.set_volume(data.get("value"))
+                elif str(data.get("query") or "").strip().startswith(("+", "-")):
+                    result = player.adjust_volume(data.get("query"))
+                else:
+                    result = player.set_volume(data.get("query"))
+                json_response(self, 200 if result.get("ok") else 400, result)
                 return
             if action == "play" and data.get("query"):
                 result = player.play(str(data.get("query")), backend=backend, dry_run=dry_run)
@@ -1637,7 +1841,9 @@ def run_self_test() -> int:
         ("resume music", True, "resume", ""),
         ("今天幾號", False, "none", ""),
         ("為什麼沒聲音，因為我聽到聲音超小", False, "none", ""),
-        ("我聽到聲音超小，幫我調大音量", False, "none", ""),
+        ("我聽到聲音超小，幫我調大音量", True, "volume", "+10"),
+        ("音量小聲一點", True, "volume", "-10"),
+        ("音量調到 60", True, "volume", "60"),
     ]
     for text, expected_intent, expected_action, expected_query in cases:
         intent = detect_music_intent(text)
@@ -1650,8 +1856,14 @@ def run_self_test() -> int:
     result = handle_text(player, "幫我放稻香", dry_run=True)
     if not result.get("ok") or result.get("query") != "稻香":
         raise AssertionError(f"dry-run play failed: {result}")
-    if player.mpv_volume != 220 or player.mpv_volume_max != 300:
+    if player.mpv_volume != 150 or player.mpv_volume_max != 200:
         raise AssertionError(f"default mpv volume changed unexpectedly: {player.mpv_volume}/{player.mpv_volume_max}")
+    volume_result = handle_text(player, "音量加十", dry_run=True)
+    if not volume_result.get("ok") or volume_result.get("volume_percent") != 160:
+        raise AssertionError(f"volume +10 failed: {volume_result}")
+    set_volume_result = handle_text(player, "音量調到 60", dry_run=True)
+    if not set_volume_result.get("ok") or set_volume_result.get("volume_percent") != 60:
+        raise AssertionError(f"volume set failed: {set_volume_result}")
     loud_player = MusicPlayer(backend="mpv", dry_run=True, mpv_audio_device="default", mpv_volume=250, mpv_volume_max=200)
     loud_status = loud_player.status()
     if loud_player.mpv_volume != 200 or loud_player.mpv_volume_max != 200 or not loud_status.get("mpv_volume_clamped"):

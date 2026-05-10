@@ -2491,6 +2491,22 @@ def fallback_detect_music_intent(text: str) -> dict[str, Any]:
         return {"intent": True, "action": "pause", "query": "", "reason": "fallback_pause", "normalized_text": normalized}
     if re.search(r"(繼續|继续|接著|接着|恢復|恢复).{0,4}(播放|播|放|音樂|音乐|歌曲|歌)|\b(resume|unpause)\b|\bcontinue\s+(the\s+)?(music|song|audio|playback)\b", lowered, flags=re.IGNORECASE):
         return {"intent": True, "action": "resume", "query": "", "reason": "fallback_resume", "normalized_text": normalized}
+    volume_context_words = (
+        "音量", "聲音", "声音", "喇叭", "揚聲器", "扬声器", "音響", "音响",
+        "音樂", "音乐", "歌曲", "speaker", "volume", "music", "song", "audio",
+    )
+    if any(word in lowered for word in volume_context_words):
+        set_match = re.search(
+            r"(?:音量|volume).{0,8}?(?:到|成|設成|设成|設定|设置|調到|调到|調成|调成|to)?\s*(?P<value>\d{1,3})\s*%?",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if set_match:
+            return {"intent": True, "action": "volume", "query": set_match.group("value"), "reason": "fallback_volume_set", "normalized_text": normalized}
+        if any(word in lowered for word in ("調大", "调大", "大聲", "大声", "提高", "升高", "加大", "加十", "加 10", "往上", "太小", "聽不到", "听不到", "turn up", "volume up", "louder", "increase", "raise")):
+            return {"intent": True, "action": "volume", "query": "+10", "reason": "fallback_volume_up10", "normalized_text": normalized}
+        if any(word in lowered for word in ("調小", "调小", "小聲一點", "小声一点", "降低", "降下", "減小", "减小", "減十", "减十", "減 10", "减 10", "往下", "太大", "太吵", "破音", "爆音", "turn down", "volume down", "quieter", "decrease", "lower")):
+            return {"intent": True, "action": "volume", "query": "-10", "reason": "fallback_volume_down10", "normalized_text": normalized}
     audio_complaint_words = (
         "沒聲音",
         "没声音",
@@ -2755,8 +2771,8 @@ def maybe_autostart_music_tool(args: argparse.Namespace, *, tool_url: str | None
     if backend == "mpv":
         command.extend(["--mpv-audio-device", str(getattr(args, "music_mpv_audio_device", "auto") or "auto")])
         command.extend(["--mpv-audio-keyword", str(getattr(args, "music_mpv_audio_keyword", "UACDemo") or "UACDemo")])
-        command.extend(["--mpv-volume", str(getattr(args, "music_mpv_volume", 220))])
-        command.extend(["--mpv-volume-max", str(getattr(args, "music_mpv_volume_max", 300))])
+        command.extend(["--mpv-volume", str(getattr(args, "music_mpv_volume", 150))])
+        command.extend(["--mpv-volume-max", str(getattr(args, "music_mpv_volume_max", 200))])
         command.extend(["--mpv-ready-timeout", str(getattr(args, "music_mpv_ready_timeout", 1.5))])
         cookies_path = str(getattr(args, "music_mpv_ytdl_cookies", "") or "").strip()
         if cookies_path:
@@ -2932,6 +2948,10 @@ def execute_music_route(route: dict[str, Any], args: argparse.Namespace, respons
         print(f"  resumed : {result.get('resumed')}")
     if "stopped" in result:
         print(f"  stopped : {result.get('stopped')}")
+    if "volume_percent" in result or "volume" in result:
+        print(f"  volume  : {result.get('volume_percent', result.get('volume'))}")
+    if "volume_delta" in result:
+        print(f"  delta   : {result.get('volume_delta')}")
     if "ipc_ready" in result:
         print(f"  ipc_ready: {result.get('ipc_ready')}")
     if result.get("error"):
@@ -3156,7 +3176,11 @@ class FrdmRoomTemperaturePublisher:
     def enabled(self) -> bool:
         if getattr(self.args, "no_uart", False) or getattr(self.args, "no_temp_room_uart", False):
             return False
-        return self.interval_sec() > 0.0 and self.receiver is not None
+        if self.receiver is not None:
+            return self.interval_sec() > 0.0
+        mode = str(getattr(self.args, "esp32_temperature_mode", "disabled") or "disabled").strip().lower()
+        url = str(getattr(self.args, "esp32_temperature_url", "") or "").strip()
+        return self.interval_sec() > 0.0 and mode in {"pull", "both"} and bool(url)
 
     def interval_sec(self) -> float:
         return max(0.0, float(getattr(self.args, "temp_room_uart_interval_sec", 10.0) or 0.0))
@@ -3188,7 +3212,7 @@ class FrdmRoomTemperaturePublisher:
     def _latest_reading(self) -> dict[str, Any] | None:
         receiver = self.receiver
         if receiver is None:
-            return None
+            return get_local_temperature_reading(self.args)
         return receiver.latest(max_age_sec=self.max_age_sec())
 
     def _run(self) -> None:
@@ -3199,7 +3223,7 @@ class FrdmRoomTemperaturePublisher:
             if now >= next_send_at:
                 reading = self._latest_reading()
                 if reading is None:
-                    wait_sec = min(1.0, interval_sec) if interval_sec > 0 else 1.0
+                    wait_sec = min(1.0, interval_sec) if self.receiver is not None and interval_sec > 0 else max(1.0, interval_sec)
                     self._stop.wait(wait_sec)
                     continue
                 send_temp_room_uart_update(
@@ -3689,6 +3713,201 @@ class Esp32BleBridgeManager:
             f"queued={result['queued']}/{len(commands)} connected={result['connected']}"
         )
         return bool(result.get("ok"))
+
+    def handle_voice_transcript(self, transcript: str) -> dict[str, Any] | None:
+        if not self.is_enabled() or getattr(self.args, "no_esp32_ble_voice_control", False):
+            return None
+        if esp32_ble is None:
+            return None
+        speed_step = max(1, int(getattr(self.args, "esp32_ble_voice_speed_step", 32) or 32))
+        # Avoid touching the sidecar on normal conversation turns. Only fetch live
+        # status after the text parser sees an ESP32 fan/LED intent.
+        commands = esp32_ble.resolve_input_to_ble_commands(  # type: ignore[union-attr]
+            transcript,
+            None,
+            speed_step=speed_step,
+        )
+        if not commands:
+            return None
+        status = self.latest_status()
+        commands = esp32_ble.resolve_input_to_ble_commands(  # type: ignore[union-attr]
+            transcript,
+            status,
+            speed_step=speed_step,
+        ) or commands
+        connected_before = self.is_connected()
+        if connected_before and esp32_commands_are_fan_off_only(commands) and esp32_status_fan_is_off(status):
+            return {
+                "ok": True,
+                "queued": 0,
+                "commands": commands,
+                "connected": connected_before,
+                "was_connected": connected_before,
+                "reconnect_requested": False,
+                "source": "voice",
+                "intent": True,
+                "transcript": transcript,
+                "noop": True,
+                "already_state": "fan_off",
+            }
+        result = self.send_commands(commands, source="voice")
+        result["intent"] = True
+        result["transcript"] = transcript
+        return result
+
+
+class Esp32BleApiClientManager:
+    """Thin Wake Bridge client for the standalone ESP32 BLE sidecar API."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        base = str(getattr(args, "esp32_ble_api_url", "") or "").strip()
+        if not base:
+            host = str(getattr(args, "esp32_dashboard_host", DEFAULT_ESP32_DASHBOARD_HOST) or DEFAULT_ESP32_DASHBOARD_HOST)
+            port = int(getattr(args, "esp32_dashboard_port", DEFAULT_ESP32_DASHBOARD_PORT) or DEFAULT_ESP32_DASHBOARD_PORT)
+            base = f"http://{host}:{port}/api/esp32"
+        self.base_url = base.rstrip("/")
+        self.status_url = self.base_url + "/status"
+        self.control_url = self.base_url + "/control"
+        self._lock = threading.RLock()
+        self._last_payload: dict[str, Any] | None = None
+        self._last_payload_at = 0.0
+        self._last_error = ""
+
+    def is_enabled(self) -> bool:
+        return bool(getattr(self.args, "esp32_ble", False)) and not bool(
+            getattr(self.args, "_esp32_ble_runtime_unavailable", False)
+        )
+
+    def unavailable_reason(self) -> str:
+        return str(getattr(self.args, "_esp32_ble_runtime_unavailable_reason", "") or "").strip()
+
+    def is_running(self) -> bool:
+        payload = self._status_payload(allow_stale=True)
+        return bool(payload.get("running", self.is_enabled()))
+
+    def is_connected(self) -> bool:
+        payload = self._status_payload(allow_stale=True)
+        return bool(payload.get("connected", False))
+
+    def latest_status(self) -> Any | None:
+        payload = self._status_payload(allow_stale=True)
+        if not payload or payload.get("temp_c") is None and payload.get("fan") is None:
+            return None
+        return argparse.Namespace(
+            temp_c=payload.get("temp_c", payload.get("temperature_c")),
+            fan=payload.get("fan"),
+            speed=payload.get("speed"),
+            led=payload.get("led"),
+            raw=payload.get("raw", ""),
+            received_at=payload.get("updated_at", ""),
+        )
+
+    def queue_stats(self) -> dict[str, int]:
+        payload = self._status_payload(allow_stale=True)
+        return {
+            "queued_pending": int(payload.get("queued_pending", 0) or 0),
+            "dropped_pending": int(payload.get("dropped_pending", 0) or 0),
+        }
+
+    def start(self) -> bool:
+        if not self.is_enabled():
+            return False
+        payload = self._status_payload(allow_stale=False)
+        if payload.get("running", False) or "connected" in payload or "ok" in payload:
+            print(f"ESP32 BLE sidecar API: {self.status_url}")
+            return True
+        print(f"WARNING: ESP32 BLE sidecar API not ready: {self._last_error or self.status_url}")
+        return False
+
+    def stop(self) -> None:
+        return
+
+    def _timeout_sec(self) -> float:
+        return max(0.05, float(getattr(self.args, "esp32_ble_api_timeout", 0.2) or 0.2))
+
+    def _status_cache_sec(self) -> float:
+        return max(0.0, float(getattr(self.args, "esp32_ble_api_status_cache_sec", 0.5) or 0.5))
+
+    def _http_json(self, url: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        data: bytes | None = None
+        method = "GET"
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            method = "POST"
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(request, timeout=self._timeout_sec()) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        parsed = json.loads(raw or "{}")
+        return parsed if isinstance(parsed, dict) else {"ok": False, "error": "non-object JSON"}
+
+    def _status_payload(self, *, allow_stale: bool) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._lock:
+            cached = dict(self._last_payload) if self._last_payload is not None else None
+            cached_age = now - self._last_payload_at
+        if allow_stale and cached is not None and cached_age <= self._status_cache_sec():
+            return cached
+        try:
+            payload = self._http_json(self.status_url)
+        except Exception as exc:
+            self._last_error = str(exc)
+            if cached is not None:
+                cached["api_error"] = self._last_error
+                return cached
+            return {"ok": False, "enabled": self.is_enabled(), "running": False, "connected": False, "error": self._last_error}
+        with self._lock:
+            self._last_payload = dict(payload)
+            self._last_payload_at = time.monotonic()
+            self._last_error = ""
+        return payload
+
+    def send_commands(self, commands: list[str], *, source: str = "") -> dict[str, Any]:
+        cleaned = [str(command or "").strip() for command in commands if str(command or "").strip()]
+        if not cleaned or not self.is_enabled():
+            return {"ok": False, "queued": 0, "commands": cleaned, "connected": False, "source": source}
+        payload = {"commands": cleaned, "source": source or "wake_bridge"}
+        try:
+            result = self._http_json(self.control_url, payload)
+        except Exception as exc:
+            self._last_error = str(exc)
+            print(f"WARNING: ESP32 BLE sidecar command failed: {exc}")
+            return {
+                "ok": False,
+                "queued": 0,
+                "commands": cleaned,
+                "connected": False,
+                "was_connected": False,
+                "reconnect_requested": False,
+                "source": source,
+                "error": str(exc),
+            }
+        status = result.get("status")
+        if isinstance(status, dict):
+            with self._lock:
+                self._last_payload = dict(status)
+                self._last_payload_at = time.monotonic()
+        return result
+
+    def handle_frdm_fan_event(self, event: dict[str, Any]) -> bool:
+        if not self.is_enabled() or getattr(self.args, "no_esp32_ble_frdm_control", False):
+            return False
+        if esp32_ble is None:
+            return False
+        percent = clamp_int(int(event.get("percent", 0) or 0), 0, 100)
+        if not bool(event.get("power", percent > 0)):
+            commands = ["FAN_OFF"]
+        else:
+            commands = ["FAN_ON", f"FAN_SPEED:{esp32_ble.percent_to_pwm(percent)}"]  # type: ignore[union-attr]
+        result = self.send_commands(commands, source="frdm_uart")
+        print(
+            "ESP32 BLE sidecar fan relay: "
+            f"percent={percent} commands={','.join(commands)} "
+            f"queued={result.get('queued', 0)}/{len(commands)} connected={result.get('connected', False)}"
+        )
+        return bool(result.get("ok") or result.get("queued"))
 
     def handle_voice_transcript(self, transcript: str) -> dict[str, Any] | None:
         if not self.is_enabled() or getattr(self.args, "no_esp32_ble_voice_control", False):
@@ -6608,7 +6827,12 @@ def run_external_beep_player(
     requested = str(player or "auto").strip().lower()
     attempts: list[tuple[str, list[str]]] = []
     pulse_sink = pulse_sink_by_keyword(keyword)
-    if requested in {"auto", "pulse", "paplay"} and shutil.which("paplay"):
+    # In auto mode, avoid falling through to PulseAudio's default sink when the
+    # requested USB speaker is not present as a Pulse sink. On the Jetson that
+    # default may be the built-in output, which makes the cue sound inconsistent
+    # with TTS/music and can be perceived as poor speaker quality.
+    should_try_paplay = requested in {"pulse", "paplay"} or (requested == "auto" and bool(pulse_sink))
+    if should_try_paplay and shutil.which("paplay"):
         command = [
             "paplay",
             "--client-name=MakeNTU Wake Beep",
@@ -9099,8 +9323,8 @@ def run_self_test() -> int:
     if audio_complaint_route.get("intent"):
         raise AssertionError(f"audio complaint was misdetected as music: {audio_complaint_route}")
     audio_volume_route = detect_music_route({"transcript": "我聽到聲音超小，幫我調大音量"}, music_args)
-    if audio_volume_route.get("intent"):
-        raise AssertionError(f"volume complaint was misdetected as music: {audio_volume_route}")
+    if not audio_volume_route.get("intent") or audio_volume_route.get("action") != "volume" or audio_volume_route.get("query") != "+10":
+        raise AssertionError(f"volume route detection failed: {audio_volume_route}")
     if "關掉" not in music_control_reply("stop", {"ok": True, "stopped": True}):
         raise AssertionError("music stop confirmation should be spoken")
     if "沒有在播放" not in music_control_reply("stop", {"ok": True, "stopped": False, "message": "no active mpv process"}):
@@ -9426,6 +9650,17 @@ def music_control_reply(action: str, result: dict[str, Any] | None) -> str:
         if ok:
             return "音樂現在沒有在播放。"
         return "我想暫停音樂，但音樂播放器目前沒有回應。"
+    if action == "volume":
+        if ok:
+            volume = result.get("volume_percent", result.get("volume", ""))
+            try:
+                volume_text = str(int(round(float(volume))))
+            except (TypeError, ValueError):
+                volume_text = ""
+            if volume_text:
+                return f"好，音量調到 {volume_text}。"
+            return "好，我調整音量了。"
+        return "我想調整音量，但音樂播放器目前沒有回應。"
     return "音樂控制已處理。"
 
 
@@ -9836,7 +10071,7 @@ def handle_wake_chat_response(
         response_vision_summary(response)
     music_route = detect_music_route(response, args)
     music_before_result: dict[str, Any] | None = None
-    if music_route.get("action") in {"stop", "pause"}:
+    if music_route.get("action") in {"stop", "pause", "volume"}:
         music_before_result = execute_music_route(music_route, args, response, phase="before_tts")
         send_music_uart_update(args, robot, music_before_result, reason=f"music {music_route.get('action')} dashboard")
         action = str(music_route.get("action", "") or "")
@@ -9847,19 +10082,19 @@ def handle_wake_chat_response(
             head_motion="none",
             reason=f"local music {action} control",
         )
-        print("Music stop/pause handled before TTS; local confirmation will be spoken.")
+        print(f"Music {action} handled before TTS; local confirmation will be spoken.")
         if not quiet_dialog:
             print_control_summary(control)
             print(f"parsed reply: {response.get('reply', '')}")
 
-        robot.stop_active_speaking_head_motion(reason="before music stop/pause local control reply")
+        robot.stop_active_speaking_head_motion(reason=f"before music {action} local control reply")
         speaking_cue = SpeakingPlaybackCue(
             robot,
             control["emotion"],
             control["head_motion"],
             timing,
             timing_label="UART Speaking emotion code sent",
-            reset_reason="speaking_head_motion music stop/pause reset",
+            reset_reason=f"speaking_head_motion music {action} reset",
         )
         try:
             tts_ok = speak_reply_and_wait(response, args, on_playback_start=speaking_cue.start)
@@ -9875,7 +10110,7 @@ def handle_wake_chat_response(
             control=control,
             music_action=action,
             focus_running=focus_manager.is_running() if focus_manager is not None else False,
-            reason="music stop/pause confirmation complete",
+            reason=f"music {action} confirmation complete",
         )
         if focus_gate_closed_for_turn and focus_manager is not None and focus_manager.is_running():
             focus_manager.open_uart_gate()
@@ -10335,7 +10570,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     pet_idle_manager: PetIdleReflectionManager | None = None
     todo_event_listener: FrdmTodoEventListener | None = None
     fan_event_manager: FrdmFanControlManager | None = None
-    esp32_ble_manager: Esp32BleBridgeManager | None = None
+    esp32_ble_manager: Esp32BleBridgeManager | Esp32BleApiClientManager | None = None
     esp32_dashboard_server: Esp32DashboardControlServer | None = None
     temp_room_publisher: FrdmRoomTemperaturePublisher | None = None
     uart_bus: FrdmUartBus | None = None
@@ -10349,6 +10584,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         )
         if (
             bool(getattr(args, "esp32_ble", False))
+            and not bool(getattr(args, "esp32_ble_sidecar", False))
             and not bool(getattr(args, "_esp32_ble_runtime_unavailable", False))
             and temperature_receiver is None
             and (not getattr(args, "no_weather_local_temperature", False) or temp_room_uart_enabled)
@@ -10420,11 +10656,18 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     focus_manager = FocusModeManager(args, camera_manager, uart_proxy_url=uart_proxy_server.url if uart_proxy_server is not None else "")
     pet_idle_manager = PetIdleReflectionManager(args, robot, focus_manager)
     todo_manager = TodoListManager(args)
-    esp32_ble_manager = Esp32BleBridgeManager(args, temperature_receiver)
+    if bool(getattr(args, "esp32_ble_sidecar", False)):
+        esp32_ble_manager = Esp32BleApiClientManager(args)
+    else:
+        esp32_ble_manager = Esp32BleBridgeManager(args, temperature_receiver)
     esp32_ble_manager.start()
     temp_room_publisher = FrdmRoomTemperaturePublisher(args, robot, temperature_receiver)
     temp_room_publisher.start()
-    if not getattr(args, "no_esp32_dashboard_control", False) and bool(getattr(args, "esp32_ble", False)):
+    if (
+        not getattr(args, "esp32_ble_sidecar", False)
+        and not getattr(args, "no_esp32_dashboard_control", False)
+        and bool(getattr(args, "esp32_ble", False))
+    ):
         esp32_dashboard_server = Esp32DashboardControlServer(args, esp32_ble_manager)
         esp32_dashboard_server.start()
     todo_event_listener = FrdmTodoEventListener(args, robot, todo_manager)
@@ -10567,6 +10810,13 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             f"reason={getattr(args, '_esp32_ble_runtime_unavailable_reason', 'unavailable')}; "
             "reconnect loop disabled so other features keep running"
         )
+    elif getattr(args, "esp32_ble", False) and getattr(args, "esp32_ble_sidecar", False):
+        esp32_ble_desc = (
+            f"sidecar API, url={args.esp32_ble_api_url}, "
+            f"voice_control={not args.no_esp32_ble_voice_control}, "
+            f"frdm_relay={not args.no_esp32_ble_frdm_control}, "
+            f"timeout={args.esp32_ble_api_timeout:g}s"
+        )
     elif getattr(args, "esp32_ble", False):
         esp32_ble_desc = (
             f"enabled, name={args.esp32_ble_name}, "
@@ -10641,6 +10891,11 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         temp_room_desc = "disabled"
     elif float(getattr(args, "temp_room_uart_interval_sec", 10.0) or 0.0) <= 0.0:
         temp_room_desc = "disabled (interval <= 0)"
+    elif temperature_receiver is None and str(getattr(args, "esp32_temperature_mode", "disabled") or "disabled").strip().lower() in {"pull", "both"} and str(getattr(args, "esp32_temperature_url", "") or "").strip():
+        temp_room_desc = (
+            f"TempRoom every {args.temp_room_uart_interval_sec:g}s from "
+            f"{args.esp32_temperature_url}, max_age={args.temp_room_uart_max_age_sec:g}s, payload=Celsius*10"
+        )
     elif temperature_receiver is None:
         temp_room_desc = "disabled (no ESP32 temperature source)"
     else:
@@ -11174,8 +11429,8 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     music_group.add_argument("--music-mpv-audio-keyword", default=os.getenv("MUSIC_MPV_AUDIO_KEYWORD", os.getenv("MPV_AUDIO_DEVICE_KEYWORD", "UACDemo")), help="Keyword for auto mpv audio device discovery.")
     music_group.add_argument("--music-mpv-ytdl-cookies", default=os.getenv("MUSIC_MPV_YTDL_COOKIES", os.getenv("MPV_YTDL_COOKIES", os.getenv("YTDLP_COOKIES", ""))), help="Optional cookies.txt passed to auto-started mpv/yt-dlp for logged-in YouTube playback.")
     music_group.add_argument("--music-mpv-ytdl-cookies-from-browser", default=os.getenv("MUSIC_MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("MPV_YTDL_COOKIES_FROM_BROWSER", os.getenv("YTDLP_COOKIES_FROM_BROWSER", ""))), help="Optional yt-dlp browser cookie source for auto-started mpv, e.g. firefox or chrome:Profile 1.")
-    music_group.add_argument("--music-mpv-volume", type=int, default=_env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 220)), help="mpv music volume passed to auto-started sidecar.")
-    music_group.add_argument("--music-mpv-volume-max", type=int, default=_env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 300)), help="mpv --volume-max ceiling passed to auto-started sidecar.")
+    music_group.add_argument("--music-mpv-volume", type=int, default=_env_int("MUSIC_MPV_VOLUME", _env_int("MPV_VOLUME", 150)), help="mpv music volume passed to auto-started sidecar.")
+    music_group.add_argument("--music-mpv-volume-max", type=int, default=_env_int("MUSIC_MPV_VOLUME_MAX", _env_int("MPV_VOLUME_MAX", 200)), help="mpv --volume-max ceiling passed to auto-started sidecar.")
     music_group.add_argument("--music-mpv-ready-timeout", type=float, default=_env_float("MUSIC_MPV_READY_TIMEOUT", _env_float("MPV_READY_TIMEOUT", 1.5)), help="Seconds the music sidecar waits for mpv playback status.")
     music_group.add_argument(
         "--music-wake-pause-timeout",
@@ -11340,6 +11595,10 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     esp32_ble_group.add_argument("--esp32-dashboard-port", type=int, default=_env_int("ESP32_DASHBOARD_PORT", DEFAULT_ESP32_DASHBOARD_PORT), help="Local port for dashboard -> ESP32 BLE HTTP control.")
     esp32_ble_group.add_argument("--no-esp32-dashboard-control", action="store_true", help="Do not expose the local dashboard ESP32 BLE control API.")
     esp32_ble_group.add_argument("--esp32-dashboard-debug", action="store_true", help="Log dashboard ESP32 HTTP control requests.")
+    esp32_ble_group.add_argument("--esp32-ble-sidecar", action=argparse.BooleanOptionalAction, default=_env_bool("ESP32_BLE_SIDECAR", False), help="Use the standalone ESP32 BLE HTTP sidecar instead of running BLE reconnect inside this Wake Bridge process.")
+    esp32_ble_group.add_argument("--esp32-ble-api-url", default=os.getenv("ESP32_BLE_API_URL", f"http://{DEFAULT_ESP32_DASHBOARD_HOST}:{DEFAULT_ESP32_DASHBOARD_PORT}/api/esp32"), help="Base URL for the ESP32 BLE sidecar API.")
+    esp32_ble_group.add_argument("--esp32-ble-api-timeout", type=float, default=_env_float("ESP32_BLE_API_TIMEOUT", 0.2), help="Short timeout for Wake Bridge -> ESP32 BLE sidecar API calls.")
+    esp32_ble_group.add_argument("--esp32-ble-api-status-cache-sec", type=float, default=_env_float("ESP32_BLE_API_STATUS_CACHE_SEC", 0.5), help="Maximum cached ESP32 sidecar status age for local voice parsing.")
     esp32_ble_group.add_argument("--temp-room-uart-interval-sec", type=float, default=_env_float("TEMP_ROOM_UART_INTERVAL_SEC", 10.0), help="Send latest ESP32 room temperature to FRDM as TempRoom <Celsius*10> at this interval. Use 0 to disable.")
     esp32_ble_group.add_argument("--temp-room-uart-max-age-sec", type=float, default=_env_float("TEMP_ROOM_UART_MAX_AGE_SEC", 30.0), help="Maximum age of an ESP32 temperature reading before skipping TempRoom UART.")
     esp32_ble_group.add_argument("--no-temp-room-uart", action="store_true", help="Do not send periodic TempRoom UART updates to FRDM.")
@@ -11674,7 +11933,7 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
     if int(getattr(args, "music_mpv_volume", 100) or 0) < 0:
         print("ERROR: --music-mpv-volume must be >= 0.")
         return False
-    if int(getattr(args, "music_mpv_volume_max", 300) or 0) < 100:
+    if int(getattr(args, "music_mpv_volume_max", 200) or 0) < 100:
         print("ERROR: --music-mpv-volume-max must be >= 100.")
         return False
     if float(getattr(args, "music_mpv_ready_timeout", 0.0) or 0.0) < 0.0:
@@ -11782,6 +12041,16 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
         if float(getattr(args, "esp32_ble_tts_timeout", 0.0) or 0.0) <= 0.0:
             print("ERROR: --esp32-ble-tts-timeout must be > 0.")
             return False
+        if bool(getattr(args, "esp32_ble_sidecar", False)):
+            if not str(getattr(args, "esp32_ble_api_url", "") or "").strip():
+                print("ERROR: --esp32-ble-api-url is required when --esp32-ble-sidecar is enabled.")
+                return False
+            if float(getattr(args, "esp32_ble_api_timeout", 0.0) or 0.0) <= 0.0:
+                print("ERROR: --esp32-ble-api-timeout must be > 0.")
+                return False
+            if float(getattr(args, "esp32_ble_api_status_cache_sec", 0.0) or 0.0) < 0.0:
+                print("ERROR: --esp32-ble-api-status-cache-sec must be >= 0.")
+                return False
     if float(getattr(args, "temp_room_uart_interval_sec", 0.0) or 0.0) < 0.0:
         print("ERROR: --temp-room-uart-interval-sec must be >= 0.")
         return False

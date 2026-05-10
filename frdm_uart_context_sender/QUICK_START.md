@@ -1,15 +1,124 @@
 # Quick Start: Wake Bridge Full Demo + Vision + FRDM UART + Focus + To-Do + Music + Weather + Dashboard
 
-這份文件是現場 demo 操作手冊。每次要從零啟動，先看 **0. 一頁照貼版**，照順序貼 Terminal 1/2/4/5/3 即可。Terminal 4 是 Jetson 本地工具視窗，負責音樂 `/music` 與天氣 `/weather`；Terminal 5 是手機/網站 dashboard；Terminal 3 是 Wake Bridge，正式語音 demo 最後啟動。
+這份文件是現場 demo 操作手冊。每次要從零啟動，Windows 端仍要先開 Terminal 1；Jetson 端現在建議直接用一鍵 pipeline，不用再手動開 Terminal 2/6/4/5/3。Terminal 6 是 ESP32 BLE sidecar API，專門跑 ESP32 reconnect/status notify/command queue；Terminal 4 是 Jetson 本地工具視窗，負責音樂 `/music` 與天氣 `/weather`；Terminal 5 是手機/網站 dashboard；Terminal 3 是 Wake Bridge，正式語音 demo 最後啟動。
 
 最短使用方式：
 
+```bash
+# Windows Terminal 1 先開好 desktop_fast_chat_server.py 之後，在 Jetson 跑：
+cd /home/asrlab-yian/MakeNTU
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh start
+```
+
+這支 pipeline 會照 Quick Start 順序自動啟動 Jetson 端所有服務：
+
 ```text
 Terminal 1 on Windows : desktop_fast_chat_server.py
-Terminal 2 on Jetson  : jetson_piper_tts.server
-Terminal 4 on Jetson  : music_web_player.py   # local /music + /weather tools
-Terminal 5 on Jetson  : smart_home_dashboard/server.py   # phone/web dashboard
-Terminal 3 on Jetson  : wake_voice_chat_frdm_bridge.py
+Terminal 2 on Jetson  : jetson_piper_tts.server                 # pipeline starts it
+Terminal 6 on Jetson  : esp32s3_ble_fan_led_controller.py --api-server # pipeline starts it
+Terminal 4 on Jetson  : music_web_player.py   # /music+/weather # pipeline starts it
+Terminal 5 on Jetson  : smart_home_dashboard/server.py           # pipeline starts it
+Terminal 3 on Jetson  : wake_voice_chat_frdm_bridge.py           # pipeline starts it last
+```
+
+Pipeline 常用操作：
+
+```bash
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh plan
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh status
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh monitor
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh logs bridge
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh logs esp32
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh logs music
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh stop
+```
+
+`plan` 只印出正式順序和完整 command，不會殺舊 process、也不會啟動新服務。正式順序是 Terminal 2 TTS -> Terminal 6 ESP32 BLE sidecar API -> Terminal 4 Music/Weather -> Terminal 5 Dashboard -> Terminal 3 Wake Bridge。
+
+`start` 和 `restart` 預設都會先做 deep clean，再重開 Terminal 2/6/4/5/3。它會清掉：
+
+```text
+pipeline PID 裡記錄的舊 service process group
+同一個 Jetson 使用者底下舊的 TTS / ESP32 sidecar/standalone / Music / Dashboard / Wake Bridge / Focus process
+user systemd 的 makentu-wake-bridge.service，避免 systemd 背景自動拉起另一個 Terminal 3
+固定 demo ports: 8777, 8788, 8789, 8790, 8791
+```
+
+它不會碰 Windows Terminal 1，也不會殺掉無關的 terminal shell。真的只想在舊 process 旁邊試跑，可加 `--no-clean`；只是不建議正式 demo 這樣做，因為很容易兩個 bridge 搶 FRDM UART、麥克風、或 ESP32 BLE。
+
+如果想啟動後留在同一個 terminal 看所有 log：
+
+```bash
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh start --tail
+```
+
+如果想像以前一樣看到多個 Terminal 視窗，各自顯示 TTS / ESP32 / Music / Dashboard / Bridge log：
+
+```bash
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart --terminals
+
+# 已經啟動後只打開 log terminal，不重啟服務：
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh monitor
+```
+
+pipeline 本身是背景 service 啟動器，所以單純 `restart` 成功後會回到 prompt，這是正常的；要看即時輸出就用 `monitor`、`logs bridge`、`logs esp32` 或 `--tail`。
+
+如果 ESP32 BLE 要固定 MAC，或要覆蓋音量/Windows IP：
+
+```bash
+ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
+ESP32_BLE_ADAPTER=hci0 \
+SERVER_URL=http://100.108.141.26:8766/voice-chat \
+FOCUS_SERVER_URL=http://100.108.141.26:8766/focus-check \
+PIPELINE_TTS_VOLUME_GAIN=3.6 \
+PET_IDLE_REFLECTION=0 \
+BEEP_PLAYER=aplay \
+BEEP_VOLUME=0.55 \
+MUSIC_MPV_VOLUME=150 \
+MUSIC_MPV_VOLUME_MAX=200 \
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh start
+```
+
+Pipeline 會預設強制使用 `PIPELINE_TTS_VOLUME_GAIN=3.6`，避免舊 terminal 裡殘留的 `MAKE_NTU_TTS_VOLUME_GAIN=4.8` 又把聲音拉回舊值。單獨跑 `run_wake_bridge_full_demo.sh` 時也預設是 `3.6`；真的要覆蓋 Terminal 3 說話音量，用 `WAKE_TTS_VOLUME_GAIN=2.8` 或 `WAKE_TTS_VOLUME_GAIN=4.8`。
+
+Pipeline 也預設 `PET_IDLE_REFLECTION=0`。這會關掉背景每隔一段時間去 Windows `/text-chat` 的 pet idle self-reflection，避免它在 Ollama 忙或 timeout 時和真正使用者對話搶 queue。真的想恢復寵物自己偶爾講話，再用 `PET_IDLE_REFLECTION=1 ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart`。
+
+需要把額外 Wake Bridge parser/debug 參數傳給正式 Terminal 3，就放在 `--` 後面：
+
+```bash
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh start -- --no-startup-time --no-startup-weather --no-dashboard-uart
+```
+
+pipeline log 會放在：
+
+```text
+frdm_uart_context_sender/logs/jetson_pipeline/latest/
+```
+
+現場快速判讀：
+
+```text
+plan         -> 核對順序與完整 parser；不會動目前服務
+status       -> 看 tts / esp32 / music / dashboard / bridge 是否 running
+logs esp32   -> 只看 BLE scan、reconnect、status notify、BLE TX
+logs bridge  -> 看 wake word、錄音、Windows AI、TTS、FRDM UART
+logs music   -> 看 mpv、YouTube、weather tool
+logs dashboard -> 看手機/網站 API
+monitor      -> 開多個 log terminal；如果沒有 GUI terminal，就退回同一個 terminal tail log
+restart      -> 正式重開 Jetson 端；會先 deep clean 再依序啟動
+stop         -> 停 Jetson 端所有 pipeline service
+```
+
+正式啟動成功至少要看到：
+
+```text
+TTS health       OK
+ESP32 API health OK
+Music health     OK
+Dashboard status OK
+ESP32 sidecar API OK
+bridge           running
 ```
 
 請盡量整段複製，不要手打尾端參數。最常見打錯是把下面兩個參數黏在一起：
@@ -21,7 +130,7 @@ Terminal 3 on Jetson  : wake_voice_chat_frdm_bridge.py
       --uart-debug
 ```
 
-現在建議 Terminal 3 直接用啟動腳本，避免 `source` 錯 venv 或尾端參數貼壞：
+如果只想單獨重啟 Terminal 3 Wake Bridge，仍建議直接用啟動腳本，避免 `source` 錯 venv 或尾端參數貼壞。這是 Terminal-3-only debug，不是正式完整 pipeline：
 
 ```bash
 cd /home/asrlab-yian/MakeNTU
@@ -31,7 +140,7 @@ cd /home/asrlab-yian/MakeNTU
 如果 FRDM firmware 還沒加入 Time / Weather / Todo / Health dashboard parser，log 出現 `FRDM UART RX: No such command exist.` 不會影響語音、TTS、表情和頭部馬達；要暫時關掉那些 dashboard UART 噪音，可用：
 
 ```bash
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh --no-startup-time --no-startup-weather --no-dashboard-uart
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart -- --no-startup-time --no-startup-weather --no-dashboard-uart
 ```
 
 目前預設：
@@ -48,8 +157,8 @@ Local tool server : http://127.0.0.1:8788
 Dashboard server  : http://jetson-ip:8789/dashboard
 Weather source    : Open-Meteo, default location=Taipei
 Startup weather   : enabled, sends Weather daily + Weather current before Normal
-ESP32-S3 BLE     : fan + LED + DS18B20 status, device ESP32S3_FAN_LED_TEMP
-Local temperature : preferred from ESP32 BLE notify; legacy HTTP push receiver still available
+ESP32-S3 BLE     : fan + LED + DS18B20 status, device ESP32S3_FAN_LED_TEMP, Jetson sidecar API on 127.0.0.1:8791
+Local temperature : preferred from ESP32 BLE sidecar status; legacy HTTP push receiver still available
 ```
 
 如果 Tailscale IP 變了，所有指令裡的 IP 要一起改。
@@ -85,10 +194,10 @@ music_backend=mpv
 music_wake_pause_timeout=0.6
 weather_default_location=Taipei
 smart_home_dashboard=on, Jetson :8789, phone/web controls Jetson state + ESP32 BLE appliances
-esp32_ble=on by default in run_wake_bridge_full_demo.sh
-esp32_dashboard_api=Wake Bridge local :8791 for Dashboard -> ESP32 BLE control
+esp32_ble=on by default in the pipeline
+esp32_sidecar_api=Terminal 6 local :8791 for Dashboard/Wake Bridge -> ESP32 BLE control
 dashboard_wake_monitor=Wake Bridge writes logs/wake_status.json for volume/wake score/listening health
-esp32_temperature_mode=push receiver still available, but BLE notify is preferred for the fan/LED/temp board
+esp32_temperature_mode=pull from Terminal 6 sidecar in pipeline; legacy push receiver remains for temperature-only ESP32 boards
 head_pitch=65..90..115 (down..center..up)
 head_yaw=0..90..180 (right..center..left)
 head_motor=enabled in Terminal 3 full demo, disable only for FRDM parser debugging
@@ -100,27 +209,27 @@ head_motion=pose-driven cute motion, large yaw/pitch targets with longer holds
 現場音量安全檔位：
 
 ```text
-目前建議值     : DEFAULT_VOLUME_GAIN=4.8, --tts-volume-gain 4.8
-旁邊的人會嚇到 : 降到 3.6，並把 --beep-volume 降到 0.25
-現場太吵聽不清 : 先升到 6.0，不要直接跳 8.0
+目前建議值     : DEFAULT_VOLUME_GAIN=3.6, --tts-volume-gain 3.6
+旁邊的人會嚇到 : 降到 2.8，並把 --beep-volume 降到 0.25
+現場太吵聽不清 : 先升到 4.8，不要直接跳 8.0
 USB sink 建議   : PulseAudio UACDemo 約 70%，ALSA PCM 70%
 ```
 
-這裡的 `4.8` 是固定絕對增益，不是每次啟動再乘一次。它是前一版 `2.4` 的 `2x`，用來補回現場聽起來依然偏小的 TTS 音量。
+這裡的 `3.6` 是固定絕對增益，不是每次啟動再乘一次。它比前一版 `4.8` 保守，優先避免破音和忽大忽小；如果現場真的太吵，再升到 `4.8`。
 
 新開 Terminal 會透過 `~/.bashrc` 自動呼叫 `frdm_uart_context_sender/set_uacdemo_volume.sh --wait 1`，把 UACDemo 的 PulseAudio 與 ALSA PCM 音量拉回絕對 `70%`。開機/登入時也有已啟用 linger 的 `makentu-uacdemo-volume.service` 和 `~/.config/autostart/makentu-uacdemo-volume.desktop` 會等待 USB speaker 出現後套用同一份絕對音量。臨時要改可以在開 Terminal 前設定 `MAKE_NTU_UACDEMO_PCM_VOLUME` / `MAKE_NTU_UACDEMO_PULSE_VOLUME`，例如 `MAKE_NTU_UACDEMO_PCM_VOLUME=60% MAKE_NTU_UACDEMO_PULSE_VOLUME=60% bash`。
 
-新開 Terminal 也會把 demo 裝置和音量環境變數固定成 auto/keyword/absolute：`AUDIO_DEVICE=auto:UACDemo`、`MIC_DEVICE_KEYWORD=UACDemo`、`SPEAKER_DEVICE_KEYWORD=UACDemo`、`WAKE_CAMERA_ID=auto`、`FOCUS_CAMERA_ID=auto`、`FOCUS_UART_PORT=auto`、`TTS_VOLUME_GAIN=4.8`、`DEFAULT_VOLUME_GAIN=4.8`。如果真的要手動覆蓋，用 `MAKE_NTU_AUDIO_DEVICE` / `MAKE_NTU_WAKE_CAMERA_ID` / `MAKE_NTU_FOCUS_UART_PORT` / `MAKE_NTU_TTS_VOLUME_GAIN` 這類 `MAKE_NTU_*` 變數。
+新開 Terminal 也會把 demo 裝置和音量環境變數固定成 auto/keyword/absolute：`AUDIO_DEVICE=auto:UACDemo`、`MIC_DEVICE_KEYWORD=UACDemo`、`SPEAKER_DEVICE_KEYWORD=UACDemo`、`WAKE_CAMERA_ID=auto`、`FOCUS_CAMERA_ID=auto`、`FOCUS_UART_PORT=auto`、`TTS_VOLUME_GAIN=3.6`、`DEFAULT_VOLUME_GAIN=3.6`。如果真的要手動覆蓋裝置，用 `MAKE_NTU_AUDIO_DEVICE` / `MAKE_NTU_WAKE_CAMERA_ID` / `MAKE_NTU_FOCUS_UART_PORT`；要覆蓋 Terminal 3 說話增益，用 `WAKE_TTS_VOLUME_GAIN`，要覆蓋 pipeline 預設用 `PIPELINE_TTS_VOLUME_GAIN`。
 
-正式 demo 最省事的做法是先跑自動偵測，再用包好的啟動腳本：
+正式 demo 最省事的做法是先跑自動偵測，再用一鍵 pipeline 重開 Jetson 端所有服務：
 
 ```bash
 cd /home/asrlab-yian/MakeNTU
 bash frdm_uart_context_sender/auto_demo_devices.sh
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
-`auto_demo_devices.sh` 會等 UACDemo 揚聲器、UACDemo 麥克風、FRDM UART、相機重新枚舉完成，並順手套用 UACDemo 70% 音量。`run_wake_bridge_full_demo.sh` 也會在每次啟動前再跑一次偵測，所以 USB 重插後通常只要重開 Terminal 3。
+`auto_demo_devices.sh` 會等 UACDemo 揚聲器、UACDemo 麥克風、FRDM UART、相機重新枚舉完成，並順手套用 UACDemo 70% 音量。`run_jetson_full_demo_pipeline.sh restart` 會先 deep clean 舊的 Jetson demo process/port，再依序啟動 Terminal 2/6/4/5/3；USB 重插後建議直接重跑 pipeline，除非你正在做 Terminal-3-only 的窄範圍 debug。
 
 音量相關修改後：
 
@@ -135,7 +244,8 @@ bash frdm_uart_context_sender/auto_demo_devices.sh
 ```text
 Windows Terminal 1  -> 必須重啟，讓 emotion alias / local fallback 生效
 Jetson Terminal 2   -> 必須重啟，讓 TTS volume_gain API 生效
-Jetson Terminal 3   -> 必須重啟，讓 Speaking 0-5、音樂誤判保護、BLE reconnect 隔離、tts-volume-gain 生效
+Jetson Terminal 6   -> 必須重啟，讓 ESP32 BLE sidecar API / reconnect / status notify 生效
+Jetson Terminal 3   -> 必須重啟，讓 Speaking 0-5、音樂誤判保護、ESP32 sidecar client、tts-volume-gain 生效
 Jetson Terminal 4   -> music/weather tool 若已正常可不用重啟；若點歌誤判仍怪，重啟它
 Jetson Terminal 5   -> dashboard server 若前端/API 有改，重啟它
 ```
@@ -145,10 +255,9 @@ Jetson Terminal 5   -> dashboard server 若前端/API 有改，重啟它
 ```text
 1. Windows Terminal 1 還活著嗎？先看 /health。
 2. Jetson Terminal 2 TTS 還活著嗎？先看 /health。
-3. 停掉舊 bridge：pkill -9 -f wake_voice_chat_frdm_bridge.py
-4. Dashboard 不動可先不用重開；若網站怪怪的，重貼 Terminal 5。
-5. 重貼 Terminal 3 正式完整模式。
-6. 若找不到 USB，跑 ./recover_demo_usb.sh，然後重開 Terminal 2 和 Terminal 3。
+3. 直接跑 `./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart`，讓它清掉舊 Terminal 2/6/4/5/3。
+4. 若只想看問題，不想動服務，先跑 `./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh plan` 或 `status`。
+5. 若找不到 USB，跑 `./frdm_uart_context_sender/recover_demo_usb.sh`，再重跑 pipeline。
 ```
 
 FRDM UART 狀態機速查：
@@ -383,11 +492,11 @@ TTS `.env` 必須是：
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=4.8
+DEFAULT_VOLUME_GAIN=3.6
 ENABLE_STREAM_PLAYBACK=true
 ```
 
-`4.8` 是目前現場固定音量。若仍偏大，降到 `3.6`；若太小，再試 `6.0`。不要直接跳回 `8.0`。
+`3.6` 是目前現場固定音量。若仍偏大或失真，降到 `2.8`；若太小，再試 `4.8`。不要直接跳回 `8.0`。
 
 ### 0.5 Terminal 4: Jetson Local Tool Server
 
@@ -410,8 +519,8 @@ python3 music_web_player.py \
   --port 8788 \
   --backend mpv \
   --mpv-audio-device auto \
-  --mpv-volume 220 \
-  --mpv-volume-max 300 \
+  --mpv-volume 150 \
+  --mpv-volume-max 200 \
   --mpv-ready-timeout 1.5 \
   --weather-default-location Taipei \
   --weather-timeout 4.5
@@ -419,10 +528,10 @@ python3 music_web_player.py \
 
 `mpv` 會真的播放第一個搜尋結果，並支援 pause/resume 保留播放位置；`browser` 只開搜尋頁，不保證播放，也不能可靠暫停/繼續。
 `--mpv-audio-device auto` 會優先找 `UACDemo` USB 音效輸出，避免 mpv 播了但聲音跑到 Jetson 預設音源。
-`--mpv-volume 220` 只調整音樂本身，不會影響 Piper TTS；`--mpv-volume-max 300` 讓 mpv 接受大於 100 的音量設定，避免你把音樂調高卻被 mpv 內部上限截掉。
+`--mpv-volume 150` 只調整音樂本身，不會影響 Piper TTS；`--mpv-volume-max 200` 讓 mpv 接受大於 100 的音量設定，避免你把音樂調高卻被 mpv 內部上限截掉。
 天氣走 Open-Meteo，不需要 API key。`--weather-default-location Taipei` 是「所在地、這裡、附近、here」的預設位置；如果 demo 場地在新竹，可改成 `Hsinchu`。`--weather-timeout 4.5` 會讓外部 Open-Meteo 查詢在合理時間內回覆，並搭配本機 cache 避免 dashboard/status 被天氣查詢卡住。
 
-ESP32-S3 + DS18B20 本地溫度不在 Terminal 4。現在主線是 Terminal 3 透過 BLE 訂閱 ESP32-S3 狀態 notify；同一塊 ESP32 也控制風扇和 MAX7219 LED。舊版 WiFi push 溫度仍保留給只做溫度板的情境：ESP32 和 Jetson 在同一個 LAN，ESP32 定期 POST 到 Jetson：
+ESP32-S3 + DS18B20 本地溫度不在 Terminal 4。現在主線是 Terminal 6 sidecar 透過 BLE 訂閱 ESP32-S3 狀態 notify，Terminal 3 只讀 sidecar API；同一塊 ESP32 也控制風扇和 MAX7219 LED。舊版 WiFi push 溫度仍保留給只做溫度板的情境：ESP32 和 Jetson 在同一個 LAN，ESP32 定期 POST 到 Jetson：
 
 ```text
 POST http://JETSON_LAN_IP:8790/temperature
@@ -447,12 +556,12 @@ curl http://127.0.0.1:8788/health
 backend=mpv        -> 正式播放模式
 active=true        -> 目前有 mpv process
 paused=true        -> 音樂暫停中，可以 resume
-requested_mpv_volume=220 -> 啟動時要求的音樂音量
-requested_mpv_volume_max=300 -> 啟動時要求的 mpv 上限
-mpv_volume=220     -> 程式設定的音樂音量
-mpv_volume_max=300 -> mpv --volume-max ceiling
-mpv_actual_volume=220 -> mpv IPC 回報的實際音量，播放中才會有
-mpv_effective_volume=220 -> 播放中用實際音量，閒置時用設定音量
+requested_mpv_volume=150 -> 啟動時要求的音樂音量
+requested_mpv_volume_max=200 -> 啟動時要求的 mpv 上限
+mpv_volume=150     -> 程式設定的音樂音量
+mpv_volume_max=200 -> mpv --volume-max ceiling
+mpv_actual_volume=150 -> mpv IPC 回報的實際音量，播放中才會有
+mpv_effective_volume=150 -> 播放中用實際音量，閒置時用設定音量
 mpv_volume_clamped=false -> true 代表要求值被上限截斷
 last_query=...     -> 上一次點的歌
 title=...          -> mpv 從 YouTube/yt-dlp 取得的實際 media title
@@ -478,7 +587,7 @@ curl -X POST http://127.0.0.1:8788/weather \
 /api/status            time / devices / sensors / ESP32 temp / wake monitor / todo / focus / music / weather / health
 /api/camera/latest     pet camera snapshot
 /api/camera/stream     MJPEG pet camera stream
-/api/devices           電器控制狀態，LED / fan 會轉送 Wake Bridge :8791
+/api/devices           電器控制狀態，LED / fan 會轉送 ESP32 sidecar :8791
 /api/todo              和 Wake Bridge 共用同一份 todo JSON
 /api/focus/summaries   專心紀錄圖像化資料
 /api/ai/trace          使用者文字輸入 / 模型文字輸出
@@ -505,12 +614,12 @@ Dashboard 的 Live tab 會用它顯示 `Wake Listen`、`Volume`、`Wake Score`�
 Live tab 的 Smart Appliances 區塊走這條路：
 
 ```text
-Local Temperature <- Wake Bridge ESP32 BLE status notify
-LED Light         -> Dashboard :8789 -> Wake Bridge :8791 -> ESP32 BLE LED_ON/OFF
-Fan Speed         -> Dashboard :8789 -> Wake Bridge :8791 -> ESP32 BLE FAN_SPEED
+Local Temperature <- ESP32 sidecar BLE status -> Wake Bridge weather/TempRoom
+LED Light         -> Dashboard :8789 -> ESP32 sidecar :8791 -> ESP32 BLE LED_ON/OFF
+Fan Speed         -> Dashboard :8789 -> ESP32 sidecar :8791 -> ESP32 BLE FAN_SPEED
 ```
 
-所以要讓網站上的 LED/風扇真的動，Terminal 3 必須開著並啟用 ESP32 BLE。`run_wake_bridge_full_demo.sh` 已經會啟用主線 ESP32 BLE 設定；若手動下指令，要包含 `--esp32-ble`、ESP32 address/adapter，且不要加 `--no-esp32-dashboard-control`。
+所以要讓網站上的 LED/風扇真的動，Terminal 6 sidecar 必須開著並啟用 ESP32 BLE。正式 demo 用 pipeline 會自動帶好；若手動下指令，要先開 `esp32s3_ble_fan_led_controller.py --api-server`，Terminal 3 再用 `--esp32-ble --esp32-ble-sidecar --esp32-ble-api-url http://127.0.0.1:8791/api/esp32`。
 
 語音桌寵 demo 預設不要讓 Dashboard 搶 FRDM UART，所以用 `--no-frdm-uart`：
 
@@ -603,80 +712,46 @@ python3 smart_home_dashboard/server.py \
 
 ### 0.7 Terminal 3: Jetson Wake Bridge
 
-這個最後啟動。請整段複製，不要手打最後幾行。要真的送 Discord，先在同一個 terminal 設：
+Terminal 3 是 Wake Bridge 主流程，正式 demo 由 pipeline 最後啟動。請不要再手貼超長 parser；要核對完整參數時用 `plan`，它會印出 Terminal 2/6/4/5/3 的順序和 Terminal 3 expanded parser，但不會殺 process、也不會啟動服務。
+
+```bash
+cd /home/asrlab-yian/MakeNTU
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh plan
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
+```
+
+Terminal 3 的正式 parser 由 `run_wake_bridge_full_demo.sh` 產生，但 pipeline 會幫你帶好 sidecar mode。ESP32 相關的關鍵差異一定要看到：
+
+```text
+Terminal 6 owns BLE:
+  esp32s3_ble_fan_led_controller.py --api-server --api-port 8791
+
+Terminal 3 talks to Terminal 6 with short local API calls:
+  --esp32-temperature-mode pull
+  --esp32-temperature-url http://127.0.0.1:8791/api/esp32/status
+  --esp32-ble-sidecar
+  --esp32-ble-api-url http://127.0.0.1:8791/api/esp32
+  --esp32-ble-api-timeout 0.2
+  --no-esp32-dashboard-control
+```
+
+這和舊手動版的 `--esp32-temperature-mode push` 不一樣，是故意的。正式 full demo 由 Terminal 6 負責 BLE scan / reconnect / status notify / command queue，Terminal 3 只做 wake/audio/Windows AI/TTS/FRDM UART 和短 timeout API 呼叫，避免 ESP32 迴圈拖慢一般對話。
+
+要真的送 Discord focus 通知，先在同一個 terminal 設：
 
 ```bash
 export DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...'
 ```
 
-沒有設定 webhook 時，專心報告仍會寫到本機檔案，只是不會送出通知。
-如果手動用 Python 測 webhook，request 要帶 `User-Agent`，不然可能被 Discord 前面的 Cloudflare 擋成 `403 error code: 1010`：
+沒有設定 webhook 時，專心報告仍會寫到本機檔案，只是不會送出通知。`plan` / `--print-command` 會自動把 webhook URL redacted，不會把完整 token 印進 log。
 
-```bash
-python3 - <<'PY'
-import os, json, urllib.request, urllib.error
-
-url = os.environ["DISCORD_WEBHOOK_URL"].strip()
-payload = json.dumps({"content": "Jetson Discord webhook test."}).encode("utf-8")
-req = urllib.request.Request(
-    url,
-    data=payload,
-    headers={
-        "Content-Type": "application/json",
-        "User-Agent": "DiscordBot (https://github.com/asrlab-yian/MakeNTU, 0.1)",
-    },
-    method="POST",
-)
-
-try:
-    with urllib.request.urlopen(req, timeout=8) as r:
-        print("status:", r.status)
-        print(r.read().decode("utf-8", errors="replace"))
-except urllib.error.HTTPError as e:
-    print("HTTP status:", e.code)
-    print(e.read().decode("utf-8", errors="replace"))
-PY
-```
-
-推薦直接跑腳本；它會自動進 `/home/asrlab-yian/MakeNTU`、啟用 `emotion_robot_controller/.venv`，並帶完整穩定參數：
-
-```bash
-cd /home/asrlab-yian/MakeNTU
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
-```
-
-ESP32 BLE 建議用掃描到的 MAC 啟動，最穩：
+ESP32 BLE 建議用掃描到的 MAC 啟動，最穩；正式請用 pipeline restart：
 
 ```bash
 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
 ESP32_BLE_ADAPTER=hci0 \
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
-
-BLE 現在是可降級功能，不應該影響其他功能。Terminal 3 會把 BLE scan/connect/reconnect 放在背景 worker `esp32s3-ble-reconnect-loop`；ESP32 沒連上時，Hey Jarvis、TTS、音樂、天氣、FRDM UART、to-do、focus 和 dashboard 仍要繼續跑。只有風扇/LED/DS18B20 溫度相關功能會暫時降級。
-
-如果你要 Jetson 開機就自動啟動 Wake Bridge 並自動連 ESP32 BLE，安裝 user systemd service：
-
-```bash
-cd /home/asrlab-yian/MakeNTU
-./frdm_uart_context_sender/install_wake_bridge_service.sh \
-  --address 78:E3:6D:18:94:6A \
-  --adapter hci0
-
-systemctl --user start makentu-wake-bridge.service
-journalctl --user -u makentu-wake-bridge.service -f
-```
-
-之後重開機也會自動啟動。BLE 中途斷線時，背景 worker 會持續重新 scan/connect；如果整個 bridge 程式掛掉，systemd 會用 `Restart=always` 拉起來。要改 MAC、Tailscale IP、BLE queue 上限或風扇最低 PWM，編輯：
-
-```bash
-nano ~/.config/makentu/wake-bridge.env
-systemctl --user restart makentu-wake-bridge.service
-```
-
-如果 BLE 斷線時你說「開風扇 / 關風扇 / 調高風扇」，Jetson 會直接語音提醒「目前沒有連上 ESP32-S3 藍芽、正在重新連線」，並把這次指令先排進佇列；ESP32-S3 重新連上後會自動送出。佇列上限是 `ESP32_BLE_COMMAND_QUEUE_MAX` / `--esp32-ble-command-queue-max`，預設 `64`，滿了會丟掉最舊的 BLE 指令，不會讓主程式卡住。如果 BLE 連線中且最新 ESP32 狀態已經是 `FAN:OFF`，你又說「關風扇」，Jetson 會直接說電風扇明明已經是關的，不會再重複送 `FAN_OFF`。
-
-語音控制 ESP32 是本地控制，不會先丟給一般 AI route。`關風扇 / 全部關掉 / 關 LED` 會先送 BLE 指令，再用 Piper 說一小句確認，最後送 `Normal 0 0` 並退出 conversation follow-up。這些確認句強制 `head_motion=none`；Terminal 3 看到 `speaking head motion skipped: none` 是正確的，代表有講話但不轉頭，避免「沒聲音或已關閉後馬達還在動」。音量抱怨不會被當成風扇控制：`音樂太小聲，幫我調大音量` 不會走 BLE；只有包含 `風扇 / 風量 / 風速 / 好熱 / 好冷` 這類語境時才會調風扇。
 
 需要調風扇最低起轉 duty 時：
 
@@ -684,13 +759,13 @@ systemctl --user restart makentu-wake-bridge.service
 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
 ESP32_BLE_ADAPTER=hci0 \
 FAN_MIN_PWM=120 \
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 暫時不接 ESP32 時：
 
 ```bash
-ESP32_BLE=0 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+ESP32_BLE=0 ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 如果 Windows Tailscale IP 變了，不用改檔案，這樣覆蓋：
@@ -698,117 +773,30 @@ ESP32_BLE=0 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
 ```bash
 SERVER_URL=http://NEW_WINDOWS_IP:8766/voice-chat \
 FOCUS_SERVER_URL=http://NEW_WINDOWS_IP:8766/focus-check \
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
-```bash
-cd /home/asrlab-yian/MakeNTU
-source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
+Terminal-3-only debug 仍可用下面兩個指令。這個模式只適合查 mic/beep/camera/UART/TTS，不適合現場完整 demo，也不適合追 ESP32 造成的延遲：
 
-python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
-  --server-url http://100.108.141.26:8766/voice-chat \
-  --mic-keyword UACDemo \
-  --beep-keyword UACDemo \
-  --beep-player auto \
-  --noisy-room \
-  --tts-volume-gain 4.8 \
-  --beep-volume 0.35 \
-  --uart-port auto \
-  --uart-baudrate 115200 \
-  --frdm-uart-tx-timeout 0.45 \
-  --frdm-uart-failure-threshold 2 \
-  --frdm-uart-circuit-breaker-sec 4.0 \
-  --enable-head-motor \
-  --boot-normal-delay 2.0 \
-  --device-ready-timeout 30 \
-  --wake-threshold 0.75 \
-  --wake-volume-min 500 \
-  --volume-min 1100 \
-  --speech-start-margin 750 \
-  --silence-duration 1.2 \
-  --silence-margin 900 \
-  --max-speech-seconds 5 \
-  --max-recording-seconds 7 \
-  --audio-read-timeout 0.75 \
-  --recording-progress-interval 1.0 \
-  --conversation-mode \
-  --turn-listen-timeout 8 \
-  --session-idle-timeout 30 \
-  --max-session-turns 20 \
-  --camera-id auto \
-  --camera-width 320 \
-  --camera-height 240 \
-  --camera-jpeg-quality 70 \
-  --camera-latest-timeout 1.0 \
-  --camera-frame-max-age 2.0 \
-  --focus-script /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py \
-  --focus-server-url http://100.108.141.26:8766/focus-check \
-  --focus-interval-sec 60 \
-  --focus-first-sample-delay-sec -1 \
-  --focus-duration-min 0 \
-  --focus-log-root /tmp/focus_voice_test \
-  --focus-alert-threshold 1 \
-  --focus-alert-cooldown-sec 90 \
-  --fan-device-id desk_fan \
-  --fan-speed-max 100 \
-  --esp32-ble \
-  --esp32-ble-adapter hci0 \
-  --esp32-ble-scan-duplicates \
-  --esp32-ble-min-fan-pwm 96 \
-  --esp32-ble-command-queue-max 64 \
-  --esp32-dashboard-host 127.0.0.1 \
-  --esp32-dashboard-port 8791 \
-  --fan-duplicate-suppress-sec 2.0 \
-  --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
-  --wake-status-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/wake_status.json \
-  --focus-notify-mode discord \
-  --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
-  --music-backend mpv \
-  --music-mpv-audio-device auto \
-  --music-mpv-volume 220 \
-  --music-mpv-volume-max 300 \
-  --music-mpv-ready-timeout 1.5 \
-  --music-timeout 5 \
-  --music-wake-pause-timeout 0.25 \
-  --music-wake-beep-settle 0.05 \
-  --post-music-standby-cooldown 0.8 \
-  --music-debug \
-  --weather-default-location Taipei \
-  --weather-timeout 6 \
-  --weather-api-timeout 4.5 \
-  --weather-debug \
-  --esp32-temperature-mode push \
-  --esp32-temperature-host 0.0.0.0 \
-  --esp32-temperature-port 8790 \
-  --esp32-temperature-path /temperature \
-  --temp-room-uart-interval-sec 10 \
-  --temp-room-uart-max-age-sec 30 \
-  --motor-step-delay 0.55 \
-  --motor-smooth-step-deg 120 \
-  --motor-speaking-step-delay 0.72 \
-  --motor-speaking-smooth-step-deg 120 \
-  --motor-reset-repeats 1 \
-  --motor-reset-delay 0.35 \
-  --motor-stop-timeout 6 \
-  --motor-join-timeout 6 \
-  --device-preflight-verbose \
-  --tts-poll-interval 0.75 \
-  --tts-start-poll-interval 0.12 \
-  --tts-speaking-start-timeout 1.2 \
-  --tts-speaking-require-audio \
-  --tts-debug \
-  --uart-debug
+```bash
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh --print-command
+./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
 ```
 
 這是 Wake Bridge 完整功能版：wake word、連續對話、speech-end 拍照、FRDM UART、Piper TTS、To-Do、Music、Weather、Focus Work Mode、ESP32 BLE、Dashboard ESP32 control API 都會開。第一次說 `Hey Jarvis` 後會進入 conversation mode，後續 follow-up 不用重複喚醒詞；說 `byebye / 掰掰 / 拜拜 / 再見`、叫它睡覺、音樂控制結束、或 focus mode 指令處理完後，會回到只聽喚醒詞的 standby。
 
-啟動成功時 Terminal 3 會看到：
+啟動成功時 pipeline 應看到：
 
 ```text
-ESP32 dashboard control: http://127.0.0.1:8791/api/esp32/status
+TTS health OK
+ESP32 API health OK
+Music health OK
+Dashboard status OK
+ESP32 sidecar API OK
+bridge running
 ```
 
-Terminal 5 Dashboard 會用這個 local API 轉送 LED/風扇控制，並讀 `logs/wake_status.json` 顯示監聽狀態、volume、wake score。
+Terminal 5 Dashboard 會透過 Terminal 6 local API 轉送 LED/風扇控制，並讀 `logs/wake_status.json` 顯示監聽狀態、volume、wake score。
 
 Terminal 3 預設就是完整功能版，包含頭部馬達；啟動指令內已經有 `--enable-head-motor`。畫面同步採嚴格模式：文字回覆已經回來但喇叭尚未出聲時，FRDM 仍停在 `Thinking`；只有 TTS `/health` 回報 `audio.playing=true` 時才送 `Speaking <emotion>` 並開始 `MotorYawPitch <yaw> <pitch>` speaking motion。TTS job 結束後才停止 speaking motion，並切到下一個 Normal / Music / Focus / Sleep 畫面。新版馬達策略是「少量大動作 + 到位停留」，不是密集小步進。
 
@@ -828,10 +816,10 @@ Head motor motion: enabled=True
 
 如果想要更激進低延遲，可以額外加 `--ultra-response`；如果講話中間常停頓被太早切句，改用比較保守的 `--turbo-response`。`fast_reply / num_predict` 需要 Windows Terminal 1 也使用最新版 `desktop_fast_chat_server.py` 並重啟；如果 Windows 還是舊 server，只會套用 Jetson 端的錄音/TTS/camera 加速。
 
-現場吵雜版已加 `--noisy-room`：speech/silence gate 會比安靜室內更嚴格。正式腳本另外固定 `--beep-volume 0.35`，避免提示音太刺耳。TTS 回覆使用固定 `--tts-volume-gain 4.8`；若仍偏大降到 `3.6`，仍太小再回到 `6.0`。只想先測 beep 音量可跑：
+現場吵雜版已加 `--noisy-room`：speech/silence gate 會比安靜室內更嚴格。正式腳本另外固定 `--beep-player aplay --beep-volume 0.55`，讓提示音直接走 UACDemo ALSA，不靠 PulseAudio default sink。TTS 回覆使用固定 `--tts-volume-gain 3.6`；若仍偏大或失真降到 `2.8`，beep 太刺耳就把 `BEEP_VOLUME` 降到 `0.35` 或 `0.25`。只想先測 beep 音量可跑：
 
 ```bash
-python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --noisy-room --beep-volume 0.35 --test-beep
+python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py --beep-keyword UACDemo --beep-player aplay --noisy-room --beep-volume 0.55 --test-beep
 ```
 
 如果現場背景音量平均約 `10000`、你講話約 `19000`，`--noisy-room` 會自動抓大約：
@@ -850,9 +838,20 @@ speech end/silence <= 13000
 --standby-progress-interval 0
 ```
 
-每次準備收音前都會先 beep；程式判定你講完時會再 beep 一聲，並在那一刻抓照片，跟該輪語音一起送到 Windows server。beep 預設用 `--beep-player auto`，會優先走 `paplay` / PulseAudio 的 UACDemo sink，不再用 `sounddevice` 直接開 ALSA output，避免 PortAudio 在音樂播放/暫停交界時 assertion abort。播音樂後下一次 `Hey Jarvis` 會先快速 pause 音樂、短暫等 0.05 秒，再播開始收音 beep；為了讓嗶聲快，wake 當下不再先送 `Music paused` dashboard UART。音樂被 pause 後會重設錄音 gate，避免剛剛音樂音量把 speech/silence 門檻墊太高，導致後續回應變慢。說 `byebye / 掰掰 / 拜拜 / 再見` 後會送 `Normal 0 0`；說「去睡覺吧 / 休息一下」會送 `Sleep 0 0`。兩者都會回到只聽喚醒詞的 standby；這之後你講一般話不會送 ASR/Ollama，下一次必須重新說 `Hey Jarvis`。
+每次準備收音前都會先 beep；程式判定你講完時會再 beep 一聲，並在那一刻抓照片，跟該輪語音一起送到 Windows server。正式腳本預設用 `--beep-player aplay` 直接播到 UACDemo ALSA 裝置，避免 PulseAudio 沒有 UACDemo sink 時嗶聲跑到內建輸出或完全聽不到。程式的 `auto` 模式仍保留：如果 PulseAudio 找得到 UACDemo sink 就走 `paplay`；找不到 UACDemo sink 時會改走 ALSA UACDemo，不會直接用 PulseAudio default sink。播音樂後下一次 `Hey Jarvis` 會先快速 pause 音樂、短暫等 0.05 秒，再播開始收音 beep；為了讓嗶聲快，wake 當下不再先送 `Music paused` dashboard UART。音樂被 pause 後會重設錄音 gate，避免剛剛音樂音量把 speech/silence 門檻墊太高，導致後續回應變慢。說 `byebye / 掰掰 / 拜拜 / 再見` 後會送 `Normal 0 0`；說「去睡覺吧 / 休息一下」會送 `Sleep 0 0`。兩者都會回到只聽喚醒詞的 standby；這之後你講一般話不會送 ASR/Ollama，下一次必須重新說 `Hey Jarvis`。
 
-音樂控制也會自動結束 conversation mode：播音樂或繼續播放後會送 `Music 0 0` 並回到 wake-only standby；暫停或停止會先處理 mpv，再用 Piper 說一小句確認，最後送 `Normal 0 0` 並回到 wake-only standby。這些本地控制確認不會啟動頭部馬達，避免沒有實際說話時馬達還在動。所以下次要暫停、停止或換歌，都必須先說 `Hey Jarvis`。音樂 mpv 預設音量已調成 `220`、上限 `300`，不影響 Piper TTS 的說話音量；覺得太大就用 `MUSIC_MPV_VOLUME=180 MUSIC_MPV_VOLUME_MAX=300 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh` 降低，仍太小聲就用 `MUSIC_MPV_VOLUME=260 MUSIC_MPV_VOLUME_MAX=350` 提高。
+播放類音樂控制會自動結束 conversation mode：播音樂或繼續播放後會送 `Music 0 0` 並回到 wake-only standby；暫停或停止會先處理 mpv，再用 Piper 說一小句確認，最後送 `Normal 0 0` 並回到 wake-only standby。這些本地控制確認不會啟動頭部馬達，避免沒有實際說話時馬達還在動。所以下次要暫停、停止或換歌，都必須先說 `Hey Jarvis`。
+
+音量控制是獨立的即時控制，不會被當成換歌，也不會送去 ESP32 BLE。可以說：
+
+```text
+Hey Jarvis，音樂太小聲，幫我調大音量  -> action=volume query=+10
+Hey Jarvis，音量加十                  -> action=volume query=+10
+Hey Jarvis，音量小聲一點              -> action=volume query=-10
+Hey Jarvis，音量調到 120              -> action=volume query=120
+```
+
+語音調大/調小每次只改 `10`，避免 ASR 誤判時一下子爆大聲或太小聲。Dashboard 的 Music 音量拉條也走同一條路，調的是「當下 Music Player 的 mpv 音量」；如果正在播放會立刻改，沒有播放時會存成下一次播放音量。音樂 mpv 預設音量已調成 `150`、上限 `200`，不影響 Piper TTS 的說話音量；覺得太大或失真就用拉條或說「音量小聲一點」，要改下次 pipeline 啟動預設才用 `MUSIC_MPV_VOLUME=120 MUSIC_MPV_VOLUME_MAX=200 ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart` 降低，仍太小聲就用 `MUSIC_MPV_VOLUME=180 MUSIC_MPV_VOLUME_MAX=250` 提高。
 
 音樂控制的預期 log：
 
@@ -995,7 +994,7 @@ FanSpeed 100 -> FAN_SPEED:255
 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
 ESP32_BLE_ADAPTER=hci0 \
 FAN_MIN_PWM=120 \
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 正式啟動建議：
@@ -1004,12 +1003,12 @@ FAN_MIN_PWM=120 \
 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
 ESP32_BLE_ADAPTER=hci0 \
 ESP32_BLE_COMMAND_QUEUE_MAX=64 \
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
-BLE 斷線不再算 Wake Bridge 致命錯誤。Terminal 3 會用背景 worker `esp32s3-ble-reconnect-loop` 自己重連；沒連上時只有風扇、LED、ESP32 溫度、TempRoom 會暫時沒有新資料，Hey Jarvis、TTS、音樂、天氣、FRDM UART、to-do、focus 都要繼續正常。BLE 指令離線時會先排隊，預設最多保留 `64` 筆；滿了丟最舊的，避免長時間斷線把主程式拖垮。
+BLE 斷線不再算 Wake Bridge 致命錯誤。正式 pipeline 會把 ESP32 BLE 放到獨立 Terminal 6 sidecar API：`esp32s3_ble_fan_led_controller.py --api-server`。Terminal 3 只用 `http://127.0.0.1:8791/api/esp32/...` 做短 timeout 呼叫，所以 ESP32 status notify、BlueZ 掃描、reconnect log 不會塞進一般對話主流程；沒連上時只有風扇、LED、ESP32 溫度、TempRoom 會暫時沒有新資料，Hey Jarvis、TTS、音樂、天氣、FRDM UART、to-do、focus 都要繼續正常。BLE 指令離線時會先排隊，預設最多保留 `64` 筆；滿了丟最舊的，避免長時間斷線把主程式拖垮。
 
-檢查 BLE worker 狀態：
+檢查 ESP32 sidecar 狀態：
 
 ```bash
 curl http://127.0.0.1:8791/api/esp32/status
@@ -1085,13 +1084,12 @@ Focus work mode: enabled, script=/home/asrlab-yian/MakeNTU/frdm_uart_context_sen
 To-do list: enabled, path=/home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json
 Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True, beep_settle=0.18s, post_music_cooldown=0.8s
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
-ESP32-S3 BLE fan/LED/temp: enabled, name=ESP32S3_FAN_LED_TEMP, address=78:E3:6D:18:94:6A, voice_control=True, frdm_relay=True, min_pwm=96, passive_reminder=True (>25 C)
-BLE: connected. Subscribing status notify...
-Weather local temperature: push receiver http://0.0.0.0:8790/temperature
+ESP32 BLE API sidecar: http://127.0.0.1:8791/api/esp32/status
+ESP32-S3 BLE fan/LED/temp: sidecar API, url=http://127.0.0.1:8791/api/esp32, voice_control=True, frdm_relay=True, timeout=0.2s
+Weather local temperature: pull http://127.0.0.1:8791/api/esp32/status
 FRDM room temperature UART: TempRoom every 10s, max_age=30s, payload=Celsius*10
 Head motor motion: enabled=True, smooth_step=120deg, step_delay=0.55s, speaking_step_delay=0.72s, speaking_smooth_step=120deg, reset_repeats=1, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
 Boot screen settle: waiting 2s, then sending startup dashboard data and Normal.
-ESP32 temperature receiver: http://0.0.0.0:8790/temperature
 Weather UART sent: Weather daily,19,23,76,53,254 (local=25.4 C)    # 如果 ESP32 已先送溫度
 Weather UART sent: Weather current,20,20,0,3,254 (local=25.4 C)   # startup 也會送 current
 TempRoom UART sent: TempRoom 254 (25.4 C, age=0.5s)               # 之後每 10 秒一次
@@ -1099,14 +1097,16 @@ FRDM UART TX: Normal 0 0
 Listening for wake word 'hey_jarvis'
 ```
 
-如果 ESP32 當下沒開或 BlueZ 還在重連，Terminal 3 也可以算啟動成功，只是 BLE 相關功能暫時降級。可接受的 log 範例：
+如果 ESP32 當下沒開或 BlueZ 還在重連，Terminal 3 也可以算啟動成功，只是 BLE 相關功能暫時降級。正式 pipeline 中可接受的 log 範例：
 
 ```text
-ESP32-S3 BLE fan/LED/temp: enabled, name=ESP32S3_FAN_LED_TEMP, address=..., voice_control=True, frdm_relay=True, min_pwm=96, passive_reminder=True (>25 C)
+ESP32-S3 BLE fan/LED/temp: sidecar API, url=http://127.0.0.1:8791/api/esp32, voice_control=True, frdm_relay=True, timeout=0.2s
+Listening for wake word 'hey_jarvis'
+
+# logs esp32:
 BLE: scanning for ...
 WARNING: BLE connection failed: ...
 BLE: reconnecting in 3s...
-Listening for wake word 'hey_jarvis'
 ```
 
 如果看到 degraded mode，代表 BLE runtime 不可用，但主流程仍會跑：
@@ -1443,7 +1443,7 @@ TTS `.env` 必須用可重插的設定：
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=4.8
+DEFAULT_VOLUME_GAIN=3.6
 ENABLE_STREAM_PLAYBACK=true
 ```
 
@@ -1463,8 +1463,8 @@ python3 music_web_player.py \
   --port 8788 \
   --backend mpv \
   --mpv-audio-device auto \
-  --mpv-volume 220 \
-  --mpv-volume-max 300 \
+  --mpv-volume 150 \
+  --mpv-volume-max 200 \
   --mpv-ready-timeout 1.5 \
   --weather-default-location Taipei \
   --weather-timeout 4.5
@@ -1483,7 +1483,7 @@ export MUSIC_MPV_YTDL_COOKIES="$HOME/.config/makentu/youtube_cookies.txt"
 只想改所在地，例如 demo 在新竹：
 
 ```bash
-python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 220 --mpv-volume-max 300 --mpv-ready-timeout 1.5 --weather-default-location Hsinchu
+python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 150 --mpv-volume-max 200 --mpv-ready-timeout 1.5 --weather-default-location Hsinchu
 ```
 
 ### 1.7 Terminal 5: Smart Home Dashboard Optional
@@ -1506,6 +1506,15 @@ python3 smart_home_dashboard/server.py \
 http://JETSON_LAN_IP:8789/dashboard
 ```
 
+Dashboard 的 Music 卡片可以直接控制 Terminal 4 Music Player：
+
+```text
+播放/暫停/繼續/停止 -> 轉送到 http://127.0.0.1:8788/music
+音量拉條             -> 轉送 action=volume，立即調整當下 mpv 音量
+```
+
+音量拉條顯示的是 `volume_percent`。音樂正在播時會透過 mpv IPC 立刻更新；沒有播歌時會先記住，下一次播放就用這個值。預設是 `150`，上限 `200`，這只影響音樂，不影響 Piper TTS 說話音量。
+
 如果這場 demo 是 phone-first smart home HMI，不跑 Wake Bridge，才可以讓 Dashboard 擁有 FRDM UART：
 
 ```bash
@@ -1514,108 +1523,28 @@ python3 smart_home_dashboard/server.py --host 0.0.0.0 --port 8789 --frdm-uart-po
 
 ### 1.8 Terminal 3: Jetson Wake Bridge
 
-正式完整模式：
-
-請整段複製貼上，尤其最後三行不要手打錯。
+正式完整模式請用 pipeline，不要再手貼超長 parser。這樣 Terminal 6 ESP32 sidecar、Terminal 3 sidecar API flags、TTS gain、beep player、music/weather/dashboard 參數都會由同一份腳本產生。
 
 ```bash
 cd /home/asrlab-yian/MakeNTU
-source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-
-python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
-  --server-url http://100.108.141.26:8766/voice-chat \
-  --mic-keyword UACDemo \
-  --beep-keyword UACDemo \
-  --beep-player auto \
-  --noisy-room \
-  --tts-volume-gain 4.8 \
-  --beep-volume 0.35 \
-  --uart-port auto \
-  --uart-baudrate 115200 \
-  --frdm-uart-tx-timeout 0.45 \
-  --frdm-uart-failure-threshold 2 \
-  --frdm-uart-circuit-breaker-sec 4.0 \
-  --enable-head-motor \
-  --boot-normal-delay 2.0 \
-  --device-ready-timeout 30 \
-  --wake-threshold 0.75 \
-  --wake-volume-min 500 \
-  --volume-min 1100 \
-  --speech-start-margin 750 \
-  --silence-duration 1.2 \
-  --silence-margin 900 \
-  --max-speech-seconds 5 \
-  --max-recording-seconds 7 \
-  --audio-read-timeout 0.75 \
-  --recording-progress-interval 1.0 \
-  --conversation-mode \
-  --turn-listen-timeout 8 \
-  --session-idle-timeout 30 \
-  --max-session-turns 20 \
-  --camera-id auto \
-  --camera-width 320 \
-  --camera-height 240 \
-  --camera-jpeg-quality 70 \
-  --camera-latest-timeout 1.0 \
-  --camera-frame-max-age 2.0 \
-  --focus-script /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/focus_work_mode.py \
-  --focus-server-url http://100.108.141.26:8766/focus-check \
-  --focus-interval-sec 60 \
-  --focus-first-sample-delay-sec -1 \
-  --focus-duration-min 0 \
-  --focus-log-root /tmp/focus_voice_test \
-  --focus-alert-threshold 1 \
-  --focus-alert-cooldown-sec 90 \
-  --fan-device-id desk_fan \
-  --fan-speed-max 100 \
-  --esp32-ble \
-  --esp32-ble-adapter hci0 \
-  --esp32-ble-scan-duplicates \
-  --esp32-ble-min-fan-pwm 96 \
-  --esp32-ble-command-queue-max 64 \
-  --esp32-dashboard-host 127.0.0.1 \
-  --esp32-dashboard-port 8791 \
-  --fan-duplicate-suppress-sec 2.0 \
-  --todo-list-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/todo_list.json \
-  --wake-status-path /home/asrlab-yian/MakeNTU/frdm_uart_context_sender/logs/wake_status.json \
-  --focus-notify-mode discord \
-  --focus-discord-webhook-url "$DISCORD_WEBHOOK_URL" \
-  --music-backend mpv \
-  --music-mpv-audio-device auto \
-  --music-mpv-volume 220 \
-  --music-mpv-volume-max 300 \
-  --music-mpv-ready-timeout 1.5 \
-  --music-timeout 5 \
-  --music-wake-pause-timeout 0.25 \
-  --music-wake-beep-settle 0.05 \
-  --post-music-standby-cooldown 0.8 \
-  --music-debug \
-  --weather-default-location Taipei \
-  --weather-timeout 6 \
-  --weather-api-timeout 4.5 \
-  --weather-debug \
-  --esp32-temperature-mode push \
-  --esp32-temperature-host 0.0.0.0 \
-  --esp32-temperature-port 8790 \
-  --esp32-temperature-path /temperature \
-  --temp-room-uart-interval-sec 10 \
-  --temp-room-uart-max-age-sec 30 \
-  --motor-step-delay 0.55 \
-  --motor-smooth-step-deg 120 \
-  --motor-speaking-step-delay 0.72 \
-  --motor-speaking-smooth-step-deg 120 \
-  --motor-reset-repeats 1 \
-  --motor-reset-delay 0.35 \
-  --motor-stop-timeout 6 \
-  --motor-join-timeout 6 \
-  --device-preflight-verbose \
-  --tts-poll-interval 0.75 \
-  --tts-start-poll-interval 0.12 \
-  --tts-speaking-start-timeout 1.2 \
-  --tts-speaking-require-audio \
-  --tts-debug \
-  --uart-debug
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh plan
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
+
+`plan` 會展開 Terminal 3 的完整 `wake_voice_chat_frdm_bridge.py` parser。現場要核對你貼的長參數時，看 `plan` 裡的 `expanded parser`，不要另外維護一份手寫版本。
+
+正式 pipeline 的 Terminal 3 會包含以下 ESP32 sidecar parser：
+
+```text
+--esp32-temperature-mode pull
+--esp32-temperature-url http://127.0.0.1:8791/api/esp32/status
+--esp32-ble-sidecar
+--esp32-ble-api-url http://127.0.0.1:8791/api/esp32
+--esp32-ble-api-timeout 0.2
+--no-esp32-dashboard-control
+```
+
+這和舊手動版的 `--esp32-temperature-mode push` 不一樣，是故意的。正式 full demo 現在由 Terminal 6 開 `8791`，Terminal 3 只讀 `8791`，避免 ESP32 BLE reconnect/status notify 影響一般對話。
 
 正式指令請不要加固定 index：
 
@@ -1635,12 +1564,13 @@ USB reset 後有時 ALSA 已經看到 UACDemo，但 sounddevice 還沒刷新；b
 點歌或繼續播放時會在 TTS 確認句說完後呼叫 Music Player。如果 Terminal 4 沒開，bridge 會在點歌時自動嘗試啟動 sidecar。正式要真的出聲並支援 pause/resume，用 `--music-backend mpv`；`browser` 只開搜尋頁，不保證播放。
 天氣也走同一個 Terminal 4 local tool server，但 endpoint 是 `http://127.0.0.1:8788/weather`。Wake Bridge 會先用 rule-based intent 判斷 transcript 是否在問天氣；只有問天氣時才呼叫 `/weather`，一般聊天、FRDM 控制、vision 問題不會查天氣。天氣資料由 Jetson 端直接連 Open-Meteo 查詢，不經 Windows Ollama，不需要 API key。
 
-本地溫度走 ESP32-S3，不走 Terminal 4。現在主線是 BLE notify：同一塊 ESP32-S3 會回傳 `TEMP:...,FAN:...,SPEED:...,LED:...`，Wake Bridge 會把最新 `TEMP` 當成 Weather UART 的 local temperature。Terminal 3 啟用 `--esp32-ble` 後應看到：
+本地溫度走 ESP32-S3，不走 Terminal 4。正式 pipeline 的主線是 Terminal 6 ESP32 sidecar 收 BLE notify：同一塊 ESP32-S3 會回傳 `TEMP:...,FAN:...,SPEED:...,LED:...`，Wake Bridge 會用短 timeout 讀 sidecar status，把最新 `TEMP` 當成 Weather UART 的 local temperature。啟動後應看到：
 
 ```text
-ESP32-S3 BLE fan/LED/temp: enabled
+ESP32 BLE API sidecar: http://127.0.0.1:8791/api/esp32/status
 BLE: connected. Subscribing status notify...
 ESP32 status: TEMP=24.12 C, FAN=ON, SPEED=96, LED=OFF
+ESP32-S3 BLE fan/LED/temp: sidecar API, url=http://127.0.0.1:8791/api/esp32
 ```
 
 舊 HTTP push 溫度路徑仍可用於只做 DS18B20 的 ESP32。Terminal 3 加上 `--esp32-temperature-mode push` 後會開：
@@ -1718,9 +1648,8 @@ Adaptive recording gate: on, noise_p75, speech_margin=750, speech_ratio=1.45, si
 Audio read watchdog: callback queue, timeout=0.75s, progress_interval=1s
 Music tool: http://127.0.0.1:8788/music, backend=mpv->mpv, autostart=True, pause_on_wake=True, beep_settle=0.18s, post_music_cooldown=0.8s
 Weather tool: http://127.0.0.1:8788/weather, default_location=Taipei, source=Open-Meteo
-ESP32-S3 BLE fan/LED/temp: enabled, name=ESP32S3_FAN_LED_TEMP, address=..., voice_control=True, frdm_relay=True, min_pwm=96, passive_reminder=True (>25 C)
-BLE: connected. Subscribing status notify...
-ESP32 status: TEMP=24.12 C, FAN=OFF, SPEED=180, LED=OFF
+ESP32-S3 BLE fan/LED/temp: sidecar API, url=http://127.0.0.1:8791/api/esp32, voice_control=True, frdm_relay=True, timeout=0.2s
+Weather local temperature: pull http://127.0.0.1:8791/api/esp32/status
 Head motor motion: enabled=True, smooth_step=120deg, step_delay=0.55s, speaking_step_delay=0.72s, speaking_smooth_step=120deg, reset_repeats=1, reset_delay=0.35s, read_ms=35, stop_timeout=6s, join_timeout=6s
 TTS queue polling: every 0.75s, start_poll=0.12s, speaking_start_timeout=1.2s, speaking_requires_audio=True, playback_timeout=45s
 USB auto-discovery: mic=keyword 'UACDemo'; beep=keyword 'UACDemo'; camera=auto; FRDM UART=auto
@@ -1821,9 +1750,9 @@ FAN_OFF          -> 風扇停止
 再測 FRDM 手動模式：
 
 ```text
-FRDM slider 16%  -> Terminal 3 應出現 Fanspeed 16，BLE TX: FAN_SPEED:96
-FRDM slider 50%  -> BLE TX: FAN_SPEED:128
-FRDM off         -> BLE TX: FAN_OFF
+FRDM slider 16%  -> Terminal 3 應出現 Fanspeed 16；Terminal 6 應出現 BLE TX: FAN_SPEED:96
+FRDM slider 50%  -> Terminal 6 應出現 BLE TX: FAN_SPEED:128
+FRDM off         -> Terminal 6 應出現 BLE TX: FAN_OFF
 ```
 
 如果 log 有 `ESP32 status: FAN=ON,SPEED=96` 但風扇不轉，先在 CLI 送 `FAN_SPEED:255` 分辨是軟體低速問題還是 L9110S/馬達供電問題。
@@ -1971,6 +1900,7 @@ Hey Jarvis，停止音樂。
 暫停音樂       -> Music tool action=pause paused=True
 繼續播放音樂   -> TTS 結束後 Music tool action=resume resumed=True
 停止音樂       -> Music tool action=stop stopped=True
+調整音量       -> Music tool action=volume volume=... delta=...
 Hey Jarvis wake -> 先 Music wake pause，等 0.18s，再 beep 並開始 recording；講完時再 beep + 抓圖
 ```
 
@@ -1990,6 +1920,18 @@ curl -X POST http://127.0.0.1:8788/music \
 curl -X POST http://127.0.0.1:8788/music \
   -H "Content-Type: application/json" \
   -d '{"action":"resume"}'
+
+curl -X POST http://127.0.0.1:8788/music \
+  -H "Content-Type: application/json" \
+  -d '{"action":"volume","delta":10}'
+
+curl -X POST http://127.0.0.1:8788/music \
+  -H "Content-Type: application/json" \
+  -d '{"action":"volume","volume":150}'
+
+curl -X POST http://127.0.0.1:8788/music \
+  -H "Content-Type: application/json" \
+  -d '{"text":"音量小聲一點"}'
 ```
 
 天氣：
@@ -2414,7 +2356,7 @@ pkill -f 'music_web_player.py'
 
 cd /home/asrlab-yian/MakeNTU/music_web_player
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 220 --mpv-volume-max 300 --mpv-ready-timeout 1.5 --weather-default-location Taipei --weather-timeout 4.5
+python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 150 --mpv-volume-max 200 --mpv-ready-timeout 1.5 --weather-default-location Taipei --weather-timeout 4.5
 ```
 
 手動測：
@@ -2441,12 +2383,13 @@ Hey Jarvis，今天會下雨嗎？
 
 ### ESP32 BLE / 本地溫度沒有合併到 Weather UART
 
-現在優先看 BLE notify。Terminal 3 啟動時應看到：
+現在優先看 Terminal 6 ESP32 sidecar status。啟動時應看到：
 
 ```text
-ESP32-S3 BLE fan/LED/temp: enabled
+ESP32 BLE API sidecar: http://127.0.0.1:8791/api/esp32/status
 BLE: connected. Subscribing status notify...
 ESP32 status: TEMP=24.12 C, FAN=..., SPEED=..., LED=...
+ESP32-S3 BLE fan/LED/temp: sidecar API, url=http://127.0.0.1:8791/api/esp32
 ```
 
 如果沒有 BLE status，先用 scan-only 找 ESP32：
@@ -2468,7 +2411,7 @@ python3 frdm_uart_context_sender/esp32s3_ble_fan_led_controller.py \
 ```bash
 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
 ESP32_BLE_ADAPTER=hci0 \
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 如果 BLE status 有溫度，但 Weather UART 還是 5 欄，通常是溫度資料太舊或天氣尚未重新查詢。再問一次：
@@ -2522,12 +2465,16 @@ Weather UART sent: Weather current,20,20,0,3,254 (local=25.4 C)
 
 ### BLE 沒連上但其他功能要繼續
 
-新版預期是 BLE 連不上也不會拖住整個 demo。Terminal 3 可以一邊印 BLE reconnect，一邊繼續聽 Hey Jarvis：
+新版預期是 BLE 連不上也不會拖住整個 demo。正式 pipeline 裡 BLE reconnect 應該只出現在 `logs esp32`，Terminal 3 仍然繼續聽 Hey Jarvis：
 
 ```text
-BLE: scanning for ...
-WARNING: BLE connection failed: ...
-BLE: reconnecting in 3s...
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh logs esp32
+# BLE: scanning for ...
+# WARNING: BLE connection failed: ...
+# BLE: reconnecting in 3s...
+
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh logs bridge
+# ESP32-S3 BLE fan/LED/temp: sidecar API, url=http://127.0.0.1:8791/api/esp32
 Listening for wake word 'hey_jarvis'
 ```
 
@@ -2549,14 +2496,15 @@ enabled=false                  -> bleak/helper 不可用，看 unavailable_reaso
 如果 `enabled=false`，先修 Python BLE 環境；但 Wake/TTS/music/weather/FRDM UART 可以先照跑。臨時完全不接 ESP32 時，用：
 
 ```bash
-ESP32_BLE=0 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+ESP32_BLE=0 ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
-如果 `running=false` 但你確定有啟用 `--esp32-ble`，通常是 Terminal 3 還是舊 process 或啟動參數沒帶到；停乾淨再重開：
+如果 `running=false` 但你確定有啟用 `ESP32_BLE=1`，通常是 sidecar 沒開或 port 被舊 process 佔住；停乾淨再重開：
 
 ```bash
-pkill -f wake_voice_chat_frdm_bridge.py
-ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A ESP32_BLE_ADAPTER=hci0 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
+ESP32_BLE_ADAPTER=hci0 \
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 ### ESP32 BLE 掃得到手機但 Jetson 掃不到
@@ -2635,7 +2583,7 @@ ESP32 full sketch 真的有重新燒錄，不是 minimal advertise sketch
 ESP32_BLE_ADDRESS=78:E3:6D:18:94:6A \
 ESP32_BLE_ADAPTER=hci0 \
 FAN_MIN_PWM=120 \
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 ESP32 full sketch 端也有 `FAN_MIN_RUNNING_SPEED=96` 和 250ms 的 `FAN_START_KICK_SPEED=255`，如果改 sketch 常數要重新燒錄。
@@ -2655,7 +2603,7 @@ WARNING: fan dashboard sync failed: <urlopen error [Errno 111] Connection refuse
 python3 smart_home_dashboard/server.py --host 0.0.0.0 --port 8789 --no-frdm-uart
 
 # 或正式 demo 不同步 dashboard
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh --no-fan-dashboard-sync
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart -- --no-fan-dashboard-sync
 ```
 
 ### TTS ready 但沒聲音
@@ -2670,7 +2618,7 @@ cat /home/asrlab-yian/MakeNTU/jetson_piper_tts/.env
 
 ```text
 AUDIO_DEVICE=auto:UACDemo
-DEFAULT_VOLUME_GAIN=4.8
+DEFAULT_VOLUME_GAIN=3.6
 ```
 
 改 `.env` 或 USB recovery 後重開 TTS server。
@@ -2680,22 +2628,22 @@ DEFAULT_VOLUME_GAIN=4.8
 如果不是完全沒聲音，而是現場聽起來超小聲，Terminal 3 的 Wake Bridge 用：
 
 ```bash
---tts-volume-gain 4.8
+--tts-volume-gain 3.6
 ```
 
-這個增益只放大 Piper raw playback，不會改系統音量；改完要重啟 Terminal 3，且 TTS server 也要是新版。如果會嚇到旁邊的人，把 Terminal 3 改成 `--tts-volume-gain 3.6`，並加 `--beep-volume 0.25 --beep-duration-ms 160`。
+這個增益只放大 Piper raw playback，不會改系統音量；改完要重啟 Terminal 3，且 TTS server 也要是新版。如果會破音或嚇到旁邊的人，把 Terminal 3 改成 `--tts-volume-gain 2.8`，並加 `--beep-volume 0.25 --beep-duration-ms 160`。
 
 直接測新版 TTS server 是否吃到增益：
 
 ```bash
 curl -X POST http://127.0.0.1:8777/speak_async \
   -H "Content-Type: application/json" \
-  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":4.8}'
+  -d '{"text":"音量測試，現在應該是固定音量。","interrupt":true,"volume_gain":3.6}'
 ```
 
 如果回 `422`，代表 Terminal 2 還是舊 TTS server，重啟 Terminal 2。
 
-### 音樂本身太小聲
+### 音樂本身太小聲 / 太大聲 / 忽大忽小
 
 先分清楚是 Piper TTS 小聲，還是 mpv 音樂小聲。TTS 看 Terminal 2 / `--tts-volume-gain`；音樂看 Terminal 4 / mpv。
 
@@ -2706,10 +2654,38 @@ curl http://127.0.0.1:8788/health
 正常預設要看到：
 
 ```text
-mpv_volume=220
-mpv_volume_max=300
+mpv_volume=150
+mpv_volume_max=200
+volume_percent=150
 mpv_volume_clamped=false
+mpv_audio_device=alsa/plughw:CARD=UACDemo...
 ```
+
+當下音量可以不用重開程式就調：
+
+```bash
+# 目前音量 +10，等同語音「音量調大 / 音樂太小聲 / 加十」
+curl -X POST http://127.0.0.1:8788/music \
+  -H "Content-Type: application/json" \
+  -d '{"action":"volume","delta":10}'
+
+# 目前音量 -10，等同語音「音量小聲一點 / 太大聲 / 減十」
+curl -X POST http://127.0.0.1:8788/music \
+  -H "Content-Type: application/json" \
+  -d '{"action":"volume","delta":-10}'
+
+# 直接設到 150，等同語音「音量調到 150」
+curl -X POST http://127.0.0.1:8788/music \
+  -H "Content-Type: application/json" \
+  -d '{"action":"volume","volume":150}'
+
+# 網站 Dashboard 音量拉條走這個 proxy
+curl -X POST http://127.0.0.1:8789/api/music/control \
+  -H "Content-Type: application/json" \
+  -d '{"action":"volume","volume":150}'
+```
+
+語音調大/調小一次只動 `10`。這是故意的，避免現場誤收音讓喇叭突然爆大聲；真的要大幅調整時用 Dashboard 拉條或講「音量調到 120 / 150 / 180」。
 
 如果 `mpv_volume` 還是 `100`，代表 Terminal 4 或 Terminal 3 autostart 還是舊參數。手動 Terminal 4 就直接重開 Terminal 4：
 
@@ -2717,18 +2693,20 @@ mpv_volume_clamped=false
 pkill -f 'music_web_player.py'
 cd /home/asrlab-yian/MakeNTU/music_web_player
 source /home/asrlab-yian/MakeNTU/emotion_robot_controller/.venv/bin/activate
-python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 220 --mpv-volume-max 300 --mpv-ready-timeout 1.5 --weather-default-location Taipei --weather-timeout 4.5
+python3 music_web_player.py --server --host 127.0.0.1 --port 8788 --backend mpv --mpv-audio-device auto --mpv-volume 150 --mpv-volume-max 200 --mpv-ready-timeout 1.5 --weather-default-location Taipei --weather-timeout 4.5
 ```
 
 如果是讓 Terminal 3 自動啟動 Music Player，就重開 Terminal 3 並帶環境變數。
 
-只想把音樂再調大，不要動 TTS：
+只想改下次啟動的音樂預設，不要動 TTS：
 
 ```bash
-MUSIC_MPV_VOLUME=260 MUSIC_MPV_VOLUME_MAX=350 ./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+MUSIC_MPV_VOLUME=180 MUSIC_MPV_VOLUME_MAX=250 ./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 如果 `mpv_volume_clamped=true`，代表要求值超過 `mpv_volume_max`；一起提高 `MUSIC_MPV_VOLUME_MAX`。如果 `mpv_actual_volume` 沒出現但你以為正在播歌，代表 mpv process 沒 active 或 IPC 還沒 ready，先檢查 Terminal 4 log。
+
+如果音質變差、破音、或聽起來忽大忽小，先用拉條降到 `120` 到 `150`；不要一開始就把 mpv 拉到 `220+`。再確認 `/health` 的 `mpv_audio_device` 是 UACDemo USB speaker，通常會長得像 `alsa/plughw:CARD=UACDemo...`。如果變成 built-in/default output，重開 Terminal 4 並保留 `--mpv-audio-device auto`。beep 的 auto 模式也已經改成只在找到 PulseAudio UACDemo sink 時才用 `paplay`，找不到就走 ALSA UACDemo，避免每次開聲音落在不同 sink 導致大小不一致。
 
 如果你說「音樂太小聲，幫我調大音量」時 Terminal 3 跑去印 `ESP32-S3 BLE control:`，代表還在跑舊版 Wake Bridge。新版 BLE 只會攔截有風扇語境的句子，例如 `風扇調大`、`風量調高`、`好熱幫我開風扇`；單純音量句不會進 BLE。
 
@@ -2754,8 +2732,7 @@ FRDM UART TX: Normal 0 0
 如果完全沒看到這些 log，通常是 Terminal 3 還在跑舊 process；先停乾淨再重開：
 
 ```bash
-pkill -f wake_voice_chat_frdm_bridge.py
-./frdm_uart_context_sender/run_wake_bridge_full_demo.sh
+./frdm_uart_context_sender/run_jetson_full_demo_pipeline.sh restart
 ```
 
 如果 log 有 `TTS speak failed`，先修 Terminal 2 TTS；新版 bridge 會在 TTS 失敗時強制清掉 speaking motion，避免沒講話但馬達繼續動。也可以先跑自測確認 regression guard：
@@ -2767,11 +2744,13 @@ python3 music_web_player/music_web_player.py --self-test
 
 ### FRDM 收不到 TempRoom 室內溫度
 
-先確認 Terminal 3 有 ESP32 BLE notify：
+先確認 Terminal 6 有 ESP32 BLE notify，Terminal 3 有 sidecar API：
 
 ```text
+ESP32 BLE API sidecar: http://127.0.0.1:8791/api/esp32/status
 BLE: connected. Subscribing status notify...
 ESP32 status: TEMP=25.43 C, FAN=OFF, SPEED=0, LED=OFF
+ESP32-S3 BLE fan/LED/temp: sidecar API, url=http://127.0.0.1:8791/api/esp32
 ```
 
 啟動時要看到：
@@ -2886,7 +2865,7 @@ Jetson：
 [ ] ESP32-S3 已燒完整 `esp32s3_ble_fan_led_temp.ino`
 [ ] BLE scan-only 看得到 service UUID `12345678-1234-1234-1234-1234567890ab`
 [ ] Standalone BLE CLI 測過 `TEMP?`、`LED_ON/OFF`、`FAN_SPEED:255`、`FAN_OFF`
-[ ] Terminal 3 用 `ESP32_BLE_ADDRESS=<MAC>` 啟動；若沒連上，`/api/esp32/status` 至少要看到 `running=true`
+[ ] Pipeline 用 `ESP32_BLE_ADDRESS=<MAC>` 啟動；若沒連上，`/api/esp32/status` 至少要看到 `running=true`
 [ ] Terminal 3 每 10 秒看到 `TempRoom UART sent: TempRoom ...`
 [ ] FRDM 已解析 `TempRoom <攝氏x10>` 並顯示室內溫度
 [ ] FRDM `FanSpeed 16` 會送至少 `FAN_SPEED:96`，必要時調 `FAN_MIN_PWM=120`

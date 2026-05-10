@@ -21,6 +21,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import queue
@@ -1001,6 +1002,233 @@ class Esp32BleController:
         )
 
 
+def esp32_api_status_payload(controller: Esp32BleController) -> dict[str, Any]:
+    status = controller.latest_status
+    connected = controller.connected.is_set()
+    payload: dict[str, Any] = {
+        "ok": bool(connected and status is not None),
+        "requested": True,
+        "enabled": True,
+        "running": True,
+        "connected": connected,
+        "queued_pending": controller.command_queue.qsize(),
+        "dropped_pending": 0,
+        "updated_at": "",
+        "raw": "",
+    }
+    if status is None:
+        payload["error"] = "no ESP32 status yet"
+        return payload
+    speed = status.speed
+    payload.update(
+        {
+            "ok": True,
+            "temp_c": status.temp_c,
+            "temperature_c": status.temp_c,
+            "fan": status.fan,
+            "speed": speed,
+            "speed_percent": pwm_to_percent(speed) if speed is not None else 0,
+            "led": status.led,
+            "updated_at": status.received_at.isoformat(timespec="seconds") if status.received_at else "",
+            "raw": status.raw,
+        }
+    )
+    return payload
+
+
+class Esp32BleApiServer:
+    def __init__(self, args: argparse.Namespace, controller: Esp32BleController, loop: asyncio.AbstractEventLoop) -> None:
+        self.args = args
+        self.controller = controller
+        self.loop = loop
+        self.host = str(getattr(args, "api_host", "127.0.0.1") or "127.0.0.1")
+        self.port = int(getattr(args, "api_port", 8791) or 8791)
+        self.debug = bool(getattr(args, "api_debug", False))
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self._dropped_pending_commands = 0
+
+    def start(self) -> bool:
+        if self._server is not None:
+            return True
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = "MakeNTUEsp32BleSidecarHTTP/1.0"
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                if owner.debug:
+                    print("ESP32 BLE API: " + (fmt % args), flush=True)
+
+            def end_headers(self) -> None:
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                super().end_headers()
+
+            def send_json(self, status_code: int, payload: dict[str, Any]) -> None:
+                body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def read_payload(self) -> tuple[dict[str, Any] | None, str | None]:
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                except ValueError:
+                    return None, "invalid Content-Length"
+                if length > 4096:
+                    return None, "request too large"
+                raw = self.rfile.read(max(0, length)).decode("utf-8", errors="replace")
+                if not raw.strip():
+                    return {}, None
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    return None, f"invalid JSON: {exc}"
+                if not isinstance(parsed, dict):
+                    return None, "JSON body must be an object"
+                return parsed, None
+
+            def do_OPTIONS(self) -> None:
+                self.send_response(204)
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+                if path == "/health":
+                    payload = esp32_api_status_payload(owner.controller)
+                    self.send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "service": "esp32_ble_api",
+                            "connected": payload.get("connected", False),
+                            "status_ok": payload.get("ok", False),
+                        },
+                    )
+                    return
+                if path == "/api/esp32/status":
+                    payload = esp32_api_status_payload(owner.controller)
+                    payload["dropped_pending"] = owner._dropped_pending_commands
+                    self.send_json(200, payload)
+                    return
+                self.send_json(404, {"ok": False, "error": "not found"})
+
+            def do_POST(self) -> None:
+                path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+                if path != "/api/esp32/control":
+                    self.send_json(404, {"ok": False, "error": "not found"})
+                    return
+                payload, error = self.read_payload()
+                if error:
+                    self.send_json(400, {"ok": False, "error": error})
+                    return
+                assert payload is not None
+                result = owner.handle_control(payload)
+                self.send_json(200 if result.get("ok") or result.get("queued") else 503, result)
+
+        class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        try:
+            self._server = ReusableThreadingHTTPServer((self.host, self.port), Handler)
+        except OSError as exc:
+            print(f"ERROR: ESP32 BLE API could not listen on {self.host}:{self.port}: {exc}", file=sys.stderr)
+            return False
+        self._thread = threading.Thread(target=self._server.serve_forever, name="esp32-ble-api-http", daemon=True)
+        self._thread.start()
+        print(f"ESP32 BLE API sidecar: http://{self.host}:{self.port}/api/esp32/status", flush=True)
+        return True
+
+    def stop(self) -> None:
+        server = self._server
+        self._server = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+    def handle_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        commands = self.commands_from_payload(payload)
+        if not commands:
+            return {"ok": False, "error": "no ESP32 command resolved", "request": payload}
+        connected_before = self.controller.connected.is_set()
+        queued = self.queue_commands(commands)
+        return {
+            "ok": queued == len(commands),
+            "queued": queued,
+            "commands": commands,
+            "connected": self.controller.connected.is_set(),
+            "was_connected": connected_before,
+            "reconnect_requested": not connected_before,
+            "source": str(payload.get("source") or "api"),
+            "request": payload,
+            "status": esp32_api_status_payload(self.controller),
+        }
+
+    def queue_commands(self, commands: list[str]) -> int:
+        cleaned = [str(command or "").strip() for command in commands if str(command or "").strip()]
+        if not cleaned:
+            return 0
+        limit = max(1, int(getattr(self.args, "command_queue_max", 64) or 64))
+
+        async def put_bounded() -> int:
+            queued = 0
+            for command in cleaned:
+                while self.controller.command_queue.qsize() >= limit:
+                    try:
+                        self.controller.command_queue.get_nowait()
+                        self._dropped_pending_commands += 1
+                    except asyncio.QueueEmpty:
+                        break
+                await self.controller.command_queue.put(command)
+                queued += 1
+            return queued
+
+        future = asyncio.run_coroutine_threadsafe(put_bounded(), self.loop)
+        try:
+            return int(future.result(timeout=max(0.1, float(getattr(self.args, "api_queue_timeout", 0.25) or 0.25))))
+        except Exception as exc:
+            print(f"WARNING: ESP32 BLE API queue failed: {exc}", flush=True)
+            return 0
+
+    def commands_from_payload(self, payload: dict[str, Any]) -> list[str]:
+        raw_commands = payload.get("commands")
+        if isinstance(raw_commands, list):
+            return [str(command).strip() for command in raw_commands if str(command).strip()]
+        if payload.get("command"):
+            return [str(payload.get("command")).strip()]
+        status = self.controller.latest_status
+        if payload.get("text"):
+            resolved = resolve_input_to_ble_commands(
+                str(payload.get("text") or ""),
+                status,
+                speed_step=max(1, int(getattr(self.args, "voice_speed_step", 32) or 32)),
+            )
+            return resolved or []
+
+        device_id = str(payload.get("device_id") or "").strip().lower()
+        device_type = str(payload.get("type") or "").strip().lower()
+        state = str(payload.get("state") or "").strip().lower()
+        value = payload.get("value")
+        is_light = device_type == "light" or device_id in {"living_light", "led", "led_light"}
+        is_fan = device_type == "fan" or device_id in {"desk_fan", "fan"}
+        if is_light:
+            return ["LED_OFF"] if state == "off" else ["LED_ON"]
+        if is_fan:
+            percent = clamp_int(value if value is not None else (100 if state != "off" else 0), 0, 100)
+            if state == "off" or percent <= 0:
+                return ["FAN_OFF"]
+            return ["FAN_ON", f"FAN_SPEED:{percent_to_pwm(percent)}"]
+        return []
+
+
 async def async_main(args: argparse.Namespace) -> int:
     controller = Esp32BleController(args)
     loop = asyncio.get_running_loop()
@@ -1056,6 +1284,40 @@ async def async_main(args: argparse.Namespace) -> int:
             task.result()
         except asyncio.CancelledError:
             pass
+    return 0
+
+
+async def async_api_main(args: argparse.Namespace) -> int:
+    controller = Esp32BleController(args)
+    loop = asyncio.get_running_loop()
+    api_server = Esp32BleApiServer(args, controller, loop)
+    stop_event = asyncio.Event()
+
+    def request_stop() -> None:
+        controller.stop.set()
+        stop_event.set()
+        try:
+            controller.command_queue.put_nowait(None)
+        except Exception:
+            pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_stop)
+        except NotImplementedError:
+            pass
+
+    if not api_server.start():
+        return 1
+    ble_task = asyncio.create_task(controller.run_ble_forever())
+    try:
+        await stop_event.wait()
+    finally:
+        request_stop()
+        ble_task.cancel()
+        await asyncio.gather(ble_task, return_exceptions=True)
+        await controller.disconnect_current_client()
+        api_server.stop()
     return 0
 
 
@@ -1137,6 +1399,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tts-url", default=os.getenv("TTS_BASE_URL", "http://127.0.0.1:8777"))
     parser.add_argument("--tts-timeout", type=float, default=float(os.getenv("TTS_TIMEOUT", "1.5")))
     parser.add_argument("--no-tts-reminder", action="store_true", help="Print passive reminders without calling Piper TTS.")
+    parser.add_argument("--api-server", action="store_true", help="Run a local HTTP API sidecar instead of the interactive BLE prompt.")
+    parser.add_argument("--api-host", default=os.getenv("ESP32_BLE_API_HOST", "127.0.0.1"))
+    parser.add_argument("--api-port", type=int, default=int(os.getenv("ESP32_BLE_API_PORT", "8791")))
+    parser.add_argument("--api-debug", action="store_true", help="Log ESP32 BLE API HTTP requests.")
+    parser.add_argument("--api-queue-timeout", type=float, default=float(os.getenv("ESP32_BLE_API_QUEUE_TIMEOUT", "0.25")))
+    parser.add_argument("--command-queue-max", type=int, default=int(os.getenv("ESP32_BLE_COMMAND_QUEUE_MAX", "64")))
     parser.add_argument("--scan-only", action="store_true", help="List nearby BLE devices and exit without connecting.")
     parser.add_argument("--scan-target-only", action="store_true", help="With --scan-only, print only devices matching the expected name/service UUID.")
     parser.add_argument("--scan-sort", choices=["name", "rssi"], default="name", help="Sort --scan-only output.")
@@ -1169,6 +1437,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.frdm_temp_room_interval_sec < 0:
         print("ERROR: --frdm-temp-room-interval-sec must be >= 0.", file=sys.stderr)
         return 2
+    if args.api_port <= 0:
+        print("ERROR: --api-port must be > 0.", file=sys.stderr)
+        return 2
+    if args.api_queue_timeout <= 0:
+        print("ERROR: --api-queue-timeout must be > 0.", file=sys.stderr)
+        return 2
+    if args.command_queue_max <= 0:
+        print("ERROR: --command-queue-max must be > 0.", file=sys.stderr)
+        return 2
     if args.scan_only:
         try:
             return asyncio.run(scan_only(args))
@@ -1176,6 +1453,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
     try:
+        if args.api_server:
+            return asyncio.run(async_api_main(args))
         return asyncio.run(async_main(args))
     except KeyboardInterrupt:
         return 130

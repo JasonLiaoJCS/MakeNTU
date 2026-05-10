@@ -13,6 +13,7 @@
     devices: [],
     todo: [],
     music: { status: 'stopped' },
+    musicVolumeEditing: false,
     statusPayload: {},
     statusTimer: null,
     cameraTimer: null,
@@ -529,6 +530,17 @@
     statusEl.textContent = status;
     statusEl.classList.toggle('playing', status === 'playing');
     $('#music-play').textContent = status === 'playing' ? '⏸' : '▶';
+
+    const volumeSlider = $('#music-volume-slider');
+    const volumeValue = $('#music-volume-value');
+    const maxVolume = Math.max(100, Number(music.volume_max || music.mpv_volume_max || volumeSlider.max || 200));
+    const rawVolume = music.volume_percent ?? music.mpv_effective_volume ?? music.volume ?? music.mpv_volume ?? volumeSlider.value;
+    const volume = Math.max(0, Math.min(maxVolume, Math.round(Number(rawVolume) || 0)));
+    volumeSlider.max = String(maxVolume);
+    if (!state.musicVolumeEditing) {
+      volumeSlider.value = String(volume);
+    }
+    volumeValue.textContent = `${Math.round(Number(volumeSlider.value) || volume)}%`;
   }
 
   function bindMusicControls() {
@@ -540,20 +552,45 @@
     });
     $('#music-stop').addEventListener('click', () => musicControl('stop'));
     $('#music-next').addEventListener('click', () => musicControl('play'));
+
+    const volumeSlider = $('#music-volume-slider');
+    const volumeValue = $('#music-volume-value');
+    volumeSlider.addEventListener('input', () => {
+      state.musicVolumeEditing = true;
+      volumeValue.textContent = `${Math.round(Number(volumeSlider.value) || 0)}%`;
+    });
+    volumeSlider.addEventListener('change', async () => {
+      const volume = Math.round(Number(volumeSlider.value) || 0);
+      await musicControl('volume', '', { volume });
+      state.musicVolumeEditing = false;
+    });
+    volumeSlider.addEventListener('blur', () => {
+      state.musicVolumeEditing = false;
+      renderMusic();
+    });
   }
 
-  async function musicControl(action, query = '') {
+  async function musicControl(action, query = '', extra = {}) {
     const res = await api('/api/music/control', {
       method: 'POST',
-      body: JSON.stringify({ action, query }),
+      body: JSON.stringify({ action, query, ...extra }),
     });
     if (!res.ok) {
       toast(`Music: ${res.error}`, true);
+      state.musicVolumeEditing = false;
+      renderMusic();
       return;
     }
     state.music = res.data;
+    if (action === 'volume') {
+      state.musicVolumeEditing = false;
+    }
     renderMusic();
-    toast(`Music ${action}`);
+    if (action === 'volume') {
+      toast(`Volume ${res.data.volume_percent ?? extra.volume ?? ''}%`);
+    } else {
+      toast(`Music ${action}`);
+    }
     refreshEvents();
   }
 

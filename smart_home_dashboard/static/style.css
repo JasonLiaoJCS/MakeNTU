@@ -1297,6 +1297,29 @@ button {
   align-items: center;
 }
 
+.music-volume-row {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 46px;
+  align-items: center;
+  gap: 10px;
+}
+
+.music-volume-icon {
+  color: var(--text-muted);
+  font-size: 14px;
+  text-align: center;
+}
+
+.music-volume-slider {
+  width: 100%;
+}
+
+.music-volume-value {
+  width: 46px;
+  text-align: right;
+}
+
 .music-btn {
   width: 40px;
   height: 40px;
