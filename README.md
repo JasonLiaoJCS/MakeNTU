@@ -2,6 +2,13 @@
 
 This repository is the integration project for the MakeNTU desktop pet system. The Jetson side handles wake word detection, recording, camera capture, TTS, FRDM UART, the music/weather sidecar, the local to-do list, and focus work mode. The Windows desktop handles ASR, Ollama/Qwen replies, vision, and `/focus-check`.
 
+## Documentation
+
+```text
+docs/MakeNTU2026_group1_Jarvis.pptx      # presentation slides
+docs/MakeNTU2026_group1_Jarvis.pdf       # presentation (PDF)
+```
+
 For the live demo, start here:
 
 ```text
