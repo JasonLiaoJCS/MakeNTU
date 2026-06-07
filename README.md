@@ -297,7 +297,7 @@ python3 frdm_uart_context_sender/wake_voice_chat_frdm_bridge.py \
   --recording-progress-interval 1.0 \
   --conversation-mode \
   --turn-listen-timeout 8 \
-  --session-idle-timeout 30 \
+  --session-idle-timeout 10 \
   --max-session-turns 20 \
   --camera-id auto \
   --camera-width 320 \

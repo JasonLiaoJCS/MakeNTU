@@ -370,6 +370,16 @@ def clean_query(query: str) -> str:
     return value
 
 
+def read_text_tail(path: str | Path | None, *, limit: int = 2400) -> str:
+    if not path:
+        return ""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return ""
+    return data[-limit:].decode("utf-8", errors="replace").strip()
+
+
 def looks_like_audio_complaint(text: str) -> bool:
     lowered = text.lower()
     if any(word in lowered for word in EXPLICIT_MUSIC_REQUEST_WORDS):
@@ -1103,6 +1113,8 @@ class MusicPlayer:
         self.last_title = ""
         self.last_artist = ""
         self.last_url = ""
+        self._mpv_log_path: str | None = None
+        self._last_mpv_log_tail = ""
 
     def _remove_ipc_socket(self) -> None:
         if self._ipc_path:
@@ -1209,9 +1221,6 @@ class MusicPlayer:
             if latest.get("audio_out"):
                 latest["playback_ready"] = True
                 return latest
-            if latest.get("title") and latest.get("eof_reached") is not True:
-                latest["playback_ready"] = True
-                return latest
             if time.monotonic() >= deadline:
                 latest["playback_ready"] = False
                 return latest
@@ -1283,9 +1292,10 @@ class MusicPlayer:
                 "volume": effective_volume,
                 "volume_percent": int(round(float(effective_volume))) if effective_volume is not None else self.mpv_volume,
                 "volume_max": self.mpv_volume_max,
-                "playback_ready": bool(playback.get("audio_out") or playback.get("title")) if active else False,
+                "playback_ready": bool(playback.get("audio_out")) if active else False,
                 "audio_out": playback.get("audio_out") if active else None,
                 "audio_params": playback.get("audio_params") if active else None,
+                "mpv_log_tail": self._last_mpv_log_tail or read_text_tail(self._mpv_log_path),
             }
 
     def stop(self) -> dict[str, Any]:
@@ -1472,8 +1482,15 @@ class MusicPlayer:
         self.stop()
         target = f"ytdl://ytsearch1:{query}"
         ipc_path = f"/tmp/makentu_music_web_player_{os.getpid()}.sock"
+        log_path = f"/tmp/makentu_music_web_player_{os.getpid()}_{int(time.time() * 1000)}.log"
         try:
             os.unlink(ipc_path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        try:
+            os.unlink(log_path)
         except FileNotFoundError:
             pass
         except Exception:
@@ -1484,6 +1501,7 @@ class MusicPlayer:
             "--force-window=no",
             "--msg-level=all=warn",
             f"--input-ipc-server={ipc_path}",
+            f"--log-file={log_path}",
             "--term-playing-msg=Now playing: ${media-title}",
         ]
         if audio_device:
@@ -1505,6 +1523,8 @@ class MusicPlayer:
             with self._lock:
                 self._process = subprocess.Popen(command)
                 self._ipc_path = ipc_path
+                self._mpv_log_path = log_path
+                self._last_mpv_log_tail = ""
                 self._paused = False
                 self.last_query = query
                 self.last_backend = "mpv"
@@ -1518,14 +1538,23 @@ class MusicPlayer:
                         break
                 time.sleep(0.05)
             ipc_ready = os.path.exists(ipc_path)
-            playback = self._wait_for_mpv_playback(wait_sec=self.mpv_ready_timeout) if ipc_ready else {}
+            playback_wait = max(self.mpv_ready_timeout, 3.5)
+            playback = self._wait_for_mpv_playback(wait_sec=playback_wait) if ipc_ready else {}
             now_playing = self._refresh_now_playing(wait_sec=0.2) if ipc_ready else {}
+            with self._lock:
+                active = self._is_active_locked()
+                returncode = self._process.poll() if self._process is not None else None
+            log_tail = read_text_tail(log_path)
+            self._last_mpv_log_tail = log_tail
+            playback_ready = bool(playback.get("playback_ready"))
             result = {
-                "ok": True,
+                "ok": playback_ready,
                 "action": "play",
                 "backend": "mpv",
                 "query": query,
                 "target": target,
+                "active": active,
+                "mpv_returncode": returncode,
                 "audio_device": audio_device or "system-default",
                 "requested_audio_device": self.requested_mpv_audio_device or "default",
                 "cookies": cookies_path,
@@ -1538,16 +1567,21 @@ class MusicPlayer:
                 "actual_volume": playback.get("volume") if ipc_ready else None,
                 "ipc_path": ipc_path,
                 "ipc_ready": ipc_ready,
-                "playback_ready": playback.get("playback_ready") if ipc_ready else False,
+                "playback_ready": playback_ready if ipc_ready else False,
                 "audio_out": playback.get("audio_out") if ipc_ready else None,
                 "audio_params": playback.get("audio_params") if ipc_ready else None,
                 "title": now_playing.get("title") or playback.get("title") or "",
                 "artist": now_playing.get("artist") or "",
                 "url": now_playing.get("url") or playback.get("url") or target,
+                "mpv_log_path": log_path,
             }
+            if log_tail:
+                result["mpv_log_tail"] = log_tail
             if not ipc_ready:
+                result["error"] = "mpv IPC socket was not ready"
                 result["warning"] = "mpv IPC socket was not ready yet; pause/resume may fail until mpv finishes starting"
             elif not result["playback_ready"]:
+                result["error"] = "mpv did not expose audio output before timeout"
                 result["warning"] = "mpv started but did not expose playback audio status before timeout; check Terminal 4 for yt-dlp/YouTube errors"
             return result
         except Exception as exc:
@@ -1668,6 +1702,7 @@ def make_handler(
                         "playback_ready": status.get("playback_ready"),
                         "audio_out": status.get("audio_out"),
                         "audio_params": status.get("audio_params"),
+                        "mpv_log_tail": status.get("mpv_log_tail"),
                         "weather_available": True,
                         "weather_source": "open-meteo",
                         "weather_default_location": weather_default_location,

@@ -216,6 +216,7 @@ EMOTION_TO_HEAD_MOTION = {
     "confused": "confused_tilt",
     "sleepy": "sleepy_drop",
 }
+GENERIC_HEAD_MOTIONS = {"nod", "double_nod", "look_around", "shake", "gentle_nod"}
 
 EMOTION_ALIASES = {
     "calm": "neutral",
@@ -309,17 +310,23 @@ YAW_LEFT_SMALL = 125
 YAW_LEFT_SOFT = 155
 YAW_LEFT = MOTOR_YAW_MAX
 YAW_LEFT_LIMIT = MOTOR_YAW_MAX
-MOTOR_STEP_DELAY_SEC = 0.55
+MOTOR_STEP_DELAY_SEC = 0.48
 MOTOR_LIVE_MIN_STEP_DELAY_SEC = 0.25
 MOTOR_SMOOTH_STEP_DEG = 120
-MOTOR_SPEAKING_STEP_DELAY_SEC = 0.72
+MOTOR_SPEAKING_STEP_DELAY_SEC = 0.50
 MOTOR_SPEAKING_SMOOTH_STEP_DEG = 120
+MOTOR_MUSIC_STEP_DELAY_SEC = 0.38
+MOTOR_MUSIC_SMOOTH_STEP_DEG = 120
 MOTOR_STOP_TIMEOUT_SEC = 6.0
 MOTOR_RESET_REPEATS = 1
 MOTOR_RESET_DELAY_SEC = 0.35
 MOTOR_LIVE_MIN_RESET_DELAY_SEC = 0.20
 MOTOR_READ_MS = 35
 MOTOR_JOIN_TIMEOUT_SEC = 6.0
+UART_CRITICAL_RETRY_MAX_WAIT_SEC = 4.5
+UART_CRITICAL_RETRY_SETTLE_SEC = 0.12
+MUSIC_HEAD_MOTION_DEFAULT = "music_groove"
+MUSIC_MOTION_HEALTH_INTERVAL_SEC = 2.0
 MOTOR_ACK_RE = re.compile(r"\bMotor\s+(Pitch|Yaw)\s*=\s*(-?\d+)\b", re.IGNORECASE)
 MOTOR_YAWPITCH_ACK_RE = re.compile(
     r"\bMotor\s+YawPitch\s*=\s*yaw\s*:?\s*(-?\d+)\s+pitch\s*:?\s*(-?\d+)\b",
@@ -341,9 +348,8 @@ def yaw_pitch(yaw_angle: int, pitch_angle: int) -> MotorStep:
 
 
 def hold_step(step: MotorStep, count: int = 1) -> list[MotorStep]:
-    """Keep call sites readable; actual hold time is handled by per-pose delays."""
-    _ = count
-    return [step]
+    """Repeat a pose keyframe so expressive holds survive smoothing."""
+    return [step for _ in range(max(1, int(count or 1)))]
 
 
 def center_head_steps() -> list[MotorStep]:
@@ -595,60 +601,79 @@ def sleep_interruptible(duration_sec: float, stop_event: threading.Event | None 
 HEAD_MOTION_SEQUENCES = {
     "none": center_head_steps(),
     "nod": [
-        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
-        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_STRONG)),
         yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
-        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP),
-        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
+        *hold_step(yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT), 2),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_UP_SOFT),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "double_nod": [
-        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
-        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_STRONG)),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN),
         yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_STRONG),
         yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
-        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN)),
+        *hold_step(yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE), 2),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "look_around": [
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_ATTENTIVE),
-        *hold_step(yaw_pitch(YAW_RIGHT, PITCH_ATTENTIVE)),
+        *hold_step(yaw_pitch(YAW_RIGHT, PITCH_ATTENTIVE), 2),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE),
-        *hold_step(yaw_pitch(YAW_LEFT, PITCH_ATTENTIVE)),
+        *hold_step(yaw_pitch(YAW_LEFT, PITCH_ATTENTIVE), 2),
         yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_ATTENTIVE),
         yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "shake": [
-        *hold_step(yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER)),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_CENTER),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
-        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_CENTER),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_ATTENTIVE),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "gentle_nod": [
         yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
-        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT)),
         yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
+        *hold_step(yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE), 2),
         yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "sleepy_drop": [
-        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DROWSY),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DROWSY),
         yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
-        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN),
-        *hold_step(yaw_pitch(YAW_RIGHT_SOFT, PITCH_DOWN_STRONG)),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN),
+        *hold_step(yaw_pitch(YAW_CENTER, PITCH_DOWN_STRONG), 2),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN),
         yaw_pitch(YAW_LEFT_TINY, PITCH_DROWSY),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "happy_bounce": [
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_STRONG),
+        *hold_step(yaw_pitch(YAW_RIGHT_TINY, PITCH_UP), 2),
         yaw_pitch(YAW_CENTER, PITCH_UP),
-        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP),
+        *hold_step(yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_STRONG), 2),
         yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_LEFT_TINY, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_UP_STRONG),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
         yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
@@ -660,33 +685,50 @@ HEAD_MOTION_SEQUENCES = {
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_LEFT_SMALL, PITCH_UP),
         yaw_pitch(YAW_CENTER, PITCH_UP_STRONG),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_UP_STRONG),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_CENTER, PITCH_UP),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "curious_peek": [
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_ATTENTIVE),
-        yaw_pitch(YAW_RIGHT, PITCH_UP),
+        *hold_step(yaw_pitch(YAW_RIGHT, PITCH_UP), 2),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE),
-        yaw_pitch(YAW_LEFT, PITCH_UP),
+        *hold_step(yaw_pitch(YAW_LEFT, PITCH_UP), 2),
         yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_UP_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
         yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "concerned_tilt": [
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
-        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN),
+        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN), 2),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_LEFT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "sad_droop": [
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN),
-        yaw_pitch(YAW_CENTER, PITCH_DOWN_STRONG),
+        *hold_step(yaw_pitch(YAW_CENTER, PITCH_DOWN_STRONG), 2),
         yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_STRONG),
-        yaw_pitch(YAW_RIGHT_SOFT, PITCH_DOWN_STRONG),
+        *hold_step(yaw_pitch(YAW_RIGHT_SOFT, PITCH_DOWN_STRONG), 2),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_STRONG),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN),
         yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "confused_tilt": [
@@ -695,7 +737,12 @@ HEAD_MOTION_SEQUENCES = {
         yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP),
         yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
     "firm_shake": [
@@ -703,8 +750,12 @@ HEAD_MOTION_SEQUENCES = {
         yaw_pitch(YAW_LEFT, PITCH_UP_SOFT),
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT, PITCH_CENTER),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_CENTER),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_SOFT),
         yaw_pitch(YAW_LEFT_SMALL, PITCH_CENTER),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_ATTENTIVE),
         yaw_pitch(YAW_CENTER, PITCH_CENTER),
     ],
 }
@@ -712,46 +763,64 @@ HEAD_MOTION_SEQUENCES = {
 SPEAKING_HEAD_MOTION_LOOPS = {
     "none": center_head_steps(),
     "nod": [
-        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
-        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN)),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
     ],
     "double_nod": [
-        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
-        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN)),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN),
         yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
-        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_SOFT),
         yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
     ],
     "look_around": [
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_ATTENTIVE),
-        *hold_step(yaw_pitch(YAW_RIGHT, PITCH_ATTENTIVE)),
+        yaw_pitch(YAW_RIGHT, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_SOFT),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE),
-        *hold_step(yaw_pitch(YAW_LEFT, PITCH_ATTENTIVE)),
+        yaw_pitch(YAW_LEFT, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
     ],
     "shake": [
-        *hold_step(yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER)),
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_CENTER),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
-        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_CENTER),
     ],
     "gentle_nod": [
         yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
-        *hold_step(yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT)),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
         yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
     ],
     "sleepy_drop": [
-        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DROWSY),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_DROWSY),
         yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN),
-        *hold_step(yaw_pitch(YAW_RIGHT_SOFT, PITCH_DOWN_STRONG)),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_STRONG),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DROWSY),
     ],
     "happy_bounce": [
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_STRONG),
         yaw_pitch(YAW_CENTER, PITCH_UP_STRONG),
         yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_STRONG),
         yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_LEFT_TINY, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP),
     ],
     "excited_bounce": [
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_UP_STRONG),
@@ -760,25 +829,40 @@ SPEAKING_HEAD_MOTION_LOOPS = {
         yaw_pitch(YAW_LEFT_TINY, PITCH_ATTENTIVE),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_LEFT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_UP_STRONG),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_UP_SOFT),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
     ],
     "curious_peek": [
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_ATTENTIVE),
         yaw_pitch(YAW_RIGHT, PITCH_UP),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_SOFT),
         yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE),
         yaw_pitch(YAW_LEFT, PITCH_UP),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
     ],
     "concerned_tilt": [
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN),
         yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
         yaw_pitch(YAW_RIGHT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
     ],
     "sad_droop": [
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN),
         yaw_pitch(YAW_CENTER, PITCH_DOWN_STRONG),
         yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_STRONG),
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_DOWN_STRONG),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
     ],
     "confused_tilt": [
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_UP_SOFT),
@@ -786,15 +870,52 @@ SPEAKING_HEAD_MOTION_LOOPS = {
         yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP),
         yaw_pitch(YAW_LEFT_SMALL, PITCH_DOWN),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_DOWN_SOFT),
     ],
     "firm_shake": [
         yaw_pitch(YAW_RIGHT, PITCH_UP_SOFT),
         yaw_pitch(YAW_LEFT, PITCH_UP_SOFT),
         yaw_pitch(YAW_RIGHT_SOFT, PITCH_CENTER),
         yaw_pitch(YAW_LEFT_SOFT, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT, PITCH_CENTER),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_CENTER),
         yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_CENTER),
     ],
 }
+
+MUSIC_HEAD_MOTION_LOOPS = {
+    "music_groove": [
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_UP),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+    ],
+    "music_sway": [
+        yaw_pitch(YAW_RIGHT_SOFT, PITCH_ATTENTIVE),
+        *hold_step(yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP_SOFT), 2),
+        yaw_pitch(YAW_CENTER, PITCH_UP_SOFT),
+        yaw_pitch(YAW_LEFT_SOFT, PITCH_ATTENTIVE),
+        *hold_step(yaw_pitch(YAW_LEFT_SMALL, PITCH_UP_SOFT), 2),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
+    ],
+    "music_bounce": [
+        yaw_pitch(YAW_RIGHT_TINY, PITCH_UP_STRONG),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
+        yaw_pitch(YAW_LEFT_TINY, PITCH_UP_STRONG),
+        yaw_pitch(YAW_CENTER, PITCH_DOWN_SOFT),
+        yaw_pitch(YAW_RIGHT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_LEFT_SMALL, PITCH_UP),
+        yaw_pitch(YAW_CENTER, PITCH_ATTENTIVE),
+    ],
+}
+VALID_MUSIC_HEAD_MOTIONS = set(MUSIC_HEAD_MOTION_LOOPS) | VALID_HEAD_MOTIONS | {"off"}
 
 SLEEP_INTENT_KEYWORDS = (
     "去睡覺",
@@ -1245,6 +1366,28 @@ def end_session_keyword(transcript: str) -> str | None:
 
 def should_end_conversation_session(transcript: str) -> bool:
     return end_session_keyword(transcript) is not None
+
+
+def clear_local_ai_memory_for_conversation_end(args: argparse.Namespace, *, reason: str) -> None:
+    """Clear Jetson-local sidecar memory when wake bridge ends a conversation."""
+    server_url = str(getattr(args, "server_url", "") or "").strip()
+    if not server_url:
+        return
+    parsed = urllib.parse.urlsplit(server_url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return
+    clear_url = voice_chat.endpoint_url(server_url, "/memory/clear")
+    try:
+        result = voice_chat.post_json(clear_url, {"reason": reason}, timeout_sec=1.5)
+    except Exception as exc:
+        print(f"Local AI memory clear skipped: {exc}")
+        return
+    if isinstance(result, dict) and result.get("ok"):
+        print(
+            "Local AI memory cleared after conversation end "
+            f"(cleared={result.get('cleared', 0)})."
+        )
 
 
 def find_device_by_keyword(keyword: str) -> int | None:
@@ -1885,6 +2028,8 @@ def should_end_conversation_after_focus_turn(
 ) -> bool:
     if not getattr(args, "conversation_mode", False):
         return False
+    if not getattr(args, "end_conversation_after_focus_control", False):
+        return False
     return focus_intent is not None or focus_was_running or focus_is_running
 
 
@@ -2176,6 +2321,93 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+LOOSE_REPLY_FIELDS = ("reply", "reply_text", "answer", "message")
+CONTROL_FIELD_NAMES = {"persistent_state", "screen_mode", "emotion", "head_motion", "reason"}
+
+
+def strip_model_thinking_text(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", str(text or ""), flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"^\s*/?no_think\s*", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def decode_json_string_fragment(raw: str) -> str:
+    try:
+        value = json.loads(f'"{raw}"')
+    except json.JSONDecodeError:
+        value = raw.replace(r"\"", '"').replace(r"\n", "\n").replace(r"\\", "\\")
+    return str(value).strip()
+
+
+def extract_string_field_loose(text: str, field: str) -> str:
+    cleaned = strip_model_thinking_text(text)
+    pattern = rf'"{re.escape(field)}"\s*:\s*"((?:\\.|[^"\\])*)"'
+    for match in re.finditer(pattern, cleaned, flags=re.DOTALL):
+        value = decode_json_string_fragment(match.group(1))
+        if value:
+            return value
+    return ""
+
+
+def reply_looks_internal(text: str) -> bool:
+    lowered = str(text or "").lower()
+    internal_markers = (
+        "persistent_state",
+        "screen_mode",
+        "head_motion",
+        "motorpitch",
+        "motoryaw",
+        '"control"',
+        '"reply"',
+        "uart",
+        "內部理由",
+        "内部理由",
+        "控制欄位",
+        "控制字段",
+        "emotion 是",
+        "emotion is",
+        "head motion",
+        "persistent state",
+    )
+    return any(marker in lowered for marker in internal_markers)
+
+
+def extract_reply_loose(text: str) -> str:
+    for field in LOOSE_REPLY_FIELDS:
+        value = extract_string_field_loose(text, field)
+        if value and not reply_looks_internal(value):
+            return value
+    return ""
+
+
+def dict_looks_like_control(value: dict[str, Any]) -> bool:
+    return any(key in value for key in CONTROL_FIELD_NAMES)
+
+
+def extract_control_loose(text: str) -> dict[str, str]:
+    control: dict[str, str] = {}
+    persistent_state = extract_string_field_loose(text, "persistent_state").lower()
+    if persistent_state in VALID_PERSISTENT_STATES:
+        control["persistent_state"] = persistent_state
+
+    screen_mode = extract_string_field_loose(text, "screen_mode").lower()
+    if screen_mode in VALID_SCREEN_MODES:
+        control["screen_mode"] = screen_mode
+
+    raw_emotion = extract_string_field_loose(text, "emotion")
+    if raw_emotion:
+        control["emotion"] = normalize_emotion_name(raw_emotion)
+
+    head_motion = extract_string_field_loose(text, "head_motion").lower()
+    if head_motion in VALID_HEAD_MOTIONS:
+        control["head_motion"] = head_motion
+
+    reason = extract_string_field_loose(text, "reason")
+    if reason:
+        control["reason"] = reason
+    return control
+
+
 def emotion_from_transcript_keywords(transcript: str) -> str:
     text = str(transcript or "").lower()
     if any(word in text for word in ("操你媽", "操你妈", "幹你娘", "干你娘", "媽的", "妈的", "靠北", "靠邀", "fuck", "shit")):
@@ -2250,6 +2482,8 @@ def head_motion_for_emotion(emotion: str, requested_head_motion: str = "") -> st
     normalized_emotion = normalize_emotion_name(emotion, default="neutral")
     requested = str(requested_head_motion or "").strip().lower()
     if requested in VALID_HEAD_MOTIONS and requested != "none":
+        if normalized_emotion != "neutral" and requested in GENERIC_HEAD_MOTIONS:
+            return EMOTION_TO_HEAD_MOTION.get(normalized_emotion, requested)
         return requested
     return EMOTION_TO_HEAD_MOTION.get(normalized_emotion, "none")
 
@@ -2269,7 +2503,6 @@ def normalize_emotion_name(value: Any, *, default: str = "neutral") -> str:
 
 def normalize_control(response: dict[str, Any]) -> dict[str, str]:
     transcript = str(response.get("transcript", "")).strip()
-    fallback = local_control_from_transcript(transcript, response)
 
     raw_control = response.get("control")
     if not isinstance(raw_control, dict):
@@ -2282,13 +2515,48 @@ def normalize_control(response: dict[str, Any]) -> dict[str, str]:
     if raw_control is None and reply_text:
         parsed = extract_json_object(reply_text)
         if parsed is not None:
-            raw_control = parsed.get("control") if isinstance(parsed.get("control"), dict) else parsed.get("uart")
+            if not any(key in parsed for key in ("reply", "reply_text", "control", "uart")) and dict_looks_like_control(parsed):
+                raw_control = parsed
+            else:
+                raw_control = parsed.get("control") if isinstance(parsed.get("control"), dict) else parsed.get("uart")
             parsed_reply = str(parsed.get("reply", "")).strip()
             if parsed_reply:
                 response["reply"] = parsed_reply
                 print("JSON parse fallback: extracted reply/control from response reply field.")
+            else:
+                loose_reply = extract_reply_loose(reply_text)
+                if loose_reply:
+                    response["reply"] = loose_reply
+                    print("JSON parse fallback: extracted loose reply from malformed reply field.")
+        else:
+            loose_control = extract_control_loose(reply_text)
+            if loose_control:
+                raw_control = loose_control
+                print("JSON parse fallback: extracted loose control from malformed reply field.")
+            loose_reply = extract_reply_loose(reply_text)
+            if loose_reply:
+                response["reply"] = loose_reply
+                print("JSON parse fallback: extracted loose reply from malformed reply field.")
 
     source = raw_control if isinstance(raw_control, dict) else {}
+    if source:
+        fallback_emotion = emotion_from_transcript_keywords(transcript)
+        raw_response_emotion = response.get("emotion")
+        if isinstance(raw_response_emotion, dict):
+            fallback_emotion = normalize_emotion_name(raw_response_emotion.get("primary", fallback_emotion), default=fallback_emotion)
+        elif isinstance(raw_response_emotion, str):
+            fallback_emotion = normalize_emotion_name(raw_response_emotion, default=fallback_emotion)
+        fallback_emotion = normalize_emotion_name(fallback_emotion, default="neutral")
+        fallback = {
+            "persistent_state": "unchanged",
+            "screen_mode": "unchanged",
+            "emotion": fallback_emotion,
+            "head_motion": direct_head_motion_from_transcript(transcript) or EMOTION_TO_HEAD_MOTION.get(fallback_emotion, "none"),
+            "reason": "partial model control",
+        }
+    else:
+        fallback = local_control_from_transcript(transcript, response)
+
     persistent_state = str(source.get("persistent_state", fallback["persistent_state"])).strip().lower()
     if persistent_state not in VALID_PERSISTENT_STATES:
         persistent_state = fallback["persistent_state"]
@@ -2305,22 +2573,7 @@ def normalize_control(response: dict[str, Any]) -> dict[str, str]:
     if direct_head_motion:
         reason = f"direct head motion intent: {direct_head_motion}"
 
-    state_intent = detect_persistent_state_intent(transcript)
-    if state_intent == "sleep":
-        persistent_state = "sleep"
-        screen_mode = "sleep"
-        emotion = "sleepy"
-        head_motion = "sleepy_drop"
-        reason = "sleep intent"
-    elif state_intent == "normal":
-        persistent_state = "normal"
-        screen_mode = "normal"
-        if emotion in {"sleepy", "concerned", "confused"}:
-            emotion = "happy"
-        if head_motion in {"sleepy_drop", "shake"}:
-            head_motion = "happy_bounce"
-        reason = "wake/normal intent"
-    elif persistent_state in {"normal", "sleep"} and screen_mode == "unchanged":
+    if persistent_state in {"normal", "sleep"} and screen_mode == "unchanged":
         screen_mode = persistent_state
 
     return {
@@ -2345,30 +2598,21 @@ def sanitize_reply(response: dict[str, Any]) -> str:
             print("JSON parse fallback: reply contained JSON; using parsed reply only.")
             response["reply"] = parsed_reply
             return parsed_reply
+        loose_reply = extract_reply_loose(reply)
+        if loose_reply:
+            print("JSON parse fallback: reply contained malformed JSON; using loose reply field.")
+            response["reply"] = loose_reply
+            return loose_reply
         print("JSON parse fallback: reply looked internal; using safe fallback reply.")
         reply = ""
+    else:
+        loose_reply = extract_reply_loose(reply)
+        if loose_reply:
+            print("JSON parse fallback: reply contained malformed JSON; using loose reply field.")
+            response["reply"] = loose_reply
+            return loose_reply
 
-    lowered = reply.lower()
-    internal_markers = (
-        "persistent_state",
-        "screen_mode",
-        "head_motion",
-        "motorpitch",
-        "motoryaw",
-        '"control"',
-        '"reply"',
-        "uart",
-        "json",
-        "內部理由",
-        "内部理由",
-        "控制欄位",
-        "控制字段",
-        "emotion 是",
-        "emotion is",
-        "head motion",
-        "persistent state",
-    )
-    if any(marker in lowered for marker in internal_markers):
+    if reply_looks_internal(reply):
         print("JSON parse fallback: stripped internal control text from reply.")
         reply = ""
 
@@ -2954,9 +3198,15 @@ def execute_music_route(route: dict[str, Any], args: argparse.Namespace, respons
         print(f"  delta   : {result.get('volume_delta')}")
     if "ipc_ready" in result:
         print(f"  ipc_ready: {result.get('ipc_ready')}")
+    if result.get("warning"):
+        print(f"  warning : {result.get('warning')}")
     if result.get("error"):
         print(f"  error   : {result.get('error')}")
         print("  hint    : start Terminal 4 music_web_player, or use --no-music.")
+    if result.get("mpv_log_tail"):
+        print("  mpv_log :")
+        for line in str(result.get("mpv_log_tail", "")).splitlines()[-8:]:
+            print(f"    {line}")
     return result
 
 
@@ -4878,6 +5128,8 @@ class RobotUartController:
         self._last_motor_step: MotorStep | None = None
         self._active_speaking_thread: threading.Thread | None = None
         self._active_speaking_stop: threading.Event | None = None
+        self._active_music_thread: threading.Thread | None = None
+        self._active_music_stop: threading.Event | None = None
         self._screen_state = ""
         self._screen_state_at = 0.0
         self.uart_bus: FrdmUartBus | None = None
@@ -4912,6 +5164,23 @@ class RobotUartController:
                 int(getattr(self.args, "motor_speaking_smooth_step_deg", MOTOR_SPEAKING_SMOOTH_STEP_DEG) or MOTOR_SPEAKING_SMOOTH_STEP_DEG),
             ),
         )
+
+    def motor_music_step_delay(self) -> float:
+        requested = float(getattr(self.args, "motor_music_step_delay", MOTOR_MUSIC_STEP_DELAY_SEC) or MOTOR_MUSIC_STEP_DELAY_SEC)
+        live_floor = 0.0 if getattr(self.args, "uart_dry_run", False) else 0.12
+        return max(live_floor, requested)
+
+    def motor_music_smooth_step_deg(self) -> int:
+        return max(
+            1,
+            min(
+                120,
+                int(getattr(self.args, "motor_music_smooth_step_deg", MOTOR_MUSIC_SMOOTH_STEP_DEG) or MOTOR_MUSIC_SMOOTH_STEP_DEG),
+            ),
+        )
+
+    def music_motion_health_interval(self) -> float:
+        return max(0.0, float(getattr(self.args, "music_motion_health_interval", MUSIC_MOTION_HEALTH_INTERVAL_SEC) or 0.0))
 
     def motor_stop_timeout(self) -> float:
         return max(0.5, min(8.0, float(getattr(self.args, "motor_stop_timeout", MOTOR_STOP_TIMEOUT_SEC) or MOTOR_STOP_TIMEOUT_SEC)))
@@ -5073,6 +5342,24 @@ class RobotUartController:
             read_ms=read_ms,
             timeout_sec=self._uart_tx_timeout(configured_timeout, read_window_sec),
         )
+
+    def _wait_for_uart_recovery_retry(self, *, reason: str, max_wait_sec: float = UART_CRITICAL_RETRY_MAX_WAIT_SEC) -> bool:
+        bus = self._active_uart_bus()
+        if bus is None:
+            return False
+        remaining = bus._disabled_remaining()
+        if remaining <= 0.0:
+            return False
+        wait_sec = remaining + UART_CRITICAL_RETRY_SETTLE_SEC
+        if wait_sec > max(0.0, float(max_wait_sec or 0.0)):
+            print(
+                "WARNING: FRDM UART critical retry skipped; "
+                f"bus recovery needs {wait_sec:.2f}s ({reason})."
+            )
+            return False
+        print(f"FRDM UART critical retry: waiting {wait_sec:.2f}s for bus recovery ({reason}).")
+        time.sleep(wait_sec)
+        return True
 
     def _handle_motor_ack_problem(
         self,
@@ -5301,12 +5588,18 @@ class RobotUartController:
             print(f"WARNING: UART error while sending {reason or wire}: {exc}")
             return not getattr(self.args, "require_uart", False)
 
-    def reset_head_position(self, *, reason: str = "head_motion reset") -> bool:
+    def reset_head_position(
+        self,
+        *,
+        reason: str = "head_motion reset",
+        force: bool = False,
+        retry_after_recovery: bool = False,
+    ) -> bool:
         if not self.head_motor_enabled():
             if not getattr(self.args, "no_uart", False):
                 print(f"head motion reset skipped ({self.head_motor_disabled_reason()}): {reason}")
             return True
-        if self.head_is_centered():
+        if self.head_is_centered() and not force:
             print(f"head motion reset skipped: already centered ({reason})")
             return True
         steps: list[tuple[str, int, int]] = []
@@ -5318,6 +5611,13 @@ class RobotUartController:
             delay_sec=self.motor_reset_delay(),
             read_ms=self.motor_read_ms(),
         )
+        if not ok and retry_after_recovery and self._wait_for_uart_recovery_retry(reason=reason):
+            ok = self.send_uart_sequence(
+                steps,
+                reason=f"{reason}; retry after UART recovery",
+                delay_sec=self.motor_reset_delay(),
+                read_ms=self.motor_read_ms(),
+            )
         if ok:
             print(
                 "head motion reset sent: "
@@ -5327,7 +5627,14 @@ class RobotUartController:
             print("WARNING: head motion reset was not sent.")
         return ok
 
-    def set_screen_state(self, state: str, *, reason: str = "", force: bool = False) -> bool:
+    def set_screen_state(
+        self,
+        state: str,
+        *,
+        reason: str = "",
+        force: bool = False,
+        retry_after_recovery: bool = False,
+    ) -> bool:
         validated = self._validate_command(state, 0, 0)
         if validated is None or validated[0] not in CORE_SCREEN_COMMANDS:
             print(f"WARNING: refusing non-screen state {state!r}.")
@@ -5346,11 +5653,26 @@ class RobotUartController:
             )
             return True
         ok = self.send_uart_command(command, 0, 0, reason=reason or f"screen state {command}", read_ms=80)
+        if not ok and retry_after_recovery and self._wait_for_uart_recovery_retry(reason=reason or f"screen state {command}"):
+            ok = self.send_uart_command(
+                command,
+                0,
+                0,
+                reason=f"{reason or 'screen state ' + command}; retry after UART recovery",
+                read_ms=80,
+            )
         if ok:
             self._note_screen_state(command)
         return ok
 
-    def set_screen_mode(self, mode: str, *, reason: str = "") -> bool:
+    def set_screen_mode(
+        self,
+        mode: str,
+        *,
+        reason: str = "",
+        force: bool = False,
+        retry_after_recovery: bool = False,
+    ) -> bool:
         normalized = str(mode or "").strip().lower()
         command = SCREEN_MODE_TO_COMMAND.get(normalized)
         if command is None:
@@ -5358,7 +5680,12 @@ class RobotUartController:
             return False
         if normalized in {"normal", "sleep"}:
             self.set_persistent_state(normalized)
-        ok = self.set_screen_state(command, reason=reason or f"screen mode {normalized}")
+        ok = self.set_screen_state(
+            command,
+            reason=reason or f"screen mode {normalized}",
+            force=force,
+            retry_after_recovery=retry_after_recovery,
+        )
         if getattr(self.args, "no_uart", False):
             return False
         if ok:
@@ -5441,7 +5768,7 @@ class RobotUartController:
         except Exception as exc:
             print(f"WARNING: head motion failed: {exc}")
         finally:
-            reset_ok = self.reset_head_position(reason="head_motion reset")
+            reset_ok = self.reset_head_position(reason="head_motion reset", force=True)
             print(f"head motion ended: {motion}")
         return ok and reset_ok
 
@@ -5499,12 +5826,13 @@ class RobotUartController:
             print(f"WARNING: speaking head motion failed: {exc}")
             all_ok = False
         finally:
-            self.reset_head_position(reason="speaking_head_motion reset")
+            self.reset_head_position(reason="speaking_head_motion reset", force=True)
             print(f"speaking head motion loop stopped: {motion} cycles={cycle_count}")
         return all_ok
 
     def start_speaking_head_motion(self, head_motion: str) -> tuple[threading.Thread | None, threading.Event | None]:
         motion = head_motion if head_motion in SPEAKING_HEAD_MOTION_LOOPS else "none"
+        self.stop_active_music_head_motion(reason="before applying speaking head motion")
         self.stop_active_speaking_head_motion(reason="before applying speaking head motion")
         if motion == "none":
             print("speaking head motion skipped: none")
@@ -5546,7 +5874,7 @@ class RobotUartController:
         thread.join(timeout=self.motor_stop_timeout())
         if thread.is_alive():
             print(f"WARNING: speaking head motion still running after stop timeout; sending center reset ({reason}).")
-            self.reset_head_position(reason=reason)
+            self.reset_head_position(reason=reason, force=True)
         with self._lock:
             if self._active_speaking_thread is thread:
                 self._active_speaking_thread = None
@@ -5561,9 +5889,141 @@ class RobotUartController:
         if thread is not None and stop_event is not None:
             self.stop_speaking_head_motion(thread, stop_event, reason=reason)
 
+    def _music_motion_keyframes(self, head_motion: str) -> tuple[str, list[MotorStep]]:
+        requested = str(head_motion or MUSIC_HEAD_MOTION_DEFAULT).strip().lower()
+        if requested in {"", "none"}:
+            requested = MUSIC_HEAD_MOTION_DEFAULT
+        if requested in MUSIC_HEAD_MOTION_LOOPS:
+            return requested, list(MUSIC_HEAD_MOTION_LOOPS[requested])
+        if requested in SPEAKING_HEAD_MOTION_LOOPS:
+            return requested, list(SPEAKING_HEAD_MOTION_LOOPS[requested])
+        return MUSIC_HEAD_MOTION_DEFAULT, list(MUSIC_HEAD_MOTION_LOOPS[MUSIC_HEAD_MOTION_DEFAULT])
+
+    def run_music_head_motion(
+        self,
+        head_motion: str,
+        stop_event: threading.Event,
+        *,
+        check_playback: bool = True,
+    ) -> bool:
+        motion, keyframes = self._music_motion_keyframes(head_motion)
+        sequence = smooth_motor_sequence(keyframes, self.motor_music_smooth_step_deg())
+        delays = natural_motor_delays(sequence, self.motor_music_step_delay(), speaking=True)
+        cycle_count = 0
+        all_ok = True
+        health_interval = self.music_motion_health_interval() if check_playback else 0.0
+        next_health_at = time.monotonic() + max(0.5, health_interval)
+        try:
+            print(
+                f"music head motion loop started: {motion} "
+                f"(keyframes={len(keyframes)}, expanded_steps={len(sequence)}, "
+                f"smooth_step={self.motor_music_smooth_step_deg()}deg, "
+                f"base_step_delay={self.motor_music_step_delay():.2f}s, "
+                f"health_check={'on' if health_interval > 0.0 else 'off'})"
+            )
+            if getattr(self.args, "uart_debug", False):
+                print(f"music head motion keyframes: {format_motor_sequence(keyframes)}")
+                print(f"music head motion expanded: {format_motor_sequence(sequence)}")
+                print(f"music head motion delays: {' -> '.join(f'{delay:.2f}s' for delay in delays)}")
+
+            while not stop_event.is_set():
+                if health_interval > 0.0 and cycle_count > 0 and time.monotonic() >= next_health_at:
+                    if not music_playback_active(self.args, timeout_sec=0.18):
+                        print("music head motion loop stopping: music playback is no longer active.")
+                        break
+                    next_health_at = time.monotonic() + health_interval
+                cycle_count += 1
+                ok = self.send_uart_sequence(
+                    sequence,
+                    reason=f"music_head_motion {motion} cycle={cycle_count}",
+                    delay_sec=delays,
+                    read_ms=self.motor_read_ms(),
+                    stop_event=stop_event,
+                )
+                all_ok = ok and all_ok
+                if not ok:
+                    break
+                if not sleep_interruptible(0.02, stop_event):
+                    break
+        except Exception as exc:
+            print(f"WARNING: music head motion failed: {exc}")
+            all_ok = False
+        finally:
+            self.reset_head_position(reason="music_head_motion reset", force=True)
+            print(f"music head motion loop stopped: {motion} cycles={cycle_count}")
+        return all_ok
+
+    def start_music_head_motion(
+        self,
+        head_motion: str = "",
+        *,
+        check_playback: bool = True,
+    ) -> tuple[threading.Thread | None, threading.Event | None]:
+        motion_setting = str(head_motion or getattr(self.args, "music_head_motion", MUSIC_HEAD_MOTION_DEFAULT) or "").strip().lower()
+        if getattr(self.args, "no_music_head_motion", False) or motion_setting in {"off", "none"}:
+            print("music head motion skipped: disabled")
+            self.stop_active_music_head_motion(reason="music head motion disabled")
+            return None, None
+        motion, _keyframes = self._music_motion_keyframes(motion_setting)
+        self.stop_active_speaking_head_motion(reason="before applying music head motion")
+        self.stop_active_music_head_motion(reason="before applying music head motion")
+        if not self.head_motor_enabled():
+            if not getattr(self.args, "no_uart", False):
+                print(f"music head motion skipped ({self.head_motor_disabled_reason()}): {motion}")
+            return None, None
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self.run_music_head_motion,
+            args=(motion, stop_event),
+            kwargs={"check_playback": check_playback},
+            name=f"music_head_motion_{motion}",
+            daemon=True,
+        )
+        with self._lock:
+            self._active_music_thread = thread
+            self._active_music_stop = stop_event
+        thread.start()
+        return thread, stop_event
+
+    def stop_music_head_motion(
+        self,
+        thread: threading.Thread | None,
+        stop_event: threading.Event | None,
+        *,
+        reason: str = "music head motion stop",
+    ) -> None:
+        if thread is None or stop_event is None:
+            return
+        stop_event.set()
+        if thread is threading.current_thread():
+            with self._lock:
+                if self._active_music_thread is thread:
+                    self._active_music_thread = None
+                    self._active_music_stop = None
+            print(f"WARNING: music head motion stop requested from its own thread; stop event set ({reason}).")
+            return
+        thread.join(timeout=self.motor_stop_timeout())
+        if thread.is_alive():
+            print(f"WARNING: music head motion still running after stop timeout; sending center reset ({reason}).")
+            self.reset_head_position(reason=reason, force=True)
+        with self._lock:
+            if self._active_music_thread is thread:
+                self._active_music_thread = None
+                self._active_music_stop = None
+
+    def stop_active_music_head_motion(self, *, reason: str = "stop active music head motion") -> None:
+        with self._lock:
+            thread = self._active_music_thread
+            stop_event = self._active_music_stop
+            self._active_music_thread = None
+            self._active_music_stop = None
+        if thread is not None and stop_event is not None:
+            self.stop_music_head_motion(thread, stop_event, reason=reason)
+
     def force_motion_idle(self, *, reason: str = "force motion idle") -> None:
         self.stop_active_speaking_head_motion(reason=reason)
-        self.reset_head_position(reason=reason)
+        self.stop_active_music_head_motion(reason=reason)
+        self.reset_head_position(reason=reason, force=True)
 
 
 class FrdmUartProxyServer:
@@ -8392,6 +8852,7 @@ def build_wake_hook(
 
         pause_result = pause_music_for_wake(args)
         timing.mark("music paused for wake")
+        robot.stop_active_music_head_motion(reason="wake detected after music pause")
         settle_after_music_wake_pause(args, pause_result)
 
         metadata: dict[str, Any] = {
@@ -8423,7 +8884,7 @@ def build_wake_hook(
                 timing.mark("music pause dashboard sent")
 
         if not getattr(args, "no_uart", False):
-            if robot.set_screen_state("Thinking"):
+            if robot.set_screen_state("Thinking", reason="wake word heard", force=True):
                 print("UART Thinking sent.")
             else:
                 print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
@@ -8480,9 +8941,12 @@ def build_conversation_turn_context(
         timing.mark("follow-up beep done")
 
     if not getattr(args, "no_uart", False):
-        if robot.is_screen_state_recent("Thinking", within_sec=8.0):
-            print(f"UART Thinking skipped; already active {robot.screen_state_age():.2f}s ago for this conversation follow-up.")
-        elif robot.set_screen_state("Thinking", reason="conversation follow-up listening"):
+        if robot.set_screen_state(
+            "Thinking",
+            reason="conversation follow-up listening",
+            force=True,
+            retry_after_recovery=True,
+        ):
             print("UART Thinking sent.")
         else:
             print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
@@ -8678,6 +9142,11 @@ class SpeakingPlaybackCue:
     def stop(self) -> None:
         if not self.started:
             self.robot.stop_active_speaking_head_motion(reason=f"{self.reset_reason}; playback cue never started")
+            self.robot.reset_head_position(
+                reason=f"{self.reset_reason}; playback cue never started",
+                force=True,
+                retry_after_recovery=True,
+            )
             return
         self.started = False
         head_thread = self.head_thread
@@ -8685,6 +9154,7 @@ class SpeakingPlaybackCue:
         self.head_thread = None
         self.head_stop = None
         self.robot.stop_speaking_head_motion(head_thread, head_stop, reason=self.reset_reason)
+        self.robot.reset_head_position(reason=self.reset_reason, force=True, retry_after_recovery=True)
 
 
 def run_self_test() -> int:
@@ -8695,9 +9165,9 @@ def run_self_test() -> int:
                 "transcript": "去睡覺吧",
                 "reply": '{"reply":"好，我先安靜陪你休息。","control":{"persistent_state":"normal","emotion":"happy","head_motion":"nod","reason":"model"}}',
             },
-            "sleep",
-            "sleepy",
-            "sleepy_drop",
+            "normal",
+            "happy",
+            "happy_bounce",
         ),
         (
             {
@@ -8705,14 +9175,23 @@ def run_self_test() -> int:
                 "reply": "我回來了，繼續待命！",
                 "control": {"persistent_state": "sleep", "emotion": "sleepy", "head_motion": "sleepy_drop"},
             },
-            "normal",
-            "happy",
-            "happy_bounce",
+            "sleep",
+            "sleepy",
+            "sleepy_drop",
         ),
         (
             {
                 "transcript": "講個笑話",
                 "reply": '{"reply":"嘿嘿，這個有趣。","control":{"persistent_state":"unchanged","emotion":"happy","head_motion":"nod","reason":"joke"}}',
+            },
+            "unchanged",
+            "happy",
+            "happy_bounce",
+        ),
+        (
+            {
+                "transcript": "你可以點個頭嗎",
+                "reply": '{"reply":"可以呀，我點頭給你看。","control":{"persistent_state":"unchanged","emotion":"happy","head_motion":"nod","reason":"direct motion"}}',
             },
             "unchanged",
             "happy",
@@ -8737,6 +9216,15 @@ def run_self_test() -> int:
             "neutral",
             "gentle_nod",
         ),
+        (
+            {
+                "transcript": "你有聽到嗎",
+                "reply": '{ "reply": "我有正常收到，這次直接回答你。", "control": { "persistent_state": "unchanged", "emotion": "curious", "head_motion": "curious_peek" }',
+            },
+            "unchanged",
+            "curious",
+            "curious_peek",
+        ),
     ]
     for response, expected_state, expected_emotion, expected_motion in response_cases:
         control = normalize_control(response)
@@ -8756,6 +9244,10 @@ def run_self_test() -> int:
         raise AssertionError(f"HEAD_MOTION_SEQUENCES mismatch: {sorted(set(HEAD_MOTION_SEQUENCES) ^ VALID_HEAD_MOTIONS)}")
     if set(SPEAKING_HEAD_MOTION_LOOPS) != VALID_HEAD_MOTIONS:
         raise AssertionError(f"SPEAKING_HEAD_MOTION_LOOPS mismatch: {sorted(set(SPEAKING_HEAD_MOTION_LOOPS) ^ VALID_HEAD_MOTIONS)}")
+    if MUSIC_HEAD_MOTION_DEFAULT not in MUSIC_HEAD_MOTION_LOOPS:
+        raise AssertionError(f"default music head motion is missing: {MUSIC_HEAD_MOTION_DEFAULT}")
+    if not set(MUSIC_HEAD_MOTION_LOOPS).issubset(VALID_MUSIC_HEAD_MOTIONS):
+        raise AssertionError("music head motion choices should include all music loops")
 
     for motion, sequence in HEAD_MOTION_SEQUENCES.items():
         if not sequence:
@@ -8778,6 +9270,24 @@ def run_self_test() -> int:
                 raise AssertionError(f"head motion {motion} value out of range: {command} {v1} {v2}")
             if command != "MotorYawPitch" and int(v2) != 0:
                 raise AssertionError(f"head motion {motion} should keep the internal compatibility value at 0: {command} {v1} {v2}")
+
+    for motion, sequence in MUSIC_HEAD_MOTION_LOOPS.items():
+        if not sequence:
+            raise AssertionError(f"empty music head motion loop: {motion}")
+        for command, v1, v2 in sequence:
+            if command not in MOTOR_COMMANDS:
+                raise AssertionError(f"music head motion {motion} uses non-motor command {command}")
+            if command == "MotorYawPitch":
+                in_range = (
+                    clamp_int(v1, MOTOR_YAW_MIN, MOTOR_YAW_MAX) == int(v1)
+                    and clamp_int(v2, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX) == int(v2)
+                )
+            elif command == "MotorPitch":
+                in_range = clamp_int(v1, MOTOR_PITCH_MIN, MOTOR_PITCH_MAX) == int(v1)
+            else:
+                in_range = clamp_int(v1, MOTOR_YAW_MIN, MOTOR_YAW_MAX) == int(v1)
+            if not in_range:
+                raise AssertionError(f"music head motion {motion} value out of range: {command} {v1} {v2}")
 
     combo_steps = [
         step
@@ -8844,9 +9354,18 @@ def run_self_test() -> int:
         motor_smooth_step_deg=MOTOR_SMOOTH_STEP_DEG,
         motor_speaking_step_delay=0.02,
         motor_speaking_smooth_step_deg=MOTOR_SPEAKING_SMOOTH_STEP_DEG,
+        motor_music_step_delay=0.02,
+        motor_music_smooth_step_deg=MOTOR_MUSIC_SMOOTH_STEP_DEG,
         motor_stop_timeout=0.5,
         motor_reset_repeats=2,
         motor_reset_delay=0.02,
+        no_music=False,
+        music_dry_run=False,
+        music_backend="mpv",
+        music_url="http://127.0.0.1:8788/music",
+        music_head_motion=MUSIC_HEAD_MOTION_DEFAULT,
+        no_music_head_motion=False,
+        music_motion_health_interval=0.0,
     )
     robot = RobotUartController(dry_args)
     safe_args = argparse.Namespace(uart_dry_run=False, enable_head_motor=False, disable_head_motor=False)
@@ -8899,6 +9418,76 @@ def run_self_test() -> int:
         raise AssertionError("duplicate Thinking screen state should be a safe no-op")
     if robot._screen_state_at != first_thinking_at:
         raise AssertionError("duplicate Thinking should not resend/update screen state immediately")
+    forced_screen_sends: list[tuple[str, int, int, str, int | None]] = []
+    original_send_uart_command = robot.send_uart_command
+
+    def fake_send_uart_command(
+        command: str,
+        v1: int = 0,
+        v2: int = 0,
+        *,
+        reason: str = "",
+        read_ms: int | None = None,
+    ) -> bool:
+        forced_screen_sends.append((command, v1, v2, reason, read_ms))
+        return True
+
+    try:
+        robot.send_uart_command = fake_send_uart_command  # type: ignore[method-assign]
+        robot._screen_state = "Thinking"
+        robot._screen_state_at = time.monotonic()
+        if not robot.set_screen_state("Thinking", reason="self-test forced duplicate screen state", force=True):
+            raise AssertionError("forced duplicate Thinking screen state failed")
+    finally:
+        robot.send_uart_command = original_send_uart_command  # type: ignore[method-assign]
+    if not forced_screen_sends or forced_screen_sends[-1][0] != "Thinking":
+        raise AssertionError("forced duplicate Thinking should send UART again")
+    forced_reset_sequences: list[tuple[list[tuple[str, int, int]], str]] = []
+    original_send_uart_sequence = robot.send_uart_sequence
+
+    def fake_send_uart_sequence(
+        steps: list[tuple[str, int, int]],
+        *,
+        reason: str = "",
+        delay_sec: float | list[float] | tuple[float, ...] = 0.0,
+        read_ms: int | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> bool:
+        forced_reset_sequences.append((list(steps), reason))
+        return True
+
+    try:
+        robot.send_uart_sequence = fake_send_uart_sequence  # type: ignore[method-assign]
+        robot._last_motor_step = yaw_pitch(YAW_CENTER, PITCH_CENTER)
+        if not robot.reset_head_position(reason="self-test forced center reset", force=True):
+            raise AssertionError("forced center reset failed")
+    finally:
+        robot.send_uart_sequence = original_send_uart_sequence  # type: ignore[method-assign]
+    if not forced_reset_sequences or forced_reset_sequences[-1][0][0] != yaw_pitch(YAW_CENTER, PITCH_CENTER):
+        raise AssertionError("forced center reset should send center UART sequence")
+    post_reply_modes: list[tuple[str, bool, str]] = []
+    original_set_screen_mode = robot.set_screen_mode
+
+    def fake_set_screen_mode(
+        mode: str,
+        *,
+        reason: str = "",
+        force: bool = False,
+        retry_after_recovery: bool = False,
+    ) -> bool:
+        del retry_after_recovery
+        post_reply_modes.append((mode, force, reason))
+        return True
+
+    try:
+        robot.set_screen_mode = fake_set_screen_mode  # type: ignore[method-assign]
+        dry_args.conversation_mode = True
+        set_post_reply_screen(dry_args, robot, None, control={}, reason="self-test reply complete")
+    finally:
+        dry_args.conversation_mode = False
+        robot.set_screen_mode = original_set_screen_mode  # type: ignore[method-assign]
+    if not post_reply_modes or post_reply_modes[-1][0] != "normal" or not post_reply_modes[-1][1]:
+        raise AssertionError("conversation post-reply screen should force Normal before follow-up listen")
     if robot._validate_command("Speaking", 9, 0) != ("Speaking", 5, 0):
         raise AssertionError("Speaking emotion code clamp failed")
     if robot._validate_command("MotorPitch", 999, 0) != ("MotorPitch", MOTOR_PITCH_MAX, 0):
@@ -9049,16 +9638,74 @@ def run_self_test() -> int:
         raise AssertionError("plain return intent should restore normal mode")
     if detect_focus_mode_intent("停止專注") != "stop":
         raise AssertionError("explicit focus stop should still be detected")
-    if not conversation_should_end_after_sleep_control(
+    if conversation_should_end_after_sleep_control(
         {"control": {"persistent_state": "sleep", "screen_mode": "sleep"}},
         argparse.Namespace(conversation_mode=True),
     ):
-        raise AssertionError("sleep control should end conversation mode")
+        raise AssertionError("sleep control should not end conversation mode by default")
+    if not conversation_should_end_after_sleep_control(
+        {"control": {"persistent_state": "sleep", "screen_mode": "sleep"}},
+        argparse.Namespace(conversation_mode=True, end_conversation_on_sleep_control=True),
+    ):
+        raise AssertionError("sleep control should end conversation mode when explicitly requested")
     if conversation_should_end_after_sleep_control(
         {"control": {"persistent_state": "sleep", "screen_mode": "sleep"}},
         argparse.Namespace(conversation_mode=False),
     ):
         raise AssertionError("sleep control should not end non-conversation mode")
+    followup_args = argparse.Namespace(turn_listen_timeout=8.0, session_idle_timeout=10.0)
+    if conversation_followup_listen_timeout(followup_args, last_activity_at=100.0, now=105.0) != 5.0:
+        raise AssertionError("follow-up listen timeout should use remaining session idle time")
+    fallback_followup_args = argparse.Namespace(turn_listen_timeout=8.0, session_idle_timeout=0.0)
+    if conversation_followup_listen_timeout(fallback_followup_args, last_activity_at=100.0, now=105.0) != 8.0:
+        raise AssertionError("follow-up listen timeout should fall back to turn timeout when idle timeout is disabled")
+    no_music_chat_args = argparse.Namespace(**vars(dry_args))
+    no_music_chat_args.conversation_mode = True
+    no_music_chat_args.quiet_dialog = True
+    no_music_chat_args.debug = False
+    no_music_chat_args.require_tts = False
+    no_music_chat_args.no_weather = True
+    no_music_chat_args.weather_debug = False
+    no_music_chat_args.no_music = True
+    no_music_chat_args.music_debug = False
+    no_music_chat_robot = RobotUartController(no_music_chat_args)
+    original_speak_reply_and_wait = globals()["speak_reply_and_wait"]
+
+    def fake_speak_reply_and_wait(
+        response: dict[str, Any],
+        args: argparse.Namespace,
+        *,
+        on_playback_start: Callable[[], None] | None = None,
+    ) -> bool:
+        del args, on_playback_start
+        response["_client_tts_attempted"] = True
+        response["_client_tts_ok"] = True
+        return True
+
+    try:
+        globals()["speak_reply_and_wait"] = fake_speak_reply_and_wait
+        if not handle_wake_chat_response(
+            {
+                "transcript": "想一個爛笑話",
+                "reply": "好，這是一個測試笑話。",
+                "control": {
+                    "persistent_state": "unchanged",
+                    "screen_mode": "unchanged",
+                    "emotion": "happy",
+                    "head_motion": "none",
+                    "reason": "self-test no music route",
+                },
+            },
+            no_music_chat_args,
+            no_music_chat_robot,
+            None,
+            None,
+            None,
+            None,
+        ):
+            raise AssertionError("plain no-music chat response should complete")
+    finally:
+        globals()["speak_reply_and_wait"] = original_speak_reply_and_wait
     if motor_ack_problem("MotorPitch", 90, ["Motor Pitch = 90"]):
         raise AssertionError("valid MotorPitch ACK should not trip safety")
     if not motor_ack_problem("MotorPitch", 90, ["Motor Pitch = 537190203"]):
@@ -9099,6 +9746,48 @@ def run_self_test() -> int:
     stale_thread.join(timeout=2.0)
     if stale_thread.is_alive():
         raise AssertionError("unstarted playback cue stop should clear stale speaking motion")
+    music_thread, music_stop = robot.start_music_head_motion("music_groove", check_playback=False)
+    if music_thread is None or music_stop is None:
+        raise AssertionError("music head motion should start in dry-run self-test")
+    time.sleep(0.05)
+    robot.stop_music_head_motion(music_thread, music_stop, reason="music head motion self-test stop")
+    if music_thread.is_alive():
+        raise AssertionError("music head motion thread did not stop in self-test")
+    if robot._active_music_thread is not None or robot._active_music_stop is not None:
+        raise AssertionError("stopped music motion should not remain active")
+    if not music_result_should_start_motion("play", {"ok": True, "action": "play", "backend": "mpv"}, dry_args):
+        raise AssertionError("successful music play should start music motion")
+    if music_result_should_start_motion("resume", {"ok": True, "action": "resume", "resumed": False}, dry_args):
+        raise AssertionError("failed music resume should not start music motion")
+    music_args = argparse.Namespace(
+        conversation_mode=True,
+        end_conversation_after_music_control=False,
+        keep_conversation_after_music_control=False,
+        no_music=False,
+        music_dry_run=False,
+        music_backend="mpv",
+    )
+    music_response = {"music": {"action": "play", "intent": True, "ok": True, "backend": "mpv"}}
+    if conversation_music_end_action(music_response, music_args) != "play":
+        raise AssertionError("successful music play should end conversation mode by default")
+    if conversation_music_end_action(music_response, argparse.Namespace(**{**vars(music_args), "keep_conversation_after_music_control": True})):
+        raise AssertionError("keep-conversation flag should keep follow-up open after music play")
+    failed_music_response = {"music": {"action": "play", "intent": True, "ok": True, "backend": "mpv", "playback_ready": False}}
+    if conversation_music_end_action(failed_music_response, music_args):
+        raise AssertionError("failed music playback should not end conversation mode")
+    pause_music_response = {"music": {"action": "pause", "intent": True, "ok": True, "handled": True, "paused": True}}
+    if conversation_music_end_action(pause_music_response, music_args):
+        raise AssertionError("music pause should not end conversation mode by default")
+    if not conversation_music_end_action(
+        pause_music_response,
+        argparse.Namespace(**{**vars(music_args), "end_conversation_after_music_control": True}),
+    ):
+        raise AssertionError("music pause should end conversation mode when explicitly requested")
+    if not conversation_music_end_action(
+        music_response,
+        argparse.Namespace(**{**vars(music_args), "end_conversation_after_music_control": True}),
+    ):
+        raise AssertionError("music play should still end conversation mode when explicitly requested")
 
     queue_url = tts_queue_url("http://127.0.0.1:8777/speak_async")
     if queue_url != "http://127.0.0.1:8777/queue":
@@ -9168,20 +9857,28 @@ def run_self_test() -> int:
     if detect_focus_mode_intent("結束工作，切回一般模式") != "stop":
         raise AssertionError("focus stop intent detection failed")
     conv_args = argparse.Namespace(conversation_mode=True)
-    if not should_end_conversation_after_focus_turn(
+    if should_end_conversation_after_focus_turn(
         conv_args,
         focus_intent="start",
         focus_was_running=False,
         focus_is_running=True,
     ):
-        raise AssertionError("focus start should end conversation follow-up mode")
+        raise AssertionError("focus start should not end conversation follow-up mode by default")
+    conv_end_focus_args = argparse.Namespace(conversation_mode=True, end_conversation_after_focus_control=True)
     if not should_end_conversation_after_focus_turn(
-        conv_args,
+        conv_end_focus_args,
+        focus_intent="start",
+        focus_was_running=False,
+        focus_is_running=True,
+    ):
+        raise AssertionError("focus start should end conversation follow-up mode when explicitly requested")
+    if not should_end_conversation_after_focus_turn(
+        conv_end_focus_args,
         focus_intent=None,
         focus_was_running=True,
         focus_is_running=True,
     ):
-        raise AssertionError("active focus mode should end conversation follow-up mode")
+        raise AssertionError("active focus mode should end conversation follow-up mode when explicitly requested")
     if should_end_conversation_after_focus_turn(
         argparse.Namespace(conversation_mode=False),
         focus_intent="start",
@@ -9530,17 +10227,25 @@ def restore_after_conversation_end(
     robot: RobotUartController,
     timing: TimingLogger | None,
 ) -> None:
-    robot.set_screen_mode("normal", reason="conversation ended")
+    robot.set_screen_mode("normal", reason="conversation ended", force=True, retry_after_recovery=True)
     if timing is not None:
         timing.mark("conversation ended; Normal restored")
 
 
 def conversation_music_end_action(response: dict[str, Any], args: argparse.Namespace) -> str:
-    if not getattr(args, "conversation_mode", False) or getattr(args, "keep_conversation_after_music_control", False):
+    if not getattr(args, "conversation_mode", False):
+        return ""
+    if getattr(args, "keep_conversation_after_music_control", False):
         return ""
     music_route = response.get("music") if isinstance(response.get("music"), dict) else {}
     action = str(music_route.get("action", "none") or "none").strip().lower()
-    if action not in {"play", "resume", "pause", "stop"}:
+    if action not in {"play", "resume", "pause", "stop", "volume"}:
+        return ""
+    if music_result_has_playback(action, music_route, args):
+        return action
+    if not getattr(args, "end_conversation_after_music_control", False):
+        return ""
+    if action not in {"pause", "stop", "volume"}:
         return ""
     if not (music_route.get("intent") or music_route.get("should_call") or music_route.get("handled") or music_route.get("ok")):
         return ""
@@ -9550,10 +10255,26 @@ def conversation_music_end_action(response: dict[str, Any], args: argparse.Names
 def conversation_should_end_after_sleep_control(response: dict[str, Any], args: argparse.Namespace) -> bool:
     if not getattr(args, "conversation_mode", False):
         return False
+    if not getattr(args, "end_conversation_on_sleep_control", False):
+        return False
     control = response.get("control") if isinstance(response.get("control"), dict) else {}
     persistent_state = str(control.get("persistent_state", "") or "").strip().lower()
     screen_mode = str(control.get("screen_mode", "") or "").strip().lower()
     return persistent_state == "sleep" or screen_mode == "sleep"
+
+
+def conversation_followup_listen_timeout(
+    args: argparse.Namespace,
+    *,
+    last_activity_at: float,
+    now: float | None = None,
+) -> float:
+    reference = time.monotonic() if now is None else float(now)
+    session_idle_timeout = float(getattr(args, "session_idle_timeout", 0.0) or 0.0)
+    if session_idle_timeout > 0.0:
+        idle_sec = max(0.0, reference - float(last_activity_at))
+        return max(0.0, session_idle_timeout - idle_sec)
+    return max(0.0, float(getattr(args, "turn_listen_timeout", 0.0) or 0.0))
 
 
 def set_post_reply_screen(
@@ -9577,32 +10298,38 @@ def set_post_reply_screen(
             timing.mark(label)
 
     if music_action in {"play", "resume"}:
-        robot.set_screen_mode("music", reason=f"{reason}; music {music_action}")
+        robot.set_screen_mode("music", reason=f"{reason}; music {music_action}", force=True, retry_after_recovery=True)
         mark_uart("UART Music sent")
         return
     if music_action in {"pause", "stop"}:
-        robot.set_screen_mode("normal", reason=f"{reason}; music {music_action}")
+        robot.stop_active_music_head_motion(reason=f"{reason}; music {music_action}")
+        robot.set_screen_mode("normal", reason=f"{reason}; music {music_action}", force=True, retry_after_recovery=True)
         mark_uart("UART Normal sent after music stop/pause")
         return
     if focus_stopped:
-        robot.set_screen_mode("normal", reason=f"{reason}; focus stopped")
+        robot.set_screen_mode("normal", reason=f"{reason}; focus stopped", force=True, retry_after_recovery=True)
         mark_uart("UART Normal sent after focus stop")
         return
     if focus_running:
-        robot.set_screen_mode("focus", reason=f"{reason}; focus running")
+        robot.set_screen_mode("focus", reason=f"{reason}; focus running", force=True, retry_after_recovery=True)
         mark_uart("UART Focus sent")
         return
     if screen_mode in {"normal", "sleep", "music", "focus"}:
-        robot.set_screen_mode(screen_mode, reason=f"{reason}; control screen_mode")
+        robot.set_screen_mode(screen_mode, reason=f"{reason}; control screen_mode", force=True, retry_after_recovery=True)
         mark_uart(f"UART {SCREEN_MODE_TO_COMMAND.get(screen_mode, screen_mode)} sent")
         return
     if persistent_state in {"normal", "sleep"}:
-        robot.set_screen_mode(persistent_state, reason=f"{reason}; persistent_state")
+        robot.set_screen_mode(persistent_state, reason=f"{reason}; persistent_state", force=True, retry_after_recovery=True)
         mark_uart(f"UART {SCREEN_MODE_TO_COMMAND.get(persistent_state, persistent_state)} sent")
         return
     if getattr(args, "conversation_mode", False):
-        robot.set_screen_mode("thinking", reason=f"{reason}; waiting for follow-up")
-        mark_uart("UART Thinking sent for follow-up")
+        robot.set_screen_mode(
+            "normal",
+            reason=f"{reason}; waiting before follow-up listen",
+            force=True,
+            retry_after_recovery=True,
+        )
+        mark_uart("UART Normal sent before follow-up listen")
         return
 
     robot.restore_persistent_screen_state()
@@ -9662,6 +10389,53 @@ def music_control_reply(action: str, result: dict[str, Any] | None) -> str:
             return "好，我調整音量了。"
         return "我想調整音量，但音樂播放器目前沒有回應。"
     return "音樂控制已處理。"
+
+
+def music_result_should_start_motion(action: str, result: dict[str, Any] | None, args: argparse.Namespace) -> bool:
+    if getattr(args, "no_music", False) or getattr(args, "music_dry_run", False):
+        return False
+    if getattr(args, "no_music_head_motion", False):
+        return False
+    return music_result_has_playback(action, result, args)
+
+
+def music_result_has_playback(action: str, result: dict[str, Any] | None, args: argparse.Namespace) -> bool:
+    action = str(action or "").strip().lower()
+    result = result or {}
+    if action not in {"play", "resume"} or not bool(result.get("ok", False)):
+        return False
+    if action == "resume" and result.get("resumed") is False:
+        return False
+    backend = str(result.get("backend") or result.get("last_backend") or resolve_music_backend(args)).strip().lower()
+    if backend == "mpv" and result.get("playback_ready") is False:
+        return False
+    return True
+
+
+def music_motion_should_health_check(result: dict[str, Any] | None, args: argparse.Namespace) -> bool:
+    if getattr(args, "uart_dry_run", False):
+        return False
+    result = result or {}
+    backend = str(result.get("backend") or result.get("last_backend") or resolve_music_backend(args)).strip().lower()
+    return backend == "mpv" and float(getattr(args, "music_motion_health_interval", MUSIC_MOTION_HEALTH_INTERVAL_SEC) or 0.0) > 0.0
+
+
+def start_music_motion_after_route(
+    args: argparse.Namespace,
+    robot: RobotUartController,
+    result: dict[str, Any] | None,
+    *,
+    action: str,
+    timing: TimingLogger | None = None,
+) -> None:
+    if not music_result_should_start_motion(action, result, args):
+        robot.stop_active_music_head_motion(reason=f"music {action or 'none'} did not start playback")
+        return
+    motion = str(getattr(args, "music_head_motion", MUSIC_HEAD_MOTION_DEFAULT) or MUSIC_HEAD_MOTION_DEFAULT).strip()
+    check_playback = music_motion_should_health_check(result, args)
+    robot.start_music_head_motion(motion, check_playback=check_playback)
+    if timing is not None and not getattr(args, "no_uart", False):
+        timing.mark("music head motion loop started")
 
 
 def emotion_summary_from_control(control: dict[str, str]) -> dict[str, Any]:
@@ -9960,7 +10734,10 @@ def handle_esp32_ble_response(
         reason="local ESP32-S3 BLE control",
     )
     response["esp32_ble"] = result
-    response["_end_conversation_after_esp32_ble"] = bool(getattr(args, "conversation_mode", False))
+    response["_end_conversation_after_esp32_ble"] = bool(
+        getattr(args, "conversation_mode", False)
+        and getattr(args, "end_conversation_after_esp32_control", False)
+    )
 
     if getattr(args, "quiet_dialog", False):
         print_quiet_turn_summary(response)
@@ -10075,6 +10852,8 @@ def handle_wake_chat_response(
         music_before_result = execute_music_route(music_route, args, response, phase="before_tts")
         send_music_uart_update(args, robot, music_before_result, reason=f"music {music_route.get('action')} dashboard")
         action = str(music_route.get("action", "") or "")
+        if action in {"stop", "pause"}:
+            robot.stop_active_music_head_motion(reason=f"music {action} command")
         control = apply_local_control_reply(
             response,
             music_control_reply(action, music_before_result),
@@ -10135,21 +10914,32 @@ def handle_wake_chat_response(
     if timing is not None:
         timing.mark("TTS finished or estimated finished")
 
+    music_after_result: dict[str, Any] | None = None
     if music_route.get("action") in {"play", "resume"}:
         music_after_result = execute_music_route(music_route, args, response, phase="after_tts")
         send_music_uart_update(args, robot, music_after_result, reason=f"music {music_route.get('action')} dashboard")
         if timing is not None:
             timing.mark("music triggered")
 
+    music_action = str(music_route.get("action", "") or "")
+    post_reply_music_action = music_action if music_result_has_playback(music_action, music_after_result, args) else ""
     set_post_reply_screen(
         args,
         robot,
         timing,
         control=control,
-        music_action=str(music_route.get("action", "") or ""),
+        music_action=post_reply_music_action,
         focus_running=focus_manager.is_running() if focus_manager is not None else False,
         reason="chat reply complete",
     )
+    if music_route.get("action") in {"play", "resume"}:
+        start_music_motion_after_route(
+            args,
+            robot,
+            music_after_result,
+            action=str(music_route.get("action", "") or ""),
+            timing=timing,
+        )
     if focus_gate_closed_for_turn and focus_manager is not None and focus_manager.is_running():
         focus_manager.open_uart_gate()
     return tts_ok or not getattr(args, "require_tts", False)
@@ -10169,7 +10959,7 @@ def run_wake_text_mode(args: argparse.Namespace) -> int:
     try:
         print(f"POST text to {text_url}")
         if not getattr(args, "no_uart", False):
-            if robot.set_screen_state("Thinking"):
+            if robot.set_screen_state("Thinking", reason="text mode input", force=True):
                 print("UART Thinking sent.")
             else:
                 print("WARNING: UART Thinking not sent; FRDM UART is unavailable.")
@@ -10246,7 +11036,23 @@ def run_head_motion_test(args: argparse.Namespace) -> int:
             emotions = [requested_emotion]
         motion_plan = [(f"emotion:{emotion}", head_motion_for_emotion(emotion)) for emotion in emotions]
     elif requested_motion == "all":
-        motion_plan = [(motion, motion) for motion in ["nod", "double_nod", "look_around", "shake", "gentle_nod", "sleepy_drop", "none"]]
+        motion_order = [
+            "nod",
+            "double_nod",
+            "look_around",
+            "shake",
+            "gentle_nod",
+            "sleepy_drop",
+            "happy_bounce",
+            "excited_bounce",
+            "curious_peek",
+            "concerned_tilt",
+            "sad_droop",
+            "confused_tilt",
+            "firm_shake",
+            "none",
+        ]
+        motion_plan = [(motion, motion) for motion in motion_order]
     else:
         motion_plan = [(requested_motion, requested_motion)]
 
@@ -10299,7 +11105,7 @@ def run_head_motion_test(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print()
         print("Head motion test interrupted; sending reset.")
-        robot.reset_head_position(reason="head_motion test interrupt reset")
+        robot.reset_head_position(reason="head_motion test interrupt reset", force=True)
         return 130
 
 
@@ -10491,6 +11297,7 @@ def send_and_handle_audio_turn(
                 voice_chat.print_result(response, verbose_debug=args.debug)
                 response_vision_summary(response)
             print(f"Conversation end keyword detected ({end_keyword}); returning to Normal and wake-only standby.")
+            clear_local_ai_memory_for_conversation_end(args, reason=f"end_keyword:{end_keyword}")
             if getattr(args, "speak_end_reply", False):
                 ok = handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager, esp32_ble_manager)
                 restore_after_conversation_end(args, robot, timing)
@@ -10503,7 +11310,11 @@ def send_and_handle_audio_turn(
             return True, True
 
         ok = handle_wake_chat_response(response, args, robot, timing, focus_manager, todo_manager, esp32_ble_manager)
-        if getattr(args, "conversation_mode", False) and response.get("_end_conversation_after_esp32_ble"):
+        if (
+            getattr(args, "conversation_mode", False)
+            and getattr(args, "end_conversation_after_esp32_control", False)
+            and response.get("_end_conversation_after_esp32_ble")
+        ):
             print("ESP32-S3 BLE control command handled; returning to wake-only standby.")
             recorder.reset_wake()
             return ok, True
@@ -10529,7 +11340,11 @@ def send_and_handle_audio_turn(
             recorder.reset_wake()
             post_music_standby_cooldown(args, music_end_action)
             return ok, True
-        if getattr(args, "conversation_mode", False) and response.get("_client_tts_ok") is False:
+        if (
+            getattr(args, "conversation_mode", False)
+            and getattr(args, "end_conversation_on_tts_failure", False)
+            and response.get("_client_tts_ok") is False
+        ):
             tts_error = str(response.get("_client_tts_error", "") or "").strip()
             detail = f" ({tts_error})" if tts_error else ""
             print(
@@ -10537,11 +11352,18 @@ def send_and_handle_audio_turn(
                 f"{detail}; ending conversation follow-up so the next command requires Hey Jarvis."
             )
             if focus_manager is not None and focus_manager.is_running():
-                robot.set_screen_mode("focus", reason="TTS failed; focus still running")
+                robot.set_screen_mode("focus", reason="TTS failed; focus still running", force=True)
             else:
                 robot.restore_persistent_screen_state()
             recorder.reset_wake()
             return ok, True
+        if getattr(args, "conversation_mode", False) and response.get("_client_tts_ok") is False:
+            tts_error = str(response.get("_client_tts_error", "") or "").strip()
+            detail = f" ({tts_error})" if tts_error else ""
+            print(
+                "TTS failed during this reply"
+                f"{detail}; keeping conversation follow-up active."
+            )
         return ok, False
     finally:
         if wav_path is not None:
@@ -10747,10 +11569,11 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     if args.conversation_mode:
         print(
             "Conversation mode: enabled, "
-            f"turn_timeout={args.turn_listen_timeout:g}s, "
-            f"idle_timeout={args.session_idle_timeout:g}s, "
+            f"first_followup_timeout={args.turn_listen_timeout:g}s, "
+            f"no_audio_idle_timeout={args.session_idle_timeout:g}s, "
             f"max_turns={args.max_session_turns}, "
-            f"quiet_dialog={args.quiet_dialog}"
+            f"quiet_dialog={args.quiet_dialog}, "
+            "auto_end=bye_or_idle"
         )
         print("After an end phrase, wake-only standby is restored and normal speech is ignored until Hey Jarvis.")
     else:
@@ -10849,7 +11672,8 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
             f"wake_guard={f'threshold={args.music_wake_threshold:g}/confirm={args.music_wake_confirm_chunks}' if (args.music_wake_guard and not args.no_music_wake_guard) else 'off'}, "
             f"beep_settle={args.music_wake_beep_settle:g}s, "
             f"wake_gate_reset={args.music_reset_recording_gate_on_wake}, "
-            f"post_music_cooldown={args.post_music_standby_cooldown:g}s"
+            f"post_music_cooldown={args.post_music_standby_cooldown:g}s, "
+            f"head_motion={'off' if args.no_music_head_motion else args.music_head_motion}"
         )
     print(f"Music tool: {music_desc}")
     startup_time = "off" if args.no_startup_time or args.no_uart else "on"
@@ -10911,6 +11735,8 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
         f"step_delay={robot.motor_step_delay():g}s, "
         f"speaking_step_delay={robot.motor_speaking_step_delay():g}s, "
         f"speaking_smooth_step={robot.motor_speaking_smooth_step_deg()}deg, "
+        f"music_step_delay={robot.motor_music_step_delay():g}s, "
+        f"music_smooth_step={robot.motor_music_smooth_step_deg()}deg, "
         f"reset_repeats={robot.motor_reset_repeats()}, "
         f"reset_delay={robot.motor_reset_delay():g}s, "
         f"read_ms={robot.motor_read_ms()}, "
@@ -10943,7 +11769,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
     send_startup_time_update(args, robot)
     send_startup_weather_update(args, robot)
     send_startup_dashboard_updates(args, robot, todo_manager=todo_manager, camera_manager=camera_manager)
-    robot.set_screen_mode("normal", reason="startup boot screen complete")
+    robot.set_screen_mode("normal", reason="startup boot screen complete", force=True)
     if pet_idle_manager is not None:
         pet_idle_manager.start()
     print("Press Ctrl+C to quit.")
@@ -10993,19 +11819,15 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                     max_session_turns = max(1, int(args.max_session_turns or 1))
                     if max_session_turns <= 1:
                         print("Max conversation turns reached (1); returning to wake-only standby.")
-                        robot.set_screen_mode("normal", reason="conversation max turns reached")
+                        robot.set_screen_mode("normal", reason="conversation max turns reached", force=True)
                         print("Wake-only standby restored. Say Hey Jarvis before speaking again.")
                         continue
 
                     for turn_index in range(2, max_session_turns + 1):
-                        idle_sec = time.monotonic() - last_activity_at
-                        remaining_idle = max(0.0, float(args.session_idle_timeout or 0.0) - idle_sec)
-                        followup_timeout = args.turn_listen_timeout
-                        if args.session_idle_timeout > 0:
-                            followup_timeout = min(float(args.turn_listen_timeout), remaining_idle)
+                        followup_timeout = conversation_followup_listen_timeout(args, last_activity_at=last_activity_at)
                         if followup_timeout <= 0:
                             print("Conversation idle timeout reached; returning to wake-only standby.")
-                            robot.set_screen_mode("normal", reason="conversation idle timeout")
+                            robot.set_screen_mode("normal", reason="conversation idle timeout", force=True)
                             break
 
                         followup_context = build_conversation_turn_context(
@@ -11028,7 +11850,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                         )
                         if followup_audio is None:
                             print(f"No follow-up send: {followup_meta.get('reason', 'unknown')}.")
-                            robot.set_screen_mode("normal", reason="conversation follow-up timeout")
+                            robot.set_screen_mode("normal", reason="conversation follow-up timeout", force=True)
                             break
                         followup_meta["wake_context"] = followup_context
 
@@ -11054,7 +11876,7 @@ def run_wake_voice_loop(args: argparse.Namespace) -> int:
                             break
                     else:
                         print(f"Max conversation turns reached ({args.max_session_turns}); returning to wake-only standby.")
-                        robot.set_screen_mode("normal", reason="conversation max turns reached")
+                        robot.set_screen_mode("normal", reason="conversation max turns reached", force=True)
 
                     print("Wake-only standby restored. Say Hey Jarvis before speaking again.")
                 finally:
@@ -11220,8 +12042,18 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help="After one Hey Jarvis wake, keep listening for follow-up turns until an end phrase or timeout.",
     )
-    conversation_group.add_argument("--turn-listen-timeout", type=float, default=_env_float("TURN_LISTEN_TIMEOUT", 6.0))
-    conversation_group.add_argument("--session-idle-timeout", type=float, default=_env_float("SESSION_IDLE_TIMEOUT", 24.0))
+    conversation_group.add_argument(
+        "--turn-listen-timeout",
+        type=float,
+        default=_env_float("TURN_LISTEN_TIMEOUT", 6.0),
+        help="Fallback follow-up listening timeout when --session-idle-timeout is 0.",
+    )
+    conversation_group.add_argument(
+        "--session-idle-timeout",
+        type=float,
+        default=_env_float("SESSION_IDLE_TIMEOUT", 24.0),
+        help="Seconds with no follow-up speech before returning to wake-only standby.",
+    )
     conversation_group.add_argument("--max-session-turns", type=int, default=_env_int("MAX_SESSION_TURNS", 20))
     conversation_group.add_argument(
         "--quiet-dialog",
@@ -11261,7 +12093,32 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     conversation_group.add_argument(
         "--keep-conversation-after-music-control",
         action="store_true",
-        help="Do not auto-end conversation mode after play/pause/stop/resume music commands.",
+        help="Keep conversation follow-up open after successful play/resume music commands.",
+    )
+    conversation_group.add_argument(
+        "--end-conversation-after-music-control",
+        action="store_true",
+        help="Also return to wake-only standby after pause/stop/volume music commands.",
+    )
+    conversation_group.add_argument(
+        "--end-conversation-on-sleep-control",
+        action="store_true",
+        help="Old behavior: return to wake-only standby when model control asks for sleep mode.",
+    )
+    conversation_group.add_argument(
+        "--end-conversation-after-focus-control",
+        action="store_true",
+        help="Old behavior: return to wake-only standby after focus-mode turns.",
+    )
+    conversation_group.add_argument(
+        "--end-conversation-after-esp32-control",
+        action="store_true",
+        help="Old behavior: return to wake-only standby after ESP32 fan/LED commands.",
+    )
+    conversation_group.add_argument(
+        "--end-conversation-on-tts-failure",
+        action="store_true",
+        help="Old behavior: return to wake-only standby if a TTS reply fails.",
     )
     conversation_group.add_argument(
         "--turbo-response",
@@ -11499,6 +12356,19 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     music_group.add_argument("--music-debug", action="store_true", help="Print music routing details even when no music intent was detected.")
     music_group.add_argument("--no-music-autostart", action="store_true", help="Do not auto-start the local music sidecar when /music is unreachable.")
     music_group.add_argument("--no-music-pause-on-wake", action="store_true", help="Do not pause active music as soon as Hey Jarvis is detected.")
+    music_group.add_argument(
+        "--music-head-motion",
+        choices=sorted(VALID_MUSIC_HEAD_MOTIONS),
+        default=os.getenv("MUSIC_HEAD_MOTION", MUSIC_HEAD_MOTION_DEFAULT),
+        help="Head-motion loop to keep sending while music is playing. Use off to disable.",
+    )
+    music_group.add_argument("--no-music-head-motion", action="store_true", help="Do not run a continuous servo motion loop during music playback.")
+    music_group.add_argument(
+        "--music-motion-health-interval",
+        type=float,
+        default=_env_float("MUSIC_MOTION_HEALTH_INTERVAL", MUSIC_MOTION_HEALTH_INTERVAL_SEC),
+        help="Seconds between mpv /health checks while music head motion is running. Set 0 to stop only on commands/wake.",
+    )
     weather_group = parser.add_argument_group("weather tool routing")
     weather_group.add_argument("--no-weather", action="store_true", help="Disable local weather routing through the Music Web Player sidecar.")
     weather_group.add_argument("--weather-url", default=os.getenv("WEATHER_TOOL_URL", DEFAULT_WEATHER_TOOL_URL), help="Local tool /weather endpoint.")
@@ -11662,6 +12532,18 @@ def add_wake_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=_env_int("MOTOR_SPEAKING_SMOOTH_STEP_DEG", MOTOR_SPEAKING_SMOOTH_STEP_DEG),
         help="Maximum degrees per interpolated motor step during TTS speaking loops. Larger values mean clearer target-to-target moves.",
+    )
+    motor_group.add_argument(
+        "--motor-music-step-delay",
+        type=float,
+        default=_env_float("MOTOR_MUSIC_STEP_DELAY_SEC", MOTOR_MUSIC_STEP_DELAY_SEC),
+        help="Base seconds to hold each head-motion step while music is playing.",
+    )
+    motor_group.add_argument(
+        "--motor-music-smooth-step-deg",
+        type=int,
+        default=_env_int("MOTOR_MUSIC_SMOOTH_STEP_DEG", MOTOR_MUSIC_SMOOTH_STEP_DEG),
+        help="Maximum degrees per interpolated motor step during music playback loops.",
     )
     motor_group.add_argument(
         "--motor-stop-timeout",
@@ -11929,6 +12811,9 @@ def validate_runtime_args(args: argparse.Namespace) -> bool:
         return False
     if float(getattr(args, "music_wake_health_interval", 0.0) or 0.0) <= 0.0:
         print("ERROR: --music-wake-health-interval must be > 0.")
+        return False
+    if float(getattr(args, "music_motion_health_interval", 0.0) or 0.0) < 0.0:
+        print("ERROR: --music-motion-health-interval must be >= 0.")
         return False
     if int(getattr(args, "music_mpv_volume", 100) or 0) < 0:
         print("ERROR: --music-mpv-volume must be >= 0.")

@@ -52,7 +52,7 @@ def load_prompt(relative_path: str) -> str:
 
 
 def parse_json_object(raw_text: str) -> dict[str, Any]:
-    text = raw_text.strip()
+    text = strip_model_wrappers(raw_text)
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
@@ -60,16 +60,81 @@ def parse_json_object(raw_text: str) -> dict[str, Any]:
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            raise DecisionValidationError("No JSON object found in model output")
-        value = json.loads(match.group(0))
+        value = decode_first_json_object(text)
 
     if not isinstance(value, dict):
         raise DecisionValidationError("Model output must be a JSON object")
     return value
 
 
+def strip_model_wrappers(raw_text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", str(raw_text or ""), flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"^\s*/?no_think\s*", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def decode_first_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        candidate = text[match.start() :]
+        try:
+            value, _end = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            repaired = repair_truncated_json(candidate)
+            if not repaired:
+                continue
+            try:
+                value = json.loads(repaired)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(value, dict):
+            return value
+    raise DecisionValidationError("No JSON object found in model output")
+
+
+def repair_truncated_json(text: str) -> str:
+    start = text.find("{")
+    if start < 0:
+        return ""
+    candidate = text[start:].strip()
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    last_index = -1
+
+    for index, char in enumerate(candidate):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char in "{[":
+            stack.append("}" if char == "{" else "]")
+            last_index = index
+        elif char in "}]":
+            if not stack or stack[-1] != char:
+                break
+            stack.pop()
+            last_index = index
+            if not stack:
+                return candidate[: index + 1]
+        elif stack:
+            last_index = index
+
+    if last_index < 0:
+        return ""
+    repaired = candidate[: last_index + 1].rstrip()
+    if in_string:
+        repaired += '"'
+    repaired += "".join(reversed(stack))
+    return repaired
+
+
 def retry_count(config: dict[str, Any]) -> int:
     return int(config.get("ai", {}).get("retry_invalid_json_count", 1))
-

@@ -87,6 +87,65 @@ class AudioPlayer:
             return str(path) if path.exists() and os.access(path, os.X_OK) else None
         return shutil.which(self.aplay_bin)
 
+    def _busy_retries(self) -> int:
+        try:
+            return max(0, int(os.getenv("APLAY_BUSY_RETRIES", "5")))
+        except ValueError:
+            return 5
+
+    def _busy_retry_delay(self) -> float:
+        try:
+            return max(0.02, float(os.getenv("APLAY_BUSY_RETRY_DELAY", "0.18")))
+        except ValueError:
+            return 0.18
+
+    def _startup_grace(self) -> float:
+        try:
+            return max(0.0, float(os.getenv("APLAY_STARTUP_GRACE", "0.06")))
+        except ValueError:
+            return 0.06
+
+    @staticmethod
+    def _looks_device_busy(error: str) -> bool:
+        lowered = str(error or "").lower()
+        return "device or resource busy" in lowered or "resource busy" in lowered
+
+    def _start_aplay_process(
+        self,
+        command: list[str],
+        *,
+        stdin: int | None = None,
+        require_running: bool = False,
+    ) -> tuple[subprocess.Popen[bytes], int]:
+        attempts = self._busy_retries() + 1
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            process = subprocess.Popen(
+                command,
+                stdin=stdin,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            grace = self._startup_grace()
+            if grace > 0:
+                time.sleep(grace)
+            returncode = process.poll()
+            if returncode is None or (returncode == 0 and not require_running):
+                return process, attempt
+
+            _stdout, stderr = process.communicate()
+            error = stderr.decode("utf-8", errors="replace").strip()
+            last_error = error
+            if self._looks_device_busy(error) and attempt < attempts:
+                delay = self._busy_retry_delay() * attempt
+                logger.warning("aplay device busy on attempt %d/%d; retrying in %.2fs", attempt, attempts, delay)
+                time.sleep(delay)
+                continue
+            raise AudioPlaybackError(f"aplay failed with code {returncode}: {error}")
+
+        raise AudioPlaybackError(f"aplay failed after {attempts} attempts: {last_error}")
+
     def _aplay_devices(self) -> list[tuple[str, str]]:
         aplay_path = self.aplay_path
         if not aplay_path:
@@ -139,6 +198,24 @@ class AudioPlayer:
                     return name
         return matches[0]
 
+    def _pulse_default_sink_matches_keyword(self, keyword: str) -> bool:
+        lowered = keyword.strip().lower()
+        if not lowered or not shutil.which("pactl") or not self._device_available("pulse"):
+            return False
+        try:
+            result = subprocess.run(
+                ["pactl", "get-default-sink"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+        except Exception:
+            return False
+        if result.returncode != 0:
+            return False
+        return lowered in result.stdout.strip().lower()
+
     def _auto_keyword(self, device: str) -> str | None:
         lowered = device.lower()
         for prefix in ("auto:", "keyword:"):
@@ -157,6 +234,8 @@ class AudioPlayer:
             return None
         keyword = self._auto_keyword(device)
         if device.lower().startswith(("auto:", "keyword:")):
+            if self._pulse_default_sink_matches_keyword(keyword or ""):
+                return "pulse"
             found = self._find_device_by_keyword(keyword or "")
             if found:
                 return found
@@ -213,12 +292,12 @@ class AudioPlayer:
         command.append(str(playback_path))
 
         started = time.perf_counter()
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        try:
+            process, aplay_attempts = self._start_aplay_process(command, require_running=False)
+        except Exception:
+            if temp_playback_path is not None:
+                temp_playback_path.unlink(missing_ok=True)
+            raise
         with self._lock:
             self._current_process = process
             self._current_processes = [process]
@@ -229,6 +308,7 @@ class AudioPlayer:
                 "wav": str(path),
                 "blocking": False,
                 "pid": process.pid,
+                "aplay_start_attempts": aplay_attempts,
                 "started_ms": int((time.perf_counter() - started) * 1000),
             }
 
@@ -250,7 +330,13 @@ class AudioPlayer:
             raise AudioPlaybackError(f"aplay failed with code {process.returncode}: {error}")
 
         logger.info("played %s in %d ms", path, elapsed_ms)
-        return {"wav": str(path), "blocking": True, "elapsed_ms": elapsed_ms, "volume_gain": gain}
+        return {
+            "wav": str(path),
+            "blocking": True,
+            "elapsed_ms": elapsed_ms,
+            "volume_gain": gain,
+            "aplay_start_attempts": aplay_attempts,
+        }
 
     def play_raw_from_command(
         self,
@@ -290,12 +376,10 @@ class AudioPlayer:
         gain = _normalize_volume_gain(volume_gain)
         use_gain = gain != 1.0
 
-        aplay_process = subprocess.Popen(
+        aplay_process, aplay_attempts = self._start_aplay_process(
             aplay_command,
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+            require_running=True,
         )
         producer_process = subprocess.Popen(
             producer_command,
@@ -361,6 +445,7 @@ class AudioPlayer:
             "channels": channels,
             "format": sample_format,
             "volume_gain": gain,
+            "aplay_start_attempts": aplay_attempts,
         }
 
     def play_raw_chunks(
@@ -417,12 +502,10 @@ class AudioPlayer:
                 "bytes_written": 0,
             }
 
-        process = subprocess.Popen(
+        process, aplay_attempts = self._start_aplay_process(
             command,
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+            require_running=True,
         )
         with self._lock:
             self._current_process = process
@@ -466,6 +549,7 @@ class AudioPlayer:
             "format": sample_format,
             "bytes_written": bytes_written,
             "volume_gain": gain,
+            "aplay_start_attempts": aplay_attempts,
         }
 
     def stop(self) -> bool:

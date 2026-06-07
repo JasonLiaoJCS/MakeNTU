@@ -505,7 +505,14 @@ def add_uart_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    return add_uart_args(voice_chat.build_arg_parser())
+    parser = add_uart_args(voice_chat.build_arg_parser())
+    try:
+        from . import server_config  # type: ignore
+    except Exception:
+        import server_config  # type: ignore
+
+    parser.set_defaults(server_url=server_config.DEFAULT_SERVER_URL)
+    return parser
 
 
 def main() -> int:

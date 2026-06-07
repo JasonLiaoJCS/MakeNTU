@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT_DIR="/home/asrlab-yian/MakeNTU"
 VENV_DIR="$ROOT_DIR/emotion_robot_controller/.venv"
 
-SERVER_URL="${SERVER_URL:-http://100.108.141.26:8766/voice-chat}"
-FOCUS_SERVER_URL="${FOCUS_SERVER_URL:-http://100.108.141.26:8766/focus-check}"
+SERVER_URL="${SERVER_URL:-http://192.168.1.127:8766/voice-chat}"
+FOCUS_SERVER_URL="${FOCUS_SERVER_URL:-http://192.168.1.127:8766/focus-check}"
 DEVICE_READY_TIMEOUT="${DEVICE_READY_TIMEOUT:-30}"
 TTS_VOLUME_GAIN="${WAKE_TTS_VOLUME_GAIN:-${PIPELINE_TTS_VOLUME_GAIN:-3.6}}"
 MUSIC_MPV_AUDIO_DEVICE="${MUSIC_MPV_AUDIO_DEVICE:-auto}"
@@ -140,7 +140,7 @@ cmd=(
   --recording-progress-interval 1.0
   --conversation-mode
   --turn-listen-timeout 8
-  --session-idle-timeout 30
+  --session-idle-timeout 10
   --max-session-turns 20
   --camera-id auto
   --camera-width 320
