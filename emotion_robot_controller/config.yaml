@@ -18,8 +18,8 @@ serial:
 ai:
   backend: ollama
   ollama:
-    base_url: http://100.108.141.26:11434
-    model: qwen35-fast:latest
+    base_url: http://192.168.1.127:11434
+    model: qwen3.5:9b
     stream: false
     think: false
     api: chat

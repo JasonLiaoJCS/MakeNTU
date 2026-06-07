@@ -9,7 +9,7 @@ Install, Windows PowerShell:
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 Ollama:
-    ollama pull qwen35-fast:latest
+    ollama pull qwen3.5:9b
     ollama serve
 
 Usage:
@@ -25,7 +25,7 @@ Usage:
 
 Environment overrides:
     OLLAMA_URL=http://localhost:11434/api/chat
-    OLLAMA_MODEL=qwen35-fast:latest
+    OLLAMA_MODEL=qwen3.5:9b
     OLLAMA_NO_THINK=1
     QWEN_ASR_MODEL=Qwen/Qwen3-ASR-1.7B
     SERIAL_PORT=COM5
@@ -58,7 +58,7 @@ DEFAULT_RMS_THRESHOLD = 0.008
 DEFAULT_CONFIDENCE_THRESHOLD = 0.58
 
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
-DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen35-fast:latest")
+DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 DEFAULT_OLLAMA_NO_THINK = os.getenv("OLLAMA_NO_THINK", "1").strip().lower() not in {"0", "false", "no", "off"}
 DEFAULT_ASR_MODEL = os.getenv("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
 DEFAULT_SERIAL_PORT = os.getenv("SERIAL_PORT", "COM5")

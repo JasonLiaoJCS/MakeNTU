@@ -32,7 +32,12 @@ from typing import Any, Callable
 
 
 THIS_DIR = Path(__file__).resolve().parent
-DEFAULT_FOCUS_URL = os.getenv("FOCUS_SERVER_URL", "http://100.108.141.26:8766/focus-check")
+try:
+    from . import server_config  # type: ignore
+except Exception:
+    import server_config  # type: ignore
+
+DEFAULT_FOCUS_URL = os.getenv("FOCUS_SERVER_URL", server_config.DEFAULT_FOCUS_URL)
 DEFAULT_LOG_ROOT = THIS_DIR / "logs" / "focus_sessions"
 DEFAULT_TODO_LIST_PATH = THIS_DIR / "logs" / "todo_list.json"
 DEFAULT_INTERVAL_SEC = 60.0
